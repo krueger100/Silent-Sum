@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="background_sheet">#CCFFFFFF</color>
+    <color name="background">#FEFEFE</color>
+    <color name="Very_Severely_underweight">#FF4081</color>
+    <color name="Severely_underweight">#FF5722</color>
+    <color name="Underweight">#FF9800</color>
+    <color name="Healthy">#4CAF50</color>
+    <color name="Overweight">#E91E63</color>
+    <color name="Obese_Class_I">#9C27B0</color>
+    <color name="Obese_Class_ii">#673AB7</color>
+    <color name="Obese_Class_iii">#3F51B5</color>
+
+    <color name="black">#000000</color>
+    <color name="grey">#CCFFFFFF</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="transparent">@android:color/transparent</color>
+    <color name="tip">#FFD600</color>
+    <color name="wrong">#F4511E</color>
+    <color name="text_color">#74000000</color>
+    <color name="dashboard_button">#AD3A3A3E</color>
+
+</resources>

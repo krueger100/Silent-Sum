@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <item
+        android:id="@+id/historys"
+        android:icon="@drawable/history"
+        android:title="@string/historys"
+        app:showAsAction="always" />
+
+    <item
+        android:id="@+id/view_layout"
+        android:icon="@drawable/grid_on"
+        android:title="@string/switch_layout"
+        app:showAsAction="always" />
+
+    <item
+        android:id="@+id/resize"
+        android:icon="@drawable/fullscreen_exit"
+        android:title="@string/resize"
+        app:showAsAction="ifRoom" />
+
+    <item
+        android:id="@+id/setting"
+        android:icon="@drawable/baseline_menu_24"
+        android:title="@string/settings"
+        app:showAsAction="ifRoom" />
+
+</menu>

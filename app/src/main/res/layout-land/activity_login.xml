@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/silentsum_background"
+    android:padding="16dp"
+    tools:context="com.kruegerco.silentsum.SignUp.LoginActivity">
+
+    <!-- Display takes left half -->
+    <com.kruegerco.silentsum.BlurEffect.BlurLayout
+        android:id="@+id/blurLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:blurRadius="15"
+        app:downscaleFactor="0.2"
+        app:fps="30"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintWidth_percent="0.4">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginTop="20dp"
+            android:orientation="horizontal"
+            android:elevation="16dp"
+            android:padding="16dp">
+
+
+            <com.kruegerco.silentsum.BlurEffect.BlurLayout
+                android:id="@+id/blurLayout1"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                app:blurRadius="25"
+                app:downscaleFactor="0.2"
+                app:fps="30"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent">
+
+            <androidx.cardview.widget.CardView
+                android:id="@+id/display_cardView"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                app:cardBackgroundColor="@color/transparent"
+                app:cardCornerRadius="5dp">
+        <TextView
+            android:id="@+id/display"
+            android:layout_width="350dp"
+            android:layout_height="match_parent"
+            android:background="#5FFFFFFF"
+            android:gravity="end|bottom"
+            android:padding="16dp"
+            android:text="0"
+            android:textColor="@color/white"
+            android:textSize="38sp" />
+
+
+    </androidx.cardview.widget.CardView>
+            </com.kruegerco.silentsum.BlurEffect.BlurLayout>
+
+    <!-- Buttons on the right -->
+    <GridLayout
+        android:id="@+id/gridLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:columnCount="4"
+        android:rowCount="5"
+        android:padding="15dp"
+        android:alignmentMode="alignMargins"
+        android:layout_marginStart="16dp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toEndOf="@id/display_cardView"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintWidth_percent="0.6">
+
+        <!-- Buttons remain the same -->
+        <Button android:text="7" style="@style/CalcButton_landScape"/>
+        <Button android:text="8" style="@style/CalcButton_landScape"/>
+        <Button android:text="9" style="@style/CalcButton_landScape"/>
+        <Button android:text="/" style="@style/CalcButton_landScape"/>
+
+        <Button android:text="4" style="@style/CalcButton_landScape"/>
+        <Button android:text="5" style="@style/CalcButton_landScape"/>
+        <Button android:text="6" style="@style/CalcButton_landScape"/>
+        <Button android:text="*" style="@style/CalcButton_landScape"/>
+
+        <Button android:text="1" style="@style/CalcButton_landScape"/>
+        <Button android:text="2" style="@style/CalcButton_landScape"/>
+        <Button android:text="3" style="@style/CalcButton_landScape"/>
+        <Button android:text="-" style="@style/CalcButton_landScape"/>
+
+        <Button android:text="0" style="@style/CalcButton_landScape"/>
+        <Button android:text="C" style="@style/CalcButton_landScape"/>
+        <Button android:text="=" style="@style/CalcButton_landScape"/>
+        <Button android:text="+" style="@style/CalcButton_landScape"/>
+    </GridLayout>
+        </LinearLayout>
+    </com.kruegerco.silentsum.BlurEffect.BlurLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>

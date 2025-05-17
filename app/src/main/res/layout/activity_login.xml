@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/silentsum_background"
+    tools:context="com.kruegerco.silentsum.SignUp.LoginActivity">
+
+
+
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginTop="20dp"
+            android:background="@color/transparent"
+            android:orientation="vertical"
+            android:elevation="16dp"
+            android:padding="16dp">
+
+
+
+                <androidx.cardview.widget.CardView
+                    android:id="@+id/display_cardView"
+                    android:layout_width="match_parent"
+                    android:layout_height="300dp"
+                    app:cardBackgroundColor="@color/transparent"
+                    android:backgroundTint="@color/transparent"
+                    app:cardCornerRadius="5dp"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintTop_toTopOf="parent">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:background="@color/transparent"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:id="@+id/display"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent"
+                            android:background="#5FFFFFFF"
+                            android:gravity="end|bottom"
+                            android:padding="16dp"
+                            android:text="0"
+                            android:textColor="@color/white"
+                            android:textSize="38sp" />
+
+
+                    </LinearLayout>
+                </androidx.cardview.widget.CardView>
+
+
+            <TextView
+                android:id="@+id/pin_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="○○○○"
+                android:textSize="18sp"
+                android:layout_gravity="center"
+                android:layout_marginTop="8dp"
+                android:layout_marginBottom="6dp" />
+
+            <Button
+                android:id="@+id/login_button"
+                android:layout_width="match_parent"
+                android:layout_height="50dp"
+                android:background="@drawable/calc_button_background"
+                android:text="Login"
+                android:layout_gravity="center"
+                android:textAlignment="center"
+                android:padding="16dp"
+                android:layout_marginBottom="5dp"
+                android:visibility="gone"
+                android:layout_marginTop="16dp"/>
+
+            <GridLayout
+                android:id="@+id/gridLayout"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_marginTop="5dp"
+                android:alignmentMode="alignMargins"
+                android:background="@color/transparent"
+                android:columnCount="4"
+                android:rowCount="5"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toBottomOf="@+id/blurLayout1">
+
+                <!-- Row 1 -->
+                <Button
+                    style="@style/CalcButton"
+                    android:text="7" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="8" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="9" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="/" />
+
+                <!-- Row 2 -->
+                <Button
+                    style="@style/CalcButton"
+                    android:text="4" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="5" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="6" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="*" />
+
+                <!-- Row 3 -->
+                <Button
+                    style="@style/CalcButton"
+                    android:text="1" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="2" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="3" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="-" />
+
+                <!-- Row 4 -->
+                <Button
+                    style="@style/CalcButton"
+                    android:text="0" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="C" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="=" />
+
+                <Button
+                    style="@style/CalcButton"
+                    android:text="+" />
+
+            </GridLayout>
+
+
+
+
+
+      </LinearLayout>
+
+
+
+
+</androidx.constraintlayout.widget.ConstraintLayout>

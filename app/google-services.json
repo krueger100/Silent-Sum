@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "637515016246",
+    "project_id": "silentsum",
+    "storage_bucket": "silentsum.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:637515016246:android:5b33e0324bd7f962e3d097",
+        "android_client_info": {
+          "package_name": "com.kruegerco.silentsum"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA6z8if5ZkrnSiPNiGXi15ueekzCY8mHdE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

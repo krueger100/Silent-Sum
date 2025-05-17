@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@drawable/silentsum_background">
+
+    <!-- Reusable Header -->
+    <include layout="@layout/view_header" />
+
+    <!-- Title -->
+    <TextView
+        android:id="@+id/register_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Register"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp"
+        android:layout_marginBottom="32dp" />
+
+    <!-- Nickname Input -->
+    <EditText
+        android:id="@+id/nickname"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Nickname"
+        android:inputType="textPersonName"
+        android:padding="12dp"
+        android:textColorHint="@color/text_color"
+        android:textColor="@color/black"
+        android:layout_marginHorizontal="16dp"
+        android:background="@drawable/edit_text_background"
+        android:layout_marginBottom="16dp"/>
+
+    <!-- PIN Input -->
+    <EditText
+        android:id="@+id/pin"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="PIN"
+        android:inputType="numberPassword"
+        android:padding="12dp"
+        android:textColor="@color/black"
+        android:textColorHint="@color/text_color"
+        android:layout_marginHorizontal="16dp"
+        android:background="@drawable/edit_text_background"
+        android:layout_marginBottom="16dp"/>
+
+    <!-- Confirm PIN Input -->
+    <EditText
+        android:id="@+id/confirm_pin"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Confirm PIN"
+        android:layout_marginHorizontal="16dp"
+        android:inputType="numberPassword"
+        android:textColorHint="@color/text_color"
+        android:textColor="@color/black"
+        android:padding="12dp"
+        android:background="@drawable/edit_text_background"
+        android:layout_marginBottom="24dp"/>
+
+    <!-- Register Button -->
+    <Button
+        android:id="@+id/register_button"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Register"
+        android:background="@drawable/calc_button_background"
+        android:layout_marginHorizontal="16dp"
+        android:textColor="@android:color/white"
+        android:padding="12dp"
+        android:textSize="16sp" />
+
+</LinearLayout>
