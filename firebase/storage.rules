@@ -1,0 +1,19 @@
+rules_version = '2';
+
+// SilentSum cloud backup blobs: users/{uid}/index.enc, photos/{id}.enc,
+// thumbs/{id}.enc. All are XChaCha20-Poly1305 ciphertext produced on the
+// device; the server never sees keys. Owner-only, bounded size, opaque type.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{uid}/{allPaths=**} {
+      allow read, delete: if request.auth != null && request.auth.uid == uid;
+      allow write: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.size < 100 * 1024 * 1024
+        && request.resource.contentType == 'application/octet-stream';
+    }
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

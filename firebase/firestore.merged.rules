@@ -1,0 +1,89 @@
+// THIS is the file `firebase.json` deploys, and its contents are live on `eevee-mate` today
+// (ruleset c24b3613, released 2026-09-16). It started as review-only, which is why it used to say
+// so here; it is not review-only any more, and treating it that way would mean editing the
+// standalone `firestore.rules` and wondering why nothing changed.
+//
+// It is `firebase/firestore.rules` merged into what was live on the `eevee-mate` project when
+// SilentSum was added (ruleset d516a050-3002-4974-9583-eae2280fb768, released 2023-06-19), so that
+// SilentSum's backup metadata could be added without disturbing anything already there.
+//
+// A deploy REPLACES the whole project ruleset, so the stripe block below is not decoration: drop
+// it and EVPAL's payments lose their rules. Re-check it against the live ruleset before deploying.
+//
+// The existing `stripe_customers` block below is copied byte for byte from the deployed ruleset
+// and must stay that way. Everything under "ADDED: SilentSum" is new, matches only
+// `users/{uid}/vault/...`, and cannot widen access to any other path: Firestore denies every
+// path no match allows, and rules are OR-ed, so a new match can only ever grant on its own paths.
+//
+// SilentSum's standalone `firestore.rules` ends with `match /{document=**} { allow read, write:
+// if false; }`. That is deliberately NOT carried over: it is redundant here (unmatched paths are
+// denied anyway) and, because rules OR rather than AND, it could never revoke the stripe grants
+// even if someone assumed it would.
+//
+// Realtime Database rules are a different service entirely and are untouched by this file.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- EXISTING: deployed 2023-06-19, unchanged ----------------------------------------
+    match /stripe_customers/{uid} {
+      allow read, write: if request.auth.uid == uid;
+
+      match /payments/{id} {
+        allow read, write: if request.auth.uid == uid;
+      }
+    }
+
+    // ---- ADDED: SilentSum encrypted-backup metadata ---------------------------------------
+    // Two documents per user. The envelope holds the vault master key wrapped under a recovery
+    // passphrase that never leaves the device; the manifest lists which photo ids are stored, and
+    // carries a spare copy of the encrypted index. Neither can decrypt anything: the uid is an
+    // address, not a key. Vault unlocking never reads either and never touches the network.
+    // (The manifest no longer drives deletion -- backups only ever grow; `disable` is the one way
+    // anything leaves the cloud.)
+
+    function ssOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function ssValidEnvelope(d) {
+      return d.keys().hasOnly(['v', 'salt', 'kdf', 'wrapped', 'createdAt'])
+        && d.v == 1
+        && d.salt is string && d.salt.size() <= 64
+        && d.kdf is map && d.kdf.keys().hasOnly(['alg', 'm', 't', 'p', 'len'])
+        && d.kdf.alg == 'argon2id'
+        && d.kdf.m is int && d.kdf.m >= 8192 && d.kdf.m <= 262144
+        && d.kdf.t is int && d.kdf.t >= 1 && d.kdf.t <= 10
+        && d.kdf.p is int && d.kdf.p >= 1 && d.kdf.p <= 4
+        && d.kdf.len == 32
+        && d.wrapped is map
+        && d.wrapped.nonce is string && d.wrapped.nonce.size() <= 64
+        && d.wrapped.ct is string && d.wrapped.ct.size() <= 256
+        && d.wrapped.mac is string && d.wrapped.mac.size() <= 64
+        && d.createdAt is string;
+    }
+
+    // `index` is optional: a base64 copy of the same ciphertext as `index.enc` in Storage, kept
+    // here so that losing that one object does not strand every blob in the account. It is opaque
+    // to the server exactly as the Storage copy is, and the client omits it when it would push the
+    // document towards Firestore's 1 MiB ceiling.
+    function ssValidManifest(d) {
+      return d.keys().hasOnly(['photoIds', 'photoCount', 'updatedAt', 'index'])
+        && d.photoIds is list && d.photoIds.size() <= 20000
+        && d.photoCount is int && d.photoCount == d.photoIds.size()
+        && d.updatedAt is string
+        && (!d.keys().hasAny(['index']) || (d.index is string && d.index.size() <= 700000));
+    }
+
+    match /users/{uid}/vault/envelope {
+      allow read, delete: if ssOwner(uid);
+      allow create, update: if ssOwner(uid) && ssValidEnvelope(request.resource.data);
+    }
+
+    match /users/{uid}/vault/manifest {
+      allow read, delete: if ssOwner(uid);
+      allow create, update: if ssOwner(uid) && ssValidManifest(request.resource.data);
+    }
+  }
+}

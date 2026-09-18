@@ -1,0 +1,46 @@
+diff --git a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
+index 21382f8..07a68a7 100644
+--- a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
++++ b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/CameraViewModule.kt
+@@ -435,16 +435,11 @@ class CameraViewModule : Module() {
+       }
+ 
+       AsyncFunction("takePicture") { view: ExpoCameraView, options: PictureOptions, promise: Promise ->
+-        if (!EmulatorUtilities.isRunningOnEmulator()) {
+-          view.takePicture(options, promise, cacheDirectory, runtimeContext)
+-        } else {
+-          val image = CameraViewHelper.generateSimulatorPhoto(view.width, view.height)
+-          moduleScope.launch {
+-            ResolveTakenPicture(image, promise, options, false, runtimeContext, cacheDirectory) { response ->
+-              view.onPictureSaved(response)
+-            }.resolve()
+-          }
+-        }
++        // SilentSum: always capture from the camera. Upstream swaps in a synthetic black
++        // placeholder (generateSimulatorPhoto) on every emulator, and an encrypted vault would
++        // store that as a silently lost photo. Emulators with a working camera backend capture
++        // for real; one without a camera now rejects instead of returning a fake image.
++        view.takePicture(options, promise, cacheDirectory, runtimeContext)
+       }.runOnQueue(Queues.MAIN)
+ 
+       AsyncFunction("getAvailablePictureSizes") { view: ExpoCameraView ->
+diff --git a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
+index 999a22c..a57f59d 100644
+--- a/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
++++ b/node_modules/expo-camera/android/src/main/java/expo/modules/camera/ExpoCameraView.kt
+@@ -283,7 +283,14 @@ class ExpoCameraView(
+     val volume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+     val hasShutterSound = options.shutterSound
+ 
+-    imageCaptureUseCase?.takePicture(
++    val imageCapture = imageCaptureUseCase
++    if (imageCapture == null) {
++      // SilentSum: without this the promise never settles when no camera is bound.
++      promise.reject(CameraExceptions.ImageCaptureFailed())
++      return
++    }
++
++    imageCapture.takePicture(
+       ContextCompat.getMainExecutor(context),
+       object : ImageCapture.OnImageCapturedCallback() {
+         override fun onCaptureStarted() {

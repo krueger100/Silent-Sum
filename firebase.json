@@ -1,0 +1,12 @@
+{
+  "//": "eevee-mate is shared with other apps. `firestore.rules` here is the MERGED file, which reproduces the deployed stripe_customers block verbatim and adds only users/{uid}/vault/*. The storage entry names SilentSum's own bucket explicitly so a deploy can never touch eevee-mate.appspot.com, which belongs to EVPAL.",
+  "firestore": {
+    "rules": "firebase/firestore.merged.rules"
+  },
+  "storage": [
+    {
+      "bucket": "silentsum-vault-eevee-mate",
+      "rules": "firebase/storage.rules"
+    }
+  ]
+}
