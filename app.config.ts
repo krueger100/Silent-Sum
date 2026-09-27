@@ -178,10 +178,26 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     [
       'expo-splash-screen',
       {
+        // The bare operator mark on the app's own background: a calculator and nothing else. A
+        // splash that hinted at a vault would give the app away on every launch, to whoever is in
+        // the room, which is the one thing the disguise cannot survive.
+        //
+        // The mark is the four glyphs WITHOUT their tiles, in white -- 17.7:1 against this
+        // background. The tiles are dropped rather than recoloured because the `=` tile is the
+        // accent, and a plate would read as a sticker on a flat field.
         image: './assets/splash-icon.png',
-        imageWidth: 160,
+        // A splash icon with NO background is masked to a 192dp circle, so 96dp of radius -- NOT
+        // the 240dp that applies when the icon has one. The furthest pixel in this mark is the tip
+        // of the multiply glyph's lower-left arm, at 0.627 x this width from centre. At 146 that is
+        // 91.5dp, inside 96 with 4.5dp to spare; at 160 it was 99dp and that one arm came back
+        // sliced on the device. `scripts` in the splash installer refuse to write if it exceeds.
+        imageWidth: 146,
         resizeMode: 'contain',
-        backgroundColor: '#1F2937',
+        // `background` from DARK_PALETTE: the exact colour the calculator paints behind itself, so
+        // the splash hands over to the app with no visible step. `values-night/colors.xml` carries
+        // the same value -- a splash that changed with the system theme would show two identities
+        // on one device.
+        backgroundColor: '#111827',
         dark: { backgroundColor: '#111827' },
       },
     ],
