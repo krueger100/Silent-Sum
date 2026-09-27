@@ -12,6 +12,7 @@ import { SettingsScreen } from '@/settings/screens/SettingsScreen';
 import { SupportScreen } from '@/settings/screens/SupportScreen';
 import { WipePinScreen } from '@/settings/screens/WipePinScreen';
 import { buildHarness, renderWithServices } from '@/settings/screens/__tests__/harness';
+import { DATA_DELETION_URL, PRIVACY_POLICY_URL } from '@/settings/privacyPolicy';
 import { DEFAULT_SETTINGS } from '@/settings/appSettings';
 import { InMemoryCloudBackend } from '@/firebase/cloudBackend';
 import { NoopAnalyticsService, NoopCrashReporter } from '@/firebase/types';
@@ -320,6 +321,106 @@ describe('SecurityScreen', () => {
     expect(screen.getByText(/Blocks screenshots/)).toHaveTextContent(/app-switcher preview/);
     expect(screen.getByText(/Blocks screenshots/)).toHaveTextContent(/privacy curtain/);
     expect(screen.getByTestId('security_encryption_summary')).toHaveTextContent(/Argon2id/);
+  });
+});
+
+/**
+ * Google Play requires a privacy-policy link inside the app as well as on the listing. The one that
+ * matters is on About, because the locked calculator's menu reaches About and nothing else: a link
+ * that needed the PIN first would be invisible to anyone who has not been given it, a Play reviewer
+ * included.
+ */
+describe('privacy policy link', () => {
+  it('is offered on the About page and opens the published policy', async () => {
+    const harness = buildHarness();
+    const opened: string[] = [];
+    await renderWithServices(
+      harness.services,
+      <AboutScreen
+        openUrl={async (url) => {
+          opened.push(url);
+          return true;
+        }}
+      />,
+    );
+
+    fireEvent.press(screen.getByTestId('about_privacy_policy'));
+    await waitFor(() => {
+      expect(opened).toEqual([PRIVACY_POLICY_URL]);
+    });
+  });
+
+  /**
+   * Super secure strips the page down to what an ordinary calculator's About would show, and this
+   * link goes with the rest. Compliance does not rest on this copy: the setting is off by default,
+   * so the undisguised page below still carries it, as do the vault's About and Settings.
+   */
+  it('is hidden by the disguise, along with every other section', async () => {
+    const harness = buildHarness();
+    await renderWithServices(
+      harness.services,
+      <AboutScreen appName="Calculator" disguised openUrl={async () => true} />,
+    );
+
+    expect(screen.queryByTestId('about_privacy_policy')).toBeNull();
+  });
+
+  /** The default configuration, which is what a Play reviewer sees: the link is there. */
+  it('is present on the calculator About until the owner turns super secure on', async () => {
+    const harness = buildHarness();
+    await renderWithServices(
+      harness.services,
+      <AboutScreen appName="Calculator" openUrl={async () => true} />,
+    );
+
+    expect(screen.getByTestId('about_privacy_policy')).toBeTruthy();
+  });
+
+  it('is reachable from Settings too, for anyone already inside the vault', async () => {
+    const harness = buildHarness();
+    const opened: string[] = [];
+    await renderWithServices(
+      harness.services,
+      <SettingsScreen
+        onChangePin={jest.fn()}
+        onAutoLock={jest.fn()}
+        onSecurity={jest.fn()}
+        onWipePin={jest.fn()}
+        onCloudBackup={jest.fn()}
+        onPlans={jest.fn()}
+        onSupport={jest.fn()}
+        onAbout={jest.fn()}
+        openUrl={async (url) => {
+          opened.push(url);
+          return true;
+        }}
+      />,
+    );
+
+    fireEvent.press(screen.getByTestId('settings_privacy_policy'));
+    await waitFor(() => {
+      expect(opened).toEqual([PRIVACY_POLICY_URL]);
+    });
+  });
+
+  it('points at an https page, and the deletion anchor within it', () => {
+    expect(PRIVACY_POLICY_URL).toMatch(/^https:\/\//);
+    // Play wants account deletion reachable without installing the app; the same page carries it.
+    expect(DATA_DELETION_URL).toBe(`${PRIVACY_POLICY_URL}#delete`);
+  });
+
+  it('says nothing when the browser refuses, rather than pretending it opened', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen openUrl={async () => false} />);
+
+    fireEvent.press(screen.getByTestId('about_privacy_policy'));
+    await waitFor(() => {
+      // A RegExp, not the bare string: this matcher compares whole text content, and the fallback
+      // deliberately says more than the address.
+      expect(screen.getByTestId('about_privacy_policy_fallback')).toHaveTextContent(
+        new RegExp(PRIVACY_POLICY_URL.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')),
+      );
+    });
   });
 });
 

@@ -55,11 +55,8 @@ import { ForgotPinDialog } from '@/auth/screens/ForgotPinDialog';
 import { Button } from '@/components/Button';
 import { Field } from '@/components/Field';
 import { Screen, SectionLabel } from '@/components/Screen';
-import {
-  isPlausibleEmail,
-  SUPPORT_BODY_MAX,
-  SUPPORT_FAILURE_COPY,
-} from '@/support/supportMessage';
+import { openInBrowser, PRIVACY_POLICY_LABEL, PRIVACY_POLICY_URL } from '@/settings/privacyPolicy';
+import { isPlausibleEmail, SUPPORT_BODY_MAX, SUPPORT_FAILURE_COPY } from '@/support/supportMessage';
 import type { SupportMessage } from '@/support/types';
 import type { RecoveryRedemption } from '@/support/recoveryAccess';
 
@@ -105,6 +102,12 @@ export interface AboutScreenProps {
   onErased?: () => void;
   /** Opens the restore flow after an erase, when this device had a cloud backup to go back to. */
   onRestore?: () => void;
+  /**
+   * Opens a URL in the system browser. Injected so a test can watch it, and defaulted so no caller
+   * has to remember it: the privacy link is a Play requirement, and a screen that silently lacked it
+   * because a prop was forgotten would be a compliance failure rather than a missing feature.
+   */
+  openUrl?: (url: string) => Promise<boolean>;
 }
 
 const SUMMARY: readonly string[] = [
@@ -122,14 +125,21 @@ export function AboutScreen({
   onRecoveryVerified,
   onErased,
   onRestore,
+  openUrl = openInBrowser,
 }: AboutScreenProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
   const { firebase, backup } = useServices();
   const cloudPossible = firebase.available && backup !== null;
   const [erasing, setErasing] = useState(false);
+  const [policyUnreachable, setPolicyUnreachable] = useState(false);
 
   return (
-    <Screen title="About" scroll testID="about_screen" {...(onBack === undefined ? {} : { onBack })}>
+    <Screen
+      title="About"
+      scroll
+      testID="about_screen"
+      {...(onBack === undefined ? {} : { onBack })}
+    >
       <IdentityCard
         appName={appName}
         version={version}
@@ -164,6 +174,43 @@ export function AboutScreen({
               ? ''
               : ' This build has no cloud configuration at all, so backup cannot even be offered.'}
           </Text>
+        </>
+      )}
+
+      {/*
+        Inside the `disguised` branch, like everything else on this page.
+
+        It used to sit outside it, on the reasoning that a privacy policy names no vault and Play
+        wants the link in the app. Both halves of that are still true, but super secure is the mode
+        where the owner has asked for a page that reads as an ordinary calculator's About and
+        nothing more, and that judgement is theirs to make on their own device.
+
+        Compliance does not rest on this copy of the link. Super secure is OFF by default, so the
+        calculator's own About still carries it for anyone who has not opted out -- a Play reviewer
+        included, since they never change this setting. It is also on the vault's About and in
+        Settings. Removing it here costs the disguised page only.
+      */}
+      {disguised ? null : (
+        <>
+          <SectionLabel>Privacy</SectionLabel>
+          <View style={styles.card}>
+            <Button
+              testID="about_privacy_policy"
+              label={PRIVACY_POLICY_LABEL}
+              variant="secondary"
+              onPress={() => {
+                void (async () => {
+                  const opened = await openUrl(PRIVACY_POLICY_URL);
+                  setPolicyUnreachable(!opened);
+                })();
+              }}
+            />
+            {policyUnreachable ? (
+              <Text testID="about_privacy_policy_fallback" style={styles.muted} selectable>
+                {`No browser could open it. The policy is at ${PRIVACY_POLICY_URL}`}
+              </Text>
+            ) : null}
+          </View>
         </>
       )}
 
@@ -481,8 +528,8 @@ function CustomerService({
 
       {canQuote ? (
         <Text testID="about_support_reference_note" style={styles.muted}>
-          The reference line tells support which device this is. Delete it if you would rather
-          not send it.
+          The reference line tells support which device this is. Delete it if you would rather not
+          send it.
         </Text>
       ) : null}
 
@@ -525,7 +572,7 @@ function RecoveryCodeEntry({ onVerified }: { onVerified: () => void }): React.JS
   const styles = useStyles(makeStyles);
   const { recovery } = useServices();
   const [reference, setReference] = useState<string | null>(null);
-  const [code, setCode] = useState("");
+  const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -546,14 +593,14 @@ function RecoveryCodeEntry({ onVerified }: { onVerified: () => void }): React.JS
   if (!available) return null;
 
   const submit = (): void => {
-    if (busy || code.trim() === "") return;
+    if (busy || code.trim() === '') return;
     setBusy(true);
     setError(null);
     void (async () => {
       const result = await recovery.redeem(code);
       setBusy(false);
       if (result.ok) {
-        setCode("");
+        setCode('');
         onVerified();
         return;
       }
@@ -564,11 +611,11 @@ function RecoveryCodeEntry({ onVerified }: { onVerified: () => void }): React.JS
   return (
     <View style={styles.card} testID="about_recovery_code">
       <Text testID="about_recovery_explainer" style={styles.pointText}>
-        If support has sent you a code, enter it below. The reference identifies this device; it
-        is already in the message above.
+        If support has sent you a code, enter it below. The reference identifies this device; it is
+        already in the message above.
       </Text>
       <Text testID="about_recovery_reference" style={styles.reference}>
-        {reference === null ? "Reference \u2014" : `Reference ${reference}`}
+        {reference === null ? 'Reference \u2014' : `Reference ${reference}`}
       </Text>
       <Field
         testID="about_recovery_input"
@@ -586,10 +633,10 @@ function RecoveryCodeEntry({ onVerified }: { onVerified: () => void }): React.JS
       )}
       <Button
         testID="about_recovery_submit"
-        label={busy ? "Checking" : "Continue"}
+        label={busy ? 'Checking' : 'Continue'}
         variant="secondary"
         onPress={submit}
-        disabled={busy || code.trim() === ""}
+        disabled={busy || code.trim() === ''}
         busy={busy}
       />
     </View>
@@ -597,12 +644,12 @@ function RecoveryCodeEntry({ onVerified }: { onVerified: () => void }): React.JS
 }
 
 const REDEMPTION_COPY: Readonly<Record<RecoveryRedemption, string>> = {
-  malformed: "That code is not complete. Check you have copied all of it, including every group.",
+  malformed: 'That code is not complete. Check you have copied all of it, including every group.',
   // Wrong key and wrong device answer identically: which one it was is nobody else\u2019s business.
-  rejected: "That code was not accepted.",
-  expired: "That code has expired. Ask for a new one.",
-  used: "That code has already been used. Ask for a new one.",
-  unavailable: "This build cannot accept codes.",
+  rejected: 'That code was not accepted.',
+  expired: 'That code has expired. Ask for a new one.',
+  used: 'That code has already been used. Ask for a new one.',
+  unavailable: 'This build cannot accept codes.',
 };
 const makeStyles = (colors: Palette) =>
   StyleSheet.create({

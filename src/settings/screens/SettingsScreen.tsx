@@ -24,6 +24,7 @@ import { Button } from '@/components/Button';
 import { ListGroup, ListRow, SwitchRow } from '@/components/ListRow';
 import { Screen, SectionLabel } from '@/components/Screen';
 import { AUTO_LOCK_LABEL } from '@/settings/appSettings';
+import { openInBrowser, PRIVACY_POLICY_LABEL, PRIVACY_POLICY_URL } from '@/settings/privacyPolicy';
 
 export interface SettingsScreenProps {
   onChangePin: () => void;
@@ -37,6 +38,11 @@ export interface SettingsScreenProps {
   /** Opens user-to-user messaging. Absent in a navigator that does not offer it. */
   onMessages?: () => void;
   onAbout: () => void;
+  /**
+   * Opens a URL in the system browser. Injected for tests, defaulted so the privacy row cannot go
+   * missing because a caller forgot a prop: Play requires the link to be in the app.
+   */
+  openUrl?: (url: string) => Promise<boolean>;
   onBack?: () => void;
   /** Optional: renders a "Lock vault now" action when the navigator wants one here. */
   onLocked?: () => void;
@@ -59,6 +65,7 @@ export function SettingsScreen({
   onSupport,
   onMessages,
   onAbout,
+  openUrl = openInBrowser,
   onBack,
   onLocked,
   reloadToken,
@@ -169,9 +176,7 @@ export function SettingsScreen({
         <ListRow
           testID="settings_cloud_backup"
           label="Cloud backup"
-          value={
-            !cloudAvailable ? undefined : settings.backupEnabled ? 'On' : 'Off'
-          }
+          value={!cloudAvailable ? undefined : settings.backupEnabled ? 'On' : 'Off'}
           detail={
             !cloudAvailable
               ? 'Not available in this build. Everything works offline.'
@@ -210,6 +215,14 @@ export function SettingsScreen({
           onPress={onSupport}
         />
         <ListRow testID="settings_about" label="About" onPress={onAbout} />
+        <ListRow
+          testID="settings_privacy_policy"
+          label={PRIVACY_POLICY_LABEL}
+          detail="Opens in your browser"
+          onPress={() => {
+            void openUrl(PRIVACY_POLICY_URL);
+          }}
+        />
       </ListGroup>
 
       {onLocked === undefined ? null : (
