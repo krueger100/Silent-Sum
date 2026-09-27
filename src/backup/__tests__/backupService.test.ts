@@ -239,6 +239,13 @@ describe('BackupService uploading', () => {
     expect(toHex(await backend.getBlob(BACKUP_PATHS.index(uid)))).toBe(
       toHex(before.get(BACKUP_PATHS.index(uid)) ?? new Uint8Array()),
     );
+    // And NOTHING was written, not merely the index. The refusal used to arrive after every photo
+    // had already been uploaded under the wrong key: blobs stranded in an account whose index
+    // cannot name them and whose owner cannot decrypt them. "Refused" has to mean "wrote nothing".
+    expect(backend.blobs.size).toBe(before.size);
+    for (const [path, bytes] of before) {
+      expect(toHex(backend.blobs.get(path) ?? new Uint8Array())).toBe(toHex(bytes));
+    }
   });
 
   it('does not strand the cloud index when a device with fewer photos uploads', async () => {
@@ -396,6 +403,36 @@ describe('BackupService disabling', () => {
 
     expect(repository.photos.map((p) => p.id)).toEqual([entry.id]);
     await expect(repository.readFullImage(entry.id)).resolves.toBeDefined();
+  });
+
+  /**
+   * The property that stops an unrestorable backup from ever being written.
+   *
+   * A delete that dies half way used to leave the envelope -- the one document that says "this
+   * account is backed up, under this key" -- standing over an account with nothing in it. The next
+   * backup then passed the `hasEnvelope` gate, found no index to check itself against, and wrote
+   * every photo under a key the envelope did not wrap. Deleting the envelope first means a failure
+   * can only ever read as "backup is off", which is recoverable by enabling it again.
+   */
+  it('leaves no envelope behind when the delete fails part-way', async () => {
+    const { keys, repository } = await makeVault(random.bytes(32));
+    await repository.addPhoto({ bytes: makeImage('doomed') }, { source: 'camera' });
+    const backend = await signedInBackend();
+    const service = makeService(backend);
+    await service.enable(keys, PASSPHRASE);
+    await service.backupNow(repository, keys);
+    expect(await service.hasEnvelope()).toBe(true);
+
+    // The blobs are the last thing deleted and the most likely to fail: many calls, any of which
+    // can lose the network.
+    jest.spyOn(backend, 'deleteBlob').mockRejectedValue(new CloudError('unavailable'));
+
+    await expect(service.disable()).rejects.toThrow(CloudError);
+
+    // Whatever else survived, the envelope did not -- so `backupNow` refuses until the user
+    // enables backup again, and enabling wraps the key that is actually in use.
+    expect(await service.hasEnvelope()).toBe(false);
+    await expect(service.backupNow(repository, keys)).rejects.toThrow(BackupNotEnabledError);
   });
 });
 

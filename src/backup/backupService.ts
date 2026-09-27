@@ -163,16 +163,26 @@ export class BackupService implements BackupServiceContract {
     if (!(await this.hasEnvelope())) throw new BackupNotEnabledError();
     const uid = user.uid;
 
-    const manifest = await this.backend.getDocument(BACKUP_PATHS.manifest(uid));
-    const skip = new Set<string>(readPhotoIds(manifest));
-    const uploaded = await this.uploadPhotos(repository, uid, skip);
-
-    // Entries the cloud has and this device does not. Nothing was deleted above, so these are the
-    // ones that would be stranded if the local index simply replaced the remote one.
+    // Read the cloud's index FIRST, before a single byte is written.
+    //
+    // This used to run after `uploadPhotos`, and the ordering was the whole bug: a vault that does
+    // not own this account would upload every photo it had, under its own key, and only then reach
+    // the decrypt that fails and throws `ForeignBackupError`. The refusal was real but it came too
+    // late -- the blobs were already sitting in someone else's account, unreadable by the vault
+    // that can open the index and invisible to the index that lists what may be restored. Reading
+    // first makes the refusal mean what it says: nothing was written.
+    //
+    // Entries the cloud has and this device does not. Nothing is ever deleted from the cloud here,
+    // so these are the ones that would be stranded if the local index simply replaced the remote.
     const localIds = new Set(repository.photos.map((p) => p.id));
     const carried = (await this.readCloudIndex(uid, keys)).filter(
       (entry) => !localIds.has(entry.id),
     );
+
+    const manifest = await this.backend.getDocument(BACKUP_PATHS.manifest(uid));
+    const skip = new Set<string>(readPhotoIds(manifest));
+    const uploaded = await this.uploadPhotos(repository, uid, skip);
+
     const merged = sortedNewestFirst([...repository.photos, ...carried]);
 
     await this.writeIndexAndManifest(uid, keys, merged);
@@ -628,15 +638,40 @@ export class BackupService implements BackupServiceContract {
     return found;
   }
 
+  /**
+   * Removes everything the account owns, ENVELOPE FIRST.
+   *
+   * The order is the whole point, and it used to be the other way round. This is not atomic: it is
+   * a sequence of network calls and it has stopped part-way more than once, and
+   * `vaultWipe.deleteCloudBackup` wraps it in `quietly()`, so a partial delete is swallowed
+   * without a word. What matters is therefore not whether it can fail but what it leaves behind
+   * when it does.
+   *
+   * Deleting the envelope last left the worst possible remnant: an envelope wrapping the OLD
+   * vault's master key, standing over an account whose blobs and index had gone. `hasEnvelope()`
+   * still said yes, so the next `backupNow` sailed past `BackupNotEnabledError`, found no index to
+   * check itself against, and uploaded under the NEW vault's key. The result was a backup nobody
+   * could ever restore -- the passphrase unwraps the envelope to a master key that decrypts none
+   * of the blobs beneath it -- and nothing said so until someone tried to restore it.
+   *
+   * Deleting it first inverts that. Every failure now leaves either an untouched account (nothing
+   * had been deleted yet) or one whose envelope is gone, which reads as "backup is off": the next
+   * backup refuses with `BackupNotEnabledError` until the user enables it again, and enabling
+   * writes a fresh envelope around the key that is actually in use. Orphaned blobs may survive and
+   * that is the accepted cost -- they are unreadable bytes that cost storage, which `purgeAccount`
+   * sweeps and reports, and which the next enable overwrites. Unreadable bytes are recoverable
+   * from; an unrestorable backup is not.
+   */
   private async deleteAccountData(uid: string): Promise<void> {
-    for (const path of await this.listAccountBlobs(uid)) {
-      await this.backend.deleteBlob(path);
-    }
+    // First, so that an interrupted delete can never leave a key-mismatched envelope standing.
+    await this.backend.deleteDocument(BACKUP_PATHS.envelope(uid));
+    await this.backend.deleteDocument(BACKUP_PATHS.manifest(uid));
     // Named explicitly as well as swept: deleting it is the one thing that must not depend on a
     // listing succeeding, because the index is what makes every other blob findable.
     await this.backend.deleteBlob(BACKUP_PATHS.index(uid));
-    await this.backend.deleteDocument(BACKUP_PATHS.manifest(uid));
-    await this.backend.deleteDocument(BACKUP_PATHS.envelope(uid));
+    for (const path of await this.listAccountBlobs(uid)) {
+      await this.backend.deleteBlob(path);
+    }
   }
 
   private requireUser(): CloudUser {
