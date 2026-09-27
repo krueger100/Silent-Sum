@@ -78,7 +78,9 @@
     "firebase:sync": "node scripts/sync-firebase-linking.js",
     "typecheck:functions": "cd functions && npm run typecheck",
     "test:functions": "cd functions && npm test",
-    "build:functions": "cd functions && npm run build"
+    "build:functions": "cd functions && npm run build",
+    "eas:credentials": "node scripts/eas-credentials.js",
+    "eas:env": "node scripts/eas-env.js"
   },
   "expo": {
     "autolinking": {

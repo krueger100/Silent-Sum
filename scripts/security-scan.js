@@ -8,6 +8,7 @@
  *
  * Run with `npm run security:scan`.
  */
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -67,12 +68,21 @@ const FORBIDDEN_CONTENT = [
   },
 ];
 
-/** Files that must not be committed even if they are valid. */
+/**
+ * Files that must not be COMMITTED, however valid they are.
+ *
+ * Every one of them is supposed to exist on a machine that builds: docs/building.md asks for
+ * `keystore.properties`, and `scripts/eas-credentials.js` writes `credentials.json` from it. So
+ * presence on disk is not the fault -- being tracked by git is. The check below tests the latter,
+ * which is what the rule was always about; testing presence made following the release instructions
+ * fail the scan.
+ */
 const FORBIDDEN_FILES = [
   'google-services.json',
   'GoogleService-Info.plist',
   'keystore.properties',
   'key.properties',
+  'credentials.json',
 ];
 
 /** Git-ignored by design: see the note at the secrets check below. */
@@ -139,6 +149,10 @@ for (const file of files) {
   // public client identifier, not a secret - so scanning them would fail the build for doing
   // exactly what docs/firebase-setup.md asks for. Everywhere else, the rule still applies.
   if (relative.startsWith(FIREBASE_CONFIG_DIR)) continue;
+  // A credential store holds credentials; that is its job, and check 3 decides whether it has
+  // escaped into git. Reading one here would only invite a false alarm when a password happens to
+  // look like a key.
+  if (FORBIDDEN_FILES.includes(path.basename(file))) continue;
 
   let text;
   try {
@@ -151,11 +165,37 @@ for (const file of files) {
   }
 }
 
-// 3. Config files that belong only on a developer's machine.
+// 3. Config files that belong only on a developer's machine -- and only there.
+//
+// Reported when git TRACKS one, not when one merely exists: these are files a building machine is
+// meant to have. `git ls-files` is the whole tracked set in one call. If git cannot be reached the
+// check falls back to reporting on presence, which is the conservative direction: a false alarm is
+// recoverable, a committed keystore password is not.
+let tracked = null;
+try {
+  tracked = new Set(
+    execFileSync('git', ['ls-files', '-z'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .split('\0')
+      .filter((entry) => entry !== '')
+      .map((entry) => path.resolve(ROOT, entry)),
+  );
+} catch {
+  tracked = null;
+}
+
 for (const file of files) {
-  if (FORBIDDEN_FILES.includes(path.basename(file))) {
-    report(file, 'is a credential/config file that must not be committed');
-  }
+  if (!FORBIDDEN_FILES.includes(path.basename(file))) continue;
+  if (tracked !== null && !tracked.has(path.resolve(file))) continue;
+  report(
+    file,
+    tracked === null
+      ? 'is a credential/config file that must not be committed (git unavailable, checked by presence)'
+      : 'is a credential/config file and is TRACKED BY GIT; remove it from the index',
+  );
 }
 
 // 4. The vault must never write outside app-private storage.

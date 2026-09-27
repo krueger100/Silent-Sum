@@ -157,31 +157,68 @@ Three things about EAS differ from a local build, and all three have bitten this
   uncommitted is not in it either. That includes `.env` and `config/firebase/google-services.*.json`,
   which the app config reads to decide whether Firebase is compiled in at all. A build that does not
   receive them produces an app with **no Firebase**: no cloud backup, billing, messaging or support.
-  Supply them as EAS environment variables (`eas env:create`), using a file-type variable for
-  `GOOGLE_SERVICES_JSON`, or list them in a `.easignore` if you are content for them to travel in the
-  archive. `SILENTSUM_ENV` is already set per profile in `eas.json`.
+  `npm run eas:env` closes that gap (below). `SILENTSUM_ENV` is already set per profile in `eas.json`.
 
-`credentialsSource: "local"` on the production profile makes EAS use the same keystore as a local
-release build, read from `credentials.json` in the project root (git-ignored):
+### The configuration git does not carry
 
-```json
-{
-  "android": {
-    "keystore": {
-      "keystorePath": "../silentsum-release.jks",
-      "keystorePassword": "...",
-      "keyAlias": "...",
-      "keyPassword": "..."
-    }
-  }
-}
+```bash
+npm run eas:env             # show what would be set, and check every source is present
+npm run eas:env -- --apply  # set it
 ```
 
-It duplicates the four values in `keystore.properties`; keep them in step. Removing the
-`credentialsSource` line would let EAS generate and hold a keystore instead — simpler, but then
-locally built and EAS-built artifacts are signed with different keys, and only whichever signs the
-first Play upload can ever sign another. Failing loudly on a missing `credentials.json` is the safer
+Five variables in the EAS `production` environment, read from the files that already hold them so
+there is nothing to transcribe and nothing to keep in step:
+
+| Variable                  | Type   | Visibility | From                                        |
+| ------------------------- | ------ | ---------- | ------------------------------------------- |
+| `GOOGLE_SERVICES_JSON`    | file   | sensitive  | `config/firebase/google-services.prod.json` |
+| `FIREBASE_STORAGE_BUCKET` | string | plaintext  | `.env`                                      |
+| `SUPPORT_ENDPOINT`        | string | plaintext  | `.env`                                      |
+| `SUPPORT_FROM`            | string | plaintext  | `.env`                                      |
+| `SUPPORT_TO`              | string | plaintext  | `.env`                                      |
+
+A **file** variable is stored by EAS and written to disk during the build, with the variable set to
+the path it wrote. `app.config.ts` resolves it with `resolve(__dirname, value)`, which returns an
+absolute path unchanged, so nothing in the app had to change to accept it.
+
+The list is closed on purpose. `eas env:push` would upload every key `.env` grows later, including
+ones that should stay on one machine. A missing source stops the whole run rather than configuring
+half of it: a half-configured build is still wrong, with fewer clues why.
+
+`--force` is deliberately not passed, so re-running will not silently overwrite a variable somebody
+set by hand in the dashboard. Add it yourself if that is what you want.
+
+iOS is not covered: `GOOGLE_SERVICES_PLIST` would need the same treatment, and the iOS project has
+never been compiled (see below).
+
+`credentialsSource: "local"` on the production profile makes EAS use the same keystore as a local
+release build, read from `credentials.json` in the project root. That file holds the same four values
+as `keystore.properties`, so it is **generated** rather than maintained:
+
+```bash
+npm run eas:credentials
+```
+
+`keystore.properties` stays the only copy anyone edits. Keeping two by hand is a silent trap: they
+can disagree, and the way you find out is an EAS build that succeeds and produces an artifact Play
+then rejects for being signed with the wrong key.
+
+The script resolves credentials exactly as the Gradle plugin does — properties file first, then
+`SILENTSUM_KEYSTORE_*` from the environment — refuses to write if `credentials.json` is not
+git-ignored, and prints no value. What it does print is the keystore path, the key alias and the
+certificate's SHA-256 fingerprint, read back through `keytool` with the password supplied on stdin
+rather than the command line. The fingerprint is public — Play displays it — and it is the cheap way
+to learn that an alias or password is wrong before a build spends twenty minutes finding out. It is
+also what you register as the upload key in Play Console.
+
+Removing the `credentialsSource` line would let EAS generate and hold a keystore instead — simpler,
+but then locally built and EAS-built artifacts are signed with different keys, and only whichever
+signs the first Play upload can ever sign another. Failing loudly on missing credentials is the safer
 default, which is why it is set.
+
+Both `keystore.properties` and `credentials.json` are git-ignored and are _expected_ to exist on a
+machine that builds. `npm run security:scan` therefore fails only when git **tracks** one, not when
+one is merely present.
 
 ## Native modules that need a prebuild
 
