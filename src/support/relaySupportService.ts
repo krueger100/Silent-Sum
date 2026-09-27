@@ -2,9 +2,11 @@
  * The only outbound request this app makes that is not a backup: one POST, when the user presses
  * Send on the support screen.
  *
- * The body is the shape Resend's `POST /emails` expects, so `SUPPORT_ENDPOINT` can be either
- * Resend itself or a relay of your own that forwards the same JSON with the key held server-side
- * (see the note in `supportConfig.ts` about shipping keys in a binary).
+ * It carries NO credential. The endpoint is the project's own relay
+ * (`functions/src/supportRelay.ts`), which holds the mail provider's key and chooses the recipient
+ * from its own configuration. The body keeps the provider's field names because the relay forwards
+ * them, but `from` and `to` in it are advisory: the server discards them. That is deliberate --
+ * a public endpoint that honoured a caller's `to` would be an open mail relay.
  *
  * Nothing here retries on its own and nothing is queued: a failed send stays on screen as text the
  * user still has, and it is their choice whether to try again. A silent background retry would
@@ -39,12 +41,12 @@ export type SupportFetch = (
 
 export const SUPPORT_TIMEOUT_MS = 20_000;
 
-export interface ResendSupportOptions {
+export interface RelaySupportOptions {
   readonly fetchImpl?: SupportFetch;
   readonly timeoutMs?: number;
 }
 
-export class ResendSupportService implements SupportService {
+export class RelaySupportService implements SupportService {
   /** The configured support inbox, shown (never sent to) by the About screen. */
   get contact(): string {
     return this.config.to;
@@ -55,7 +57,7 @@ export class ResendSupportService implements SupportService {
 
   constructor(
     private readonly config: SupportConfig,
-    options: ResendSupportOptions = {},
+    options: RelaySupportOptions = {},
   ) {
     this.http = options.fetchImpl ?? ((url, init) => fetch(url, init));
     this.timeoutMs = options.timeoutMs ?? SUPPORT_TIMEOUT_MS;
@@ -74,8 +76,8 @@ export class ResendSupportService implements SupportService {
       payload.reply_to = message.replyTo;
     }
 
+    // No Authorization header: there is no credential in this build to send one with.
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (this.config.apiKey !== null) headers.Authorization = `Bearer ${this.config.apiKey}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => {

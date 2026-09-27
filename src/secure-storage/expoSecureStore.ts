@@ -1,7 +1,15 @@
 /**
  * `SecureStore` on top of expo-secure-store (Android Keystore-backed `SharedPreferences`,
- * iOS Keychain). Only small strings live here: the wrapped-master-key credential record and the
- * unlock throttle state. The PIN itself is never written anywhere.
+ * iOS Keychain).
+ *
+ * What is kept here, and what that means for a device that falls into someone else’s hands, is
+ * listed in `@/secure-storage/secureStore`. The short version, because it used to say the
+ * opposite: the records include the vault PIN and the wipe PIN in cleartext, deliberately, so
+ * that a partially-typed PIN can be recognised. The master key is only ever here WRAPPED.
+ *
+ * On Android these land in the `SecureStore` SharedPreferences file inside app-private storage,
+ * encrypted under a key held in the Android Keystore. Neither survives an uninstall; the file
+ * alone is what Clear Data removes. docs/security.md sets out how those differ.
  *
  * iOS configuration:
  *

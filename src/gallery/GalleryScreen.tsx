@@ -17,6 +17,8 @@ import { FlatList, Pressable, StyleSheet, Text, View, useWindowDimensions } from
 import { useServices, usePhotos, useVaultState } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles } from '@/app/theme';
 import { wipeLocalVault } from '@/auth/vaultWipe';
+import { FREE_TIER, MAX_ITEM_BYTES, type GateReason } from '@/billing/entitlements';
+import { VaultUpsellDialog } from '@/billing/screens/VaultUpsellDialog';
 import { Button } from '@/components/Button';
 import { ConfirmDialog, TypedConfirmDialog } from '@/components/Dialog';
 import { Paragraph, Screen } from '@/components/Screen';
@@ -36,11 +38,14 @@ export interface GalleryScreenProps {
   /** Tapped photo. The index is into the same newest-first list the viewer reads. */
   onOpenPhoto?: (photo: PhotoEntry, index: number) => void;
   onOpenSettings?: () => void;
+  /** Where the Pro dialog's "See plans" goes. Without it the dialog only informs. */
+  onOpenPlans?: () => void;
 }
 
 export function GalleryScreen({
   onOpenPhoto,
   onOpenSettings,
+  onOpenPlans,
 }: GalleryScreenProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
   const services = useServices();
@@ -56,6 +61,8 @@ export function GalleryScreen({
   // The camera is a sheet over this screen, not a separate route: a capture is reviewed and kept
   // or discarded without ever leaving the gallery.
   const [cameraOpen, setCameraOpen] = useState(false);
+  /** Which free-tier gate stopped the last import, while its dialog is up. */
+  const [upsell, setUpsell] = useState<GateReason | null>(null);
 
   const mounted = useRef(true);
   useEffect(() => {
@@ -97,15 +104,41 @@ export function GalleryScreen({
       setNotice('The vault is locked.');
       return;
     }
+    // The free tier gates ADDING only, and only in a build that can sell. A full vault gets the
+    // dialog instead of the picker; one with room gets a picker capped at exactly that room, so
+    // a selection is never half-imported.
+    // Zero bytes: nothing has been picked yet, so the size is unknown here. Each picked asset's
+    // size is checked inside the import, from the picker's metadata, before it is read.
+    const gate = services.entitlements.gate(target.photos.length, 0);
+    if (!gate.allowed) {
+      setUpsell(gate.reason);
+      return;
+    }
+    const room =
+      services.entitlements.enforced && !services.entitlements.isCloudActive()
+        ? FREE_TIER.maxItems - target.photos.length
+        : undefined;
     setNotice(null);
     setBusy(true);
     void (async () => {
       try {
-        const report = await importService.importFromLibrary(target);
+        const report = await importService.importFromLibrary(
+          target,
+          room === undefined ? {} : { selectionLimit: room },
+        );
         if (!mounted.current) return;
-        if (report.imported + report.failed > 0) {
+        if (report.imported + report.failed + report.oversized > 0) {
           const plural = report.imported === 1 ? '' : 's';
-          const tail = report.failed > 0 ? `, ${String(report.failed)} could not be read` : '';
+          // Oversized is reported beside failed rather than folded into it: "could not be read"
+          // is a broken file, "too large" is a fine file the vault will not take, and a user who
+          // is told the wrong one will go looking for the wrong problem.
+          const parts: string[] = [];
+          if (report.failed > 0) parts.push(`${String(report.failed)} could not be read`);
+          if (report.oversized > 0) {
+            const mb = String(MAX_ITEM_BYTES / (1024 * 1024));
+            parts.push(`${String(report.oversized)} over ${mb} MB`);
+          }
+          const tail = parts.length > 0 ? `, ${parts.join(' and ')}` : '';
           setNotice(`Imported ${String(report.imported)} photo${plural}${tail}.`);
         }
       } catch {
@@ -278,6 +311,15 @@ export function GalleryScreen({
         visible={cameraOpen}
         onClose={() => {
           setCameraOpen(false);
+        }}
+      />
+
+      <VaultUpsellDialog
+        visible={upsell !== null}
+        reason={upsell}
+        {...(onOpenPlans === undefined ? {} : { onPlans: onOpenPlans })}
+        onClose={() => {
+          setUpsell(null);
         }}
       />
 

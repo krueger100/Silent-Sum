@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "main": "index.ts",
   "dependencies": {
+    "@noble/curves": "^1.9.7",
     "@noble/hashes": "^1.8.0",
     "@react-native-firebase/analytics": "^26.4.0",
     "@react-native-firebase/app": "^26.4.0",
@@ -71,10 +72,13 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "check": "npm run typecheck && npm run lint && npm run security:scan && npm test",
+    "check": "npm run typecheck && npm run typecheck:functions && npm run lint && npm run security:scan && npm test && npm run test:functions",
     "security:scan": "node scripts/security-scan.js",
     "postinstall": "patch-package && node scripts/sync-firebase-linking.js",
-    "firebase:sync": "node scripts/sync-firebase-linking.js"
+    "firebase:sync": "node scripts/sync-firebase-linking.js",
+    "typecheck:functions": "cd functions && npm run typecheck",
+    "test:functions": "cd functions && npm test",
+    "build:functions": "cd functions && npm run build"
   },
   "expo": {
     "autolinking": {

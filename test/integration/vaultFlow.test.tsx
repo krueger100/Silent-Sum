@@ -155,7 +155,7 @@ describe('super secure', () => {
     expect(screen.getByTestId('menu_about')).toBeTruthy();
 
     await press('menu_forgot_pin');
-    expect(screen.getByTestId('forgot_pin_dialog')).toBeTruthy();
+    expect(screen.getByTestId('erase_explain_dialog')).toBeTruthy();
   });
 
   /**
@@ -182,7 +182,7 @@ describe('super secure', () => {
     );
 
     expect(screen.queryByTestId('calc_notice_forgot')).toBeNull();
-    expect(screen.queryByTestId('forgot_pin_dialog')).toBeNull();
+    expect(screen.queryByTestId('erase_explain_dialog')).toBeNull();
   });
 
   it('shows the same shortcut under the notice while it is off', async () => {
@@ -443,6 +443,42 @@ describe('unlocking from the calculator', () => {
       expect(screen.getByTestId('calculator-screen')).toBeTruthy();
     });
     expect(harness.services.session.isUnlocked).toBe(false);
+  });
+
+  /**
+   * Plans is the one screen both stacks declare, so it is the one place a locked app could be
+   * left showing something other than the calculator. Locking there must still land on the
+   * calculator -- and must not leave the user's billing address on screen.
+   */
+  it('returns to the calculator when the vault locks on the plans screen', async () => {
+    const harness = buildHarness();
+    await seedLockedVault(harness);
+    await renderApp(harness);
+    await waitFor(() => screen.getByTestId('calculator-screen'));
+
+    await typeDigits(PIN);
+    await press('calc_key_equals');
+    await waitFor(
+      () => {
+        expect(harness.services.session.isUnlocked).toBe(true);
+      },
+      { timeout: 10000 },
+    );
+
+    await waitFor(() => screen.getByTestId('vault-settings'));
+    await press('vault-settings');
+    await waitFor(() => screen.getByTestId('settings_plans'));
+    await press('settings_plans');
+    await waitFor(() => screen.getByTestId('plans_screen'));
+
+    await act(() => {
+      harness.services.session.lock();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('calculator-screen')).toBeTruthy();
+    });
+    expect(screen.queryByTestId('plans_screen')).toBeNull();
   });
 });
 

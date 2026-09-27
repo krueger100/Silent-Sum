@@ -165,3 +165,100 @@ describe('the unconfigured build', () => {
     jest.resetModules();
   });
 });
+
+/**
+ * Billing needs three things from the gateway: a cloud backend to read entitlements through,
+ * the project id (or an explicit https override) to find the functions, and not having been
+ * switched off. Each of the three is checked on its own.
+ */
+describe('billing', () => {
+  const AVAILABLE_MODULES: Readonly<Record<string, () => unknown>> = {
+    '@react-native-firebase/app': () => ({
+      getApps: () => [{ name: '[DEFAULT]' }],
+      getApp: () => ({ name: '[DEFAULT]', options: { projectId: 'demo-project' } }),
+    }),
+    '@react-native-firebase/crashlytics': () => ({
+      getCrashlytics: () => ({}),
+      setCrashlyticsCollectionEnabled: async () => undefined,
+      recordError: () => undefined,
+      log: () => undefined,
+    }),
+    '@react-native-firebase/analytics': () => ({
+      getAnalytics: () => ({}),
+      setAnalyticsCollectionEnabled: async () => undefined,
+      logEvent: () => undefined,
+    }),
+    '@react-native-firebase/app-check': () => ({
+      ReactNativeFirebaseAppCheckProvider: class {
+        configure(): void {}
+      },
+      initializeAppCheck: () => undefined,
+      getAppCheck: () => ({}),
+      getToken: async () => ({ token: 'app-check' }),
+    }),
+    '@react-native-firebase/auth': () => ({
+      getAuth: () => ({ currentUser: null }),
+      getIdToken: async () => 'id-token',
+    }),
+    '@react-native-firebase/firestore': () => ({}),
+    '@react-native-firebase/storage': () => ({}),
+  };
+
+  async function available(
+    options: Parameters<Gateway['initializeFirebase']>[1],
+  ): Promise<FirebaseServices> {
+    jest.resetModules();
+    for (const [id, factory] of Object.entries(AVAILABLE_MODULES)) jest.doMock(id, factory);
+    return loadGateway().initializeFirebase('prod', { configured: true, ...options });
+  }
+
+  function endpointOf(services: FirebaseServices): string | null | undefined {
+    return (services.billing as { endpoint?: string | null } | null | undefined)?.endpoint;
+  }
+
+  beforeEach(() => {
+    warn.mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    for (const id of FIREBASE_PACKAGES) jest.dontMock(id);
+    jest.resetModules();
+  });
+
+  it("offers billing against the project's own functions once there is a cloud backend", async () => {
+    const services = await available({ storageBucket: 'silentsum-vault' });
+    expect(services.available).toBe(true);
+    expect(services.cloud).not.toBeNull();
+    expect(endpointOf(services)).toBe('https://us-central1-demo-project.cloudfunctions.net');
+  });
+
+  it('honours an explicit https functions URL and ignores a plaintext one', async () => {
+    const explicit = await available({
+      storageBucket: 'silentsum-vault',
+      billing: { enabled: true, functionsUrl: 'https://billing.example.test/' },
+    });
+    expect(endpointOf(explicit)).toBe('https://billing.example.test');
+
+    const plaintext = await available({
+      storageBucket: 'silentsum-vault',
+      billing: { enabled: true, functionsUrl: 'http://billing.example.test' },
+    });
+    expect(endpointOf(plaintext)).toBe('https://us-central1-demo-project.cloudfunctions.net');
+  });
+
+  it('offers no billing without a cloud backend', async () => {
+    const services = await available({});
+    expect(services.available).toBe(true);
+    expect(services.cloud).toBeNull();
+    expect(services.billing).toBeNull();
+  });
+
+  it('offers no billing when the build turns it off', async () => {
+    const services = await available({
+      storageBucket: 'silentsum-vault',
+      billing: { enabled: false },
+    });
+    expect(services.cloud).not.toBeNull();
+    expect(services.billing).toBeNull();
+  });
+});

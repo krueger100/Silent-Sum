@@ -11,6 +11,7 @@ import { useStore } from 'zustand';
 import type { Services } from '@/app/services';
 import type { VaultControllerState } from '@/app/vaultController';
 import type { VaultSessionState } from '@/auth/vaultSession';
+import type { EntitlementsState } from '@/billing/entitlementsController';
 import type { AppSettings } from '@/settings/appSettings';
 import type { PhotoEntry, VaultRepository } from '@/vault/types';
 
@@ -60,6 +61,28 @@ export function usePhotos(): readonly PhotoEntry[] {
 export function useSettings(): AppSettings {
   const { settings } = useServices();
   return useStore(settings.store);
+}
+
+/**
+ * The account's entitlements as the store currently holds them: the live document while a
+ * backup account is signed in, the cache otherwise. Screens read this to label plans and to
+ * decide which gate card to show; the gates themselves go through `services.entitlements.gate`.
+ */
+export function useEntitlements(): EntitlementsState {
+  const { entitlements } = useServices();
+  return useStore(entitlements.store);
+}
+
+/**
+ * Whether a support-issued recovery code is currently live.
+ *
+ * Read through the store rather than the getter so that the navigator re-renders the moment
+ * the authorization ends: a screen still holding the overwrite power after it has been
+ * cleared is the one failure mode here that would matter.
+ */
+export function useRecoveryAuthorized(): boolean {
+  const { recovery } = useServices();
+  return useStore(recovery.store, (s) => s.authorized);
 }
 
 /**

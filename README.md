@@ -49,6 +49,8 @@ The app needs a development build rather than Expo Go, because it uses native li
 | `npm run typecheck` | TypeScript, no emit |
 | `npm run lint` | ESLint |
 | `npm run security:scan` | layering and secret checks a type checker cannot make |
+| `npm run test:functions` | the billing backend's Jest suite (`functions/`) |
+| `npm run typecheck:functions` | TypeScript for the backend |
 | `npm run android` | prebuild if needed, then build and install the debug app |
 | `npm run android:release` | release variant, minified |
 | `npm run ios` | same on macOS |
@@ -66,7 +68,9 @@ src/storage      file-system abstraction, atomic write, secure delete
 src/gallery      grid, tile, viewer, import
 src/camera       capture
 src/backup       envelope, backup service, backup and restore screens
-src/firebase     optional remote layer behind interfaces
+src/billing      Pro and Cloud: products, entitlements, offline mirror, plans screen, gates
+src/firebase     optional remote layer behind interfaces (incl. the callable client)
+functions/       Cloud Functions: PayMongo checkout + webhook -> Firestore entitlements
 src/privacy      auto-lock, lifecycle guard, curtain, screen protection
 src/settings     settings model, store, settings screens
 firebase/        Firestore and Storage security rules
@@ -82,6 +86,13 @@ Entirely optional and off unless configured. Nothing on the unlock path touches 
 with no Firebase config contains no Firebase native initialisation at all. Setup instructions are
 in [docs/firebase-setup.md](docs/firebase-setup.md). No secrets are committed; the config files are
 git-ignored.
+
+## Pro and Cloud
+
+SilentSum Pro (₱299 once, permanent: unlimited items and video) and SilentSum Cloud (₱99 per
+30-day term: encrypted backup, restore and cloud services) are sold through PayMongo from the
+Cloud Functions in `functions/`; the app never holds a payment key and never decides what it
+owns. See [docs/billing.md](docs/billing.md).
 
 ## Platforms
 

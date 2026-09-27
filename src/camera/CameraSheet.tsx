@@ -57,6 +57,7 @@ import { ActivityIndicator, BackHandler, Pressable, StyleSheet, Text, View } fro
 
 import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
+import { upsellMessage } from '@/billing/screens/VaultUpsellDialog';
 import type { CaptureInspector, CaptureRejection } from '@/camera/captureInspector';
 import { Button } from '@/components/Button';
 import { Paragraph } from '@/components/Screen';
@@ -293,8 +294,16 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
     if (captureInFlight.current) return;
     const camera = cameraRef.current;
     if (camera === null) return;
-    if (openRepository(services) === null) {
+    const target = openRepository(services);
+    if (target === null) {
       setNotice('The vault is locked.');
+      return;
+    }
+    // The free tier's cap, checked before the shutter fires: a frame that could not be kept is
+    // a plaintext file that never needed to exist.
+    const gate = services.entitlements.gate(target.photos.length, 0);
+    if (!gate.allowed) {
+      setNotice(upsellMessage(gate.reason));
       return;
     }
     const inspector: CaptureInspector = services.captureInspector;
@@ -349,8 +358,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
         outcome = 'failed';
       }
 
-      const dataUri =
-        captured === null ? null : `data:image/jpeg;base64,${toBase64(captured)}`;
+      const dataUri = captured === null ? null : `data:image/jpeg;base64,${toBase64(captured)}`;
       captureInFlight.current = false;
       const abandoned = !mounted.current || generation !== captureGeneration.current;
       if (abandoned || dataUri === null) {
@@ -364,9 +372,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
       if (mounted.current) {
         setCapturing(false);
         if (outcome !== 'captured' && !abandoned) {
-          setNotice(
-            outcome === 'failed' ? 'Could not take the photo.' : REJECTION_NOTICE[outcome],
-          );
+          setNotice(outcome === 'failed' ? 'Could not take the photo.' : REJECTION_NOTICE[outcome]);
         }
       }
     })();
@@ -449,6 +455,18 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
     void (async () => {
       try {
         if (video !== null) {
+          // The size cap can only be checked here. The mode-switch gate runs before anything is
+          // recorded, when the file does not exist and its length is unknown; a long take is the
+          // easiest way to pass that gate and still produce an item the vault will not accept.
+          // Asked of the file rather than read from it, so a 500 MB recording costs no memory.
+          const gate = services.entitlements.gate(
+            repository.photos.length,
+            await services.fs.size(video.uri),
+          );
+          if (!gate.allowed) {
+            if (mounted.current) setNotice(upsellMessage(gate.reason));
+            return;
+          }
           // The recording is read from its cache file straight into the cipher, a chunk at a time:
           // its bytes are never a JS buffer, so length is not a memory problem.
           await repository.addVideo(
@@ -493,9 +511,9 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
         <View testID="camera-permission" style={styles.centered}>
           <Text style={styles.heading}>Camera access needed</Text>
           <Paragraph>
-            Photos and videos you capture here are encrypted straight into the vault and never
-            reach your regular gallery. Recordings are silent -- this app never opens the
-            microphone. The camera cannot start without permission.
+            Photos and videos you capture here are encrypted straight into the vault and never reach
+            your regular gallery. Recordings are silent -- this app never opens the microphone. The
+            camera cannot start without permission.
           </Paragraph>
           {permission.canAskAgain ? null : (
             <Paragraph>
@@ -605,6 +623,20 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
               disabled={capturing || recording}
               onPress={() => {
                 setNotice(null);
+                if (option === 'video') {
+                  // A video is one vault item like any other, so a full free vault refuses it.
+                  // Refused HERE, before the camera is rebound for video, so no recording can
+                  // ever be started that could not be kept. The size is unknown until the file
+                  // exists, so `bytes` is 0 and the size check happens after recording.
+                  const gate = services.entitlements.gate(
+                    openRepository(services)?.photos.length ?? 0,
+                    0,
+                  );
+                  if (!gate.allowed) {
+                    setNotice(upsellMessage(gate.reason));
+                    return;
+                  }
+                }
                 // Switching mode rebinds CameraX's use cases, so the next capture has to wait for
                 // the new session to report ready -- exactly as a flip does.
                 cameraReady.current = false;
@@ -612,9 +644,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
               }}
               style={[styles.modeTab, mode === option ? styles.modeTabActive : null]}
             >
-              <Text
-                style={[styles.modeLabel, mode === option ? styles.modeLabelActive : null]}
-              >
+              <Text style={[styles.modeLabel, mode === option ? styles.modeLabelActive : null]}>
                 {option === 'photo' ? 'Photo' : 'Video'}
               </Text>
             </Pressable>
@@ -790,7 +820,12 @@ const makeStyles = (colors: Palette) =>
     modeLabel: { ...typography.label, color: colors.textMuted },
     modeLabelActive: { color: colors.accentText },
     recordRing: { borderColor: colors.danger },
-    recordInner: { width: 58, height: 58, borderRadius: radius.pill, backgroundColor: colors.danger },
+    recordInner: {
+      width: 58,
+      height: 58,
+      borderRadius: radius.pill,
+      backgroundColor: colors.danger,
+    },
     recordStop: { width: 30, height: 30, borderRadius: radius.sm, backgroundColor: colors.danger },
     recordingBadge: {
       position: 'absolute',
@@ -804,7 +839,12 @@ const makeStyles = (colors: Palette) =>
       borderRadius: radius.pill,
       backgroundColor: 'rgba(0, 0, 0, 0.6)',
     },
-    recordingDot: { width: 10, height: 10, borderRadius: radius.pill, backgroundColor: colors.danger },
+    recordingDot: {
+      width: 10,
+      height: 10,
+      borderRadius: radius.pill,
+      backgroundColor: colors.danger,
+    },
     recordingLabel: { ...typography.label, color: '#FFFFFF' },
     shutter: {
       width: 76,

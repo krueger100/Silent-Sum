@@ -42,14 +42,14 @@ the whole PIN, unwrap, Poly1305 tag as the only verifier.
 Until the PIN is covered, each correct part is answered with how many digits are still outstanding.
 With PIN `12142907`:
 
-| Calculation | Result | Response |
-| --- | --- | --- |
-| `2 − 1` | `1` | "1 is correct, but there are 7 more" |
-| `6 + 6` | `12` | "12 is correct, but there are 6 more" |
-| `1000 + 214` | `1214` | "1214 is correct, but there are 4 more" |
-| `2900 + 7` | `2907` | the vault opens |
-| `7 × 7` | `49` | nothing at all |
-| `12142907` | `12142907` | the vault opens on the first press |
+| Calculation  | Result     | Response                                |
+| ------------ | ---------- | --------------------------------------- |
+| `2 − 1`      | `1`        | "1 is correct, but there are 7 more"    |
+| `6 + 6`      | `12`       | "12 is correct, but there are 6 more"   |
+| `1000 + 214` | `1214`     | "1214 is correct, but there are 4 more" |
+| `2900 + 7`   | `2907`     | the vault opens                         |
+| `7 × 7`      | `49`       | nothing at all                          |
+| `12142907`   | `12142907` | the vault opens on the first press      |
 
 A run that occurs more than once is credited to the occurrence covering the most new digits,
 leftmost first, so entering a repeated digit twice covers both of its positions. Only a
@@ -86,14 +86,14 @@ arithmetic.
 
 ### Failed attempts
 
-| Consecutive failures | Delay |
-| --- | --- |
-| 1-2 | none |
-| 3 | 5 seconds |
-| 4 | 15 seconds |
-| 5 | 30 seconds |
-| 6 | 1 minute |
-| 7 and beyond | 5 minutes, doubling, capped at 1 hour |
+| Consecutive failures | Delay                                 |
+| -------------------- | ------------------------------------- |
+| 1-2                  | none                                  |
+| 3                    | 5 seconds                             |
+| 4                    | 15 seconds                            |
+| 5                    | 30 seconds                            |
+| 6                    | 1 minute                              |
+| 7 and beyond         | 5 minutes, doubling, capped at 1 hour |
 
 An attempt made during a delay is refused **before** the key derivation runs, so a locked-out
 attacker cannot even spend the device's CPU. Success resets the counter. Nothing is ever wiped
@@ -109,7 +109,7 @@ throttled.
 
 Two clocks enforce the lockout. The persisted deadline uses wall-clock time so it survives a
 restart; an in-process monotonic deadline runs alongside it, so moving the system clock forward
-while the app is running cannot shorten a lockout. A clock moved *backwards* past the last failure
+while the app is running cannot shorten a lockout. A clock moved _backwards_ past the last failure
 is treated as still fully locked.
 
 ### Forgetting the PIN
@@ -148,6 +148,57 @@ device. Only then is the recovered master key re-wrapped under a new local PIN, 
 the download start. The account password is authentication; it is never an encryption key, and
 resetting it changes nothing about the envelope, the master key or any uploaded blob.
 
+### Support-issued recovery codes
+
+Super secure mode empties the calculator menu down to About, which takes the forgot-PIN dialog
+with it. That is the point of the mode, and it leaves one narrow hole: a user who has forgotten
+their PIN can reach customer service and nothing else. A recovery code is the answer we can send
+back (`src/support/recoveryCode.ts`, `src/support/recoveryAccess.ts`).
+
+The scheme is asymmetric on purpose. The app holds an Ed25519 **public** key, compiled in from
+`extra.recoveryPublicKey`; the private half never leaves the signing machine. Verifying a code
+and minting one are therefore different powers, and only the first ships: pulling the key out of
+the APK buys nothing. A shared secret would have put both in every install.
+
+What is signed is a context string, the installation reference, and an expiry day. The reference
+is ten random bytes generated on first use and shown on the About page; because it is inside the
+signed message and supplied by the verifier rather than the typist, a code minted for one phone
+simply fails signature verification on any other. There is no separate device check to forget.
+Codes expire after seven days and are single use, with spent codes remembered across restarts so
+"use it again" cannot be turned into "close the app first".
+
+The reference is written into the support draft as editable text rather than attached to the
+message, so nothing leaves unseen and the user can delete it. It is also generated until it
+survives `scrub` unchanged. The scrubber redacts runs of four to eight digits because that is the
+shape of a PIN, so a reference whose group happened to be four digits would arrive as
+`[redacted]` -- about one in twenty-six of them -- leaving a code signed against the wrong
+reference and rejected by the phone that asked for it. The constraint sits in generation rather
+than in an exemption to the scrubber, so the PIN rule keeps the "cannot opt out, cannot forget"
+property it was written to have.
+
+Verification is arithmetic on bytes the user typed. No network, no Firebase, no server that has
+to be up -- which matters, because the people who need a code are by definition already locked
+out of something.
+
+A code buys exactly one thing: the restore flow appears. It decrypts nothing, reveals no key
+material, cannot change or bypass the PIN, and cannot stand in for the recovery passphrase, which
+is still what unwraps the envelope and which we have never had. The authorization is held in
+memory only and ends on completion, on backing out, on the vault locking, and on process restart.
+
+Because the user has told us the vault on the device cannot be opened, this is the one path where
+`adoptMasterKey` is allowed to overwrite an existing vault. That replacement happens at the END of
+the flow, after the passphrase has already unwrapped the key, so the vault on the device is given
+up only once its replacement is certain -- and the PIN step says plainly that anything added since
+the last backup is not coming back.
+
+The residual risk is not cryptographic. It is that whoever issues codes can be socially engineered
+into confirming, to whoever is holding a particular handset, that the app is a vault rather than a
+calculator. For some users that disclosure is the thing they were relying on. Verify the requester
+before signing; `scripts/recovery-code.js` says so where it cannot be missed.
+
+Builds with no `RECOVERY_PUBLIC_KEY` cannot accept a code, and the About page then offers no field
+at all.
+
 ### The wipe PIN
 
 An optional second PIN that destroys instead of opening, for coercion. It is armed in
@@ -162,6 +213,7 @@ Settings -> Wipe PIN with a scope: `This device`, `Cloud backup`, or `Both`.
   number it was, destroyed a vault with no way to stop it and no sign that it had happened. Safety
   won. The cost is real and should be stated plainly: someone watching the screen now sees the
   prompt, so the feature no longer hides itself at the moment it is used.
+
 - **Everything after the answer is still invisible.** No notice, no navigation, no welcome sheet
   reappearing, and deliberately no analytics event -- one would be a durable record that the
   feature exists and was used. The destruction runs in the background, so the display goes back to
@@ -188,12 +240,12 @@ Settings -> Wipe PIN with a scope: `This device`, `Cloud backup`, or `Both`.
   answers reads from its offline cache without reaching the server. So the cloud wipe first makes
   an authenticated, uncached Cloud Storage listing, and deletes nothing unless it succeeds. The
   outcome being ruled out is a half-deleted backup -- some blobs gone, the envelope still standing
-  -- which destroys data without achieving what the wipe was for. A token that expires *between*
+  -- which destroys data without achieving what the wipe was for. A token that expires _between_
   two of `disable()`'s own calls could still leave the cloud copy part-deleted; that window cannot
   be closed from the client.
 - **The armed scope is reported, never inferred.** Settings and the Wipe PIN screen print the scope
   read from the stored record, verbatim, as `Wipe PIN active: <scope>`. The scope picker is a
-  separate thing that starts with *nothing* selected, is never seeded from the record, and needs a
+  separate thing that starts with _nothing_ selected, is never seeded from the record, and needs a
   confirmation of its own before a row becomes the selection; arming then confirms the scope by
   name one last time, and a cloud-touching scope has to carry the warning that the envelope goes
   with the blobs.
@@ -203,6 +255,7 @@ Settings -> Wipe PIN with a scope: `This device`, `Cloud backup`, or `Both`.
   the armed scope, `both` was armed by a stray tap on the row above, and the wipe took the cloud
   backup with the phone. Anything that lets a default appear where the armed scope belongs
   reintroduces that bug.
+
 - **Storage.** The record lives in the platform secure store under its own key and holds the PIN as
   itself. Hashing only this one would be theatre: the vault PIN is already stored in the clear
   beside it, for the substring rule above.
@@ -320,6 +373,67 @@ storage with wear levelling the controller may retain stale copies, so this is b
 documented as such: it removes the easy recovery path rather than guaranteeing erasure. For vault
 blobs the contents were ciphertext anyway.
 
+## Four different erasures
+
+These are routinely confused, including by people who built the thing. They remove different
+amounts, and only one of them is the one this app documents.
+
+|                           | Local vault, PIN, settings | Overwritten first | Keystore key  | Cloud backup                                |
+| ------------------------- | -------------------------- | ----------------- | ------------- | ------------------------------------------- |
+| Android **Clear Data**    | gone                       | **no**            | **survives**  | untouched                                   |
+| SilentSum **in-app wipe** | gone                       | yes               | entry deleted | untouched (unless the scope says otherwise) |
+| **Uninstall**             | gone                       | no                | destroyed     | untouched                                   |
+| **Delete backup account** | unchanged                  | n/a               | unchanged     | gone                                        |
+
+### Android Clear Data / Clear Storage
+
+Settings -> Apps -> SilentSum -> Storage -> Clear Data empties the app's data directory. That
+takes the document directory (`files/vault/` and the settings JSON), the SharedPreferences that
+expo-secure-store writes into, the cache, and the Firebase SDK's persisted auth session. So the
+credential record goes, and with it the wrapped master key, the stored PIN and the wipe PIN; the
+encrypted media and the index go; the settings go and the app returns to its first-run state,
+signed out. The old PIN afterwards opens nothing, because the wrapped key it would unwrap no
+longer exists.
+
+**It does not delete the cloud backup.** Nothing about Clear Data reaches Firestore or Cloud
+Storage. The envelope and the encrypted blobs are exactly where they were, and are still
+restorable with the account password and the recovery passphrase. That is the intended behaviour
+-- it is what makes a lost or reset phone survivable -- but it means Clear Data is not a way to
+make the photos go away.
+
+**It is not equivalent to the in-app wipe**, for two reasons, and neither is theoretical:
+
+- Clear Data unlinks files. It does not perform the overwrite pass described under
+  [Secure deletion](#secure-deletion). The old `SecureStore` SharedPreferences file and the old
+  `.enc` blobs may therefore remain in unallocated blocks.
+- The Android Keystore key that encrypts those SharedPreferences is keyed to the app and is NOT
+  removed by Clear Data. So the key that could decrypt a recovered copy of that file is still on
+  the device -- and the record inside it carries the PIN in cleartext as well as the wrapped
+  master key.
+
+Together those mean Clear Data leaves a recovery path that the in-app wipe closes. It needs
+physical access and low-level flash recovery on an unlocked device, and wear levelling limits
+what even the in-app overwrite can promise -- but the difference is real and should not be
+described away.
+
+### Uninstall
+
+Removes everything Clear Data removes, and additionally destroys the Keystore entries, since
+those are scoped to the package. The blocks are still not overwritten, but nothing on the device
+can decrypt them any more. `allowBackup: false` means no OS backup copy exists to restore from
+either. Uninstalling is therefore strictly stronger than Clear Data, and weaker than the in-app
+wipe only in that it skips the overwrite.
+
+### The in-app wipe, and deleting the backup account
+
+The in-app wipe is the one described under [Forgetting the PIN](#forgetting-the-pin) and
+[The wipe PIN](#the-wipe-pin): ordered steps, decrypted temporaries first, an overwrite pass
+before each unlink, and the secure-store entries deleted explicitly. It stops at the device
+boundary unless a wipe PIN scope says otherwise.
+
+Deleting the backup account is the only thing that removes the cloud copy, and it removes nothing
+locally. See [Cloud backup](#cloud-backup).
+
 ## Lifecycle
 
 - Auto-lock after a configurable time in the background (immediately, 30 s, 1, 5 or 15 minutes;
@@ -362,12 +476,13 @@ Off by default and entirely optional.
   ever restore, that look like safety. A decryption failure while merging is not swallowed; it
   means those keys do not belong to that account's backup, and carrying on would strand the blobs
   the index no longer named.
+
 - An erase of the whole local vault does not touch the cloud either: forgetting the PIN signs the
   device out, because that copy is the only way back.
 - **Restoring comes in two shapes, and they are not interchangeable.** Settings -> Cloud backup ->
-  *Restore from backup* pulls the cloud copy down into a vault that is already open: it is additive
+  _Restore from backup_ pulls the cloud copy down into a vault that is already open: it is additive
   and idempotent, skips every id the vault already holds, and never deletes or overwrites anything
-  locally. The locked calculator's *Forgot PIN?* route instead rebuilds a vault that is gone, and
+  locally. The locked calculator's _Forgot PIN?_ route instead rebuilds a vault that is gone, and
   has to re-wrap the recovered key under a new PIN chosen on that device.
 
   The in-vault restore verifies the passphrase by unwrapping the envelope, then compares the
@@ -397,6 +512,7 @@ Off by default and entirely optional.
   because this device holds every photo, and turning backup off and on rebuilds the account.
 
   The recovered key is zeroed in a `finally` on every path.
+
 - Security rules restrict every path to the token's uid, validate the envelope and manifest shapes,
   and bound object size and content type. App Check is activated.
 - Without the passphrase the backup is useless to anyone, including the operator.
@@ -431,9 +547,46 @@ offering a form that goes nowhere.
 - The screen is inside the vault, so it is reachable only after unlocking. A user locked out of
   their own vault cannot use it, which is the same trade the rest of the app makes.
 
-The transport is Resend's `POST /emails` shape, so `SUPPORT_ENDPOINT` can be Resend itself or a
-relay of your own that forwards the same JSON body with the key held server-side. See
-`src/support/supportConfig.ts` for why the relay is the recommended arrangement.
+The transport is a POST to this project's own `silentsumSupportRelay` function, which holds the mail
+provider's API key in Secret Manager and picks the recipient from its own configuration. The body
+keeps the provider's field names because the relay forwards them, but a `from` or `to` in it is
+discarded server-side: honouring either would make a public endpoint an open mail relay for the
+verified domain. The app carries no credential, and a provider's own API host is refused as an
+endpoint, so the arrangement this replaced cannot return through configuration.
+
+## Payments and entitlements
+
+SilentSum Pro (₱299 once, permanent) and SilentSum Cloud (₱99 per 30-day term) are sold through
+PayMongo and recorded in Firebase. `docs/billing.md` has the full design; the security properties:
+
+- **The client is never trusted.** The app never holds a PayMongo key, never calls PayMongo, and
+  has no code path that tells the server what it owns. Entitlements are written only by the Cloud
+  Functions (Admin SDK) after PayMongo's signed webhook confirms a payment, or after the same
+  functions have asked PayMongo directly ("I have paid"). The rules let the owner read
+  `users/<uid>/billing/entitlements` and let no client write it.
+- **The webhook is verified over the raw bytes** with the webhook secret (HMAC-SHA256 of
+  `"<t>.<body>"`, constant-time compare, 5-minute replay window, live/test signature chosen by the
+  event's own mode, events from the other mode ignored).
+- **Every payment is applied once.** Webhook event ids and PayMongo payment ids are both recorded
+  in server-only ledgers; the payment ledger entry and the entitlement change are one Firestore
+  transaction. Retries, duplicate event types and the reconciliation path all collapse onto it.
+  A second Pro payment is recorded as already-owned and changes nothing.
+- **Amounts and identities come from the server's own records.** A checkout session is filed
+  under the uid and product it was created for; the webhook body may agree with that record but
+  never replace it, and the paid amount must equal the server price.
+- **Pro and Cloud are independent fields.** No transition touches both. Cloud lapsing is derived
+  from a date (`cloud.accessUntil`), never scheduled, and the security rules compare that date
+  with `request.time` to gate backup writes; reads and deletes are never gated, so a lapsed account
+  can always take its data out and delete itself.
+- **The offline mirror is a mirror.** The last entitlement document seen is cached in the secure
+  store so Pro works with no network. Nothing on the server reads it and the rules never trust it;
+  editing it on a rooted phone unlocks local features on that phone only. It is erased with the
+  vault and restored by signing in.
+- **Nothing about Pro or Cloud appears on the calculator, the ⋮ menu or the disguised About
+  page.** The plans screen is reachable only from inside the vault and from the restore flow. The
+  post-checkout return page names no product and echoes nothing from its URL.
+- **The vault, the PIN, the throttle, recovery codes, the wipe PIN and every erase path are
+  unchanged.** A build with no billing behaves exactly as before, with every feature open.
 
 ## Verified on device
 
@@ -487,9 +640,16 @@ by inspecting the device rather than by reading the code:
   available here. There is no hardware attestation of the app itself.
 - The disguise is behavioural, not forensic. Anyone who inspects the installed binary can tell what
   the app is.
-- A `SUPPORT_API_KEY` compiled into the app is readable by anyone who unzips the APK, exactly like
-  any other string in the bundle. Pointing `SUPPORT_ENDPOINT` at a relay that holds the Resend key
-  server-side is the only arrangement that does not ship a usable credential; a sending-only key on
-  a rotatable domain is the fallback, and a full-access key is never acceptable. The security scan
-  fails on a Resend key found anywhere in the tracked source, but it cannot see what an operator
-  puts in their `.env`.
+- The support relay (`silentsumSupportRelay`) is unauthenticated. It has to be: a user locked out of
+  the vault is the one who most needs to write in, and the vault has no account they could sign in
+  with. What bounds it is that it can send to exactly one address — its own configured `to`, with any
+  `from` or `to` in the request body discarded — and that it is rate limited per caller and in total
+  per window. The per-caller bucket is keyed on `X-Forwarded-For`, which a caller can set, so it is
+  the *total* that actually holds. Requiring an App Check token would narrow this further and is the
+  obvious next step; it needs a token the app does not currently attach to that request.
+- A credential compiled into the app is readable by anyone who unzips the APK, exactly like any other
+  string in the bundle. This project shipped a `SUPPORT_API_KEY` in `extra` until the relay replaced
+  it, and the lesson is structural rather than procedural: there is now no field to put one in,
+  `app.config.ts` reads no key, `parseSupportConfig` refuses a mail provider as an endpoint, and
+  `npm run security:scan` fails if either changes. The scan still cannot see what an operator puts in
+  their own `.env`, which is why the config no longer has anywhere for it to go.

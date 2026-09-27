@@ -41,5 +41,16 @@ export {
 } from '@/firebase/firebaseCloudBackend';
 export type { CloudModules } from '@/firebase/firebaseCloudBackend';
 
-export { initializeFirebase } from '@/firebase/firebaseGateway';
+export { BILLING_FUNCTIONS_REGION, initializeFirebase } from '@/firebase/firebaseGateway';
 export type { FirebaseGatewayOptions, SilentSumEnv } from '@/firebase/firebaseGateway';
+
+export { CALLABLE_TIMEOUT_MS, CallableClient, CallableError } from '@/firebase/callableClient';
+export type {
+  CallableClientOptions,
+  CallableFetch,
+  CallableHttpResponse,
+  CallableInvoker,
+  CallableTokens,
+} from '@/firebase/callableClient';
+
+export { BILLING_FUNCTIONS, FirebaseBillingService } from '@/firebase/firebaseBillingService';

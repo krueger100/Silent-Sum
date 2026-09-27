@@ -114,11 +114,19 @@ export class FakeThumbnailGenerator implements ThumbnailGenerator {
   calls = 0;
   failOnNextCall = false;
 
+  /**
+   * The size the last caller asked for. Chat media must regenerate at 256, not reuse the vault's
+   * 512px preview -- a mistake that would pass every other check and be refused by the Storage
+   * rules on a real device.
+   */
+  lastMaxDimension: number | null = null;
+
   async generate(
     image: ImageInput,
     maxDimension: number = THUMBNAIL.defaultMaxDimension,
   ): Promise<ThumbnailResult> {
     this.calls += 1;
+    this.lastMaxDimension = maxDimension;
     if (this.failOnNextCall) {
       this.failOnNextCall = false;
       throw new ImageDecodeError('fake decode failure');

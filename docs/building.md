@@ -74,12 +74,19 @@ After the first install, `npm run start:dev-client` is enough for JavaScript cha
 nothing about the local vault. Copy `.env.example` to `.env` to set it and the optional Firebase
 paths; every variable has a working default and none is required.
 
-`SUPPORT_FROM` and `SUPPORT_TO` turn on the customer service screen; with either empty the screen
-says support is not set up in this build. `SUPPORT_ENDPOINT` defaults to Resend's `/emails` and
-can point at a relay of your own instead, which is the recommended arrangement: everything in
-`extra`, `SUPPORT_API_KEY` included, is readable in the shipped bundle. See the note at the top of
-`src/support/supportConfig.ts`. On a dev-client build these values come from the Metro manifest, so
-restarting `npm run start:dev-client` with different values is enough - no native rebuild.
+`SUPPORT_ENDPOINT`, `SUPPORT_FROM` and `SUPPORT_TO` turn on the customer service screen; with any of
+them empty the screen says support is not set up in this build.
+
+`SUPPORT_ENDPOINT` is the deployed `silentsumSupportRelay` function, never a mail provider. The
+provider's API key is held by that function through Secret Manager, and the app sends no credential
+at all — everything in `extra` is readable in the shipped bundle, so a bearer token there would be
+published with every build. Pointing the endpoint at a provider's own host is refused outright by
+`src/support/supportConfig.ts`, and `npm run security:scan` fails if `app.config.ts` starts reading a
+key again. The relay needs `SILENTSUM_SUPPORT_FROM` and `SILENTSUM_SUPPORT_TO` in `functions/.env`
+and `RESEND_API_KEY` in Secret Manager; see `firebase/README.md`.
+
+On a dev-client build these values come from the Metro manifest, so restarting
+`npm run start:dev-client` with different values is enough - no native rebuild.
 
 ## Release build
 
@@ -90,9 +97,91 @@ npx expo run:android --variant release
 or, from `android/`, `./gradlew assembleRelease`. Release builds are R8-minified with resource
 shrinking, configured through the `expo-build-properties` plugin.
 
-Signing: create `android/keystore.properties` (git-ignored) with `storeFile`, `storePassword`,
-`keyAlias` and `keyPassword`, or let EAS manage credentials. Keystores are never committed; back
-yours up, because Play will not accept a replacement.
+For Play, build an app bundle instead: `./gradlew bundleRelease`, which writes
+`android/app/build/outputs/bundle/release/app-release.aab`.
+
+### Signing
+
+Expo's template signs the release build with `debug.keystore`. That is not a placeholder to fix
+later: Play rejects a debug-signed upload, and `debug.keystore` is the same key in every React
+Native checkout, so anything it signs can be replaced by anybody. `plugins/withReleaseSigning.js`
+replaces it, and makes `assembleRelease`/`bundleRelease` **fail** when no real key is configured
+rather than hand you an artifact that is only refused at upload.
+
+Copy `keystore.properties.example` to `keystore.properties` in the **project root** — not
+`android/`, which `expo prebuild` deletes — and fill in `storeFile`, `storePassword`, `keyAlias` and
+`keyPassword`. `storeFile` may be absolute or relative to the project root. For CI, leave the file
+out and set `SILENTSUM_KEYSTORE_FILE`, `SILENTSUM_KEYSTORE_PASSWORD`, `SILENTSUM_KEY_ALIAS` and
+`SILENTSUM_KEY_PASSWORD` instead.
+
+Generate one with the JDK's own tool:
+
+```bash
+keytool -genkeypair -v -keystore silentsum-release.jks -alias silentsum \
+  -keyalg RSA -keysize 4096 -validity 10000
+```
+
+Keystores and `keystore.properties` are git-ignored, and `npm run security:scan` fails if either is
+committed. **Back the keystore up somewhere you will still have in five years**: Play will not accept
+an app signed with a different upload key without a key reset, and a reset needs the working key to
+request.
+
+`npm run security:scan` also re-checks the generated `android/app/build.gradle` whenever one exists,
+so a stale prebuild that reintroduces debug signing is caught before a build rather than after.
+
+## Building on EAS
+
+`eas.json` has two profiles. `production` is `distribution: store` with
+`android.buildType: app-bundle`, so it runs `:app:bundleRelease` and produces the `.aab` Play wants;
+`development` is an internal-distribution `.apk` with the dev client.
+
+```bash
+npx eas-cli@latest build --platform android --profile production
+```
+
+`cli.appVersionSource` is **`local`** on purpose, against EAS's own recommendation of `remote`.
+Remote means EAS stores and increments `versionCode` on its servers and ignores what the app config
+says, which would make the value in `app.config.ts` decoration. Here `app.config.ts` stays the
+source of truth, at the cost of bumping it by hand for every upload (see Versioning below).
+
+Three things about EAS differ from a local build, and all three have bitten this project:
+
+- **`android/` is git-ignored, so EAS does not receive it** and runs prebuild remotely instead. The
+  config plugins therefore run on EAS, including `withReleaseSigning`.
+- **EAS signs the release itself.** It writes `android/app/eas-build.gradle` with its own
+  `signingConfigs.release` and applies it from `build.gradle`. `withReleaseSigning` detects
+  `EAS_BUILD=true` and stands down: it installs no failure guard and assigns no `signingConfig`, so
+  the two do not fight. Without that, every EAS build would stop for want of a `keystore.properties`
+  that cannot exist in a remote workspace.
+- **The archive is decided by git.** Anything git-ignored is absent from the build, and anything
+  uncommitted is not in it either. That includes `.env` and `config/firebase/google-services.*.json`,
+  which the app config reads to decide whether Firebase is compiled in at all. A build that does not
+  receive them produces an app with **no Firebase**: no cloud backup, billing, messaging or support.
+  Supply them as EAS environment variables (`eas env:create`), using a file-type variable for
+  `GOOGLE_SERVICES_JSON`, or list them in a `.easignore` if you are content for them to travel in the
+  archive. `SILENTSUM_ENV` is already set per profile in `eas.json`.
+
+`credentialsSource: "local"` on the production profile makes EAS use the same keystore as a local
+release build, read from `credentials.json` in the project root (git-ignored):
+
+```json
+{
+  "android": {
+    "keystore": {
+      "keystorePath": "../silentsum-release.jks",
+      "keystorePassword": "...",
+      "keyAlias": "...",
+      "keyPassword": "..."
+    }
+  }
+}
+```
+
+It duplicates the four values in `keystore.properties`; keep them in step. Removing the
+`credentialsSource` line would let EAS generate and hold a keystore instead — simpler, but then
+locally built and EAS-built artifacts are signed with different keys, and only whichever signs the
+first Play upload can ever sign another. Failing loudly on a missing `credentials.json` is the safer
+default, which is why it is set.
 
 ## Native modules that need a prebuild
 
@@ -152,7 +241,13 @@ in `app.config.ts`.
 
 ## Versioning
 
-Bump `version` in `app.config.ts` and `package.json` together.
+Bump `version` in `app.config.ts` and `package.json` together. It is what users see.
+
+`android.versionCode` in `app.config.ts` is the separate number Play actually compares, and it must
+increase for **every** upload — including a re-upload of the same `version`. It is declared in
+`app.config.ts` rather than left in `android/app/build.gradle` because prebuild regenerates that
+file: a versionCode edited there silently returns to 1, and Play then refuses the upload as a
+duplicate of one it already has.
 
 ## Continuous integration
 

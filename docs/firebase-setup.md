@@ -14,6 +14,7 @@ end-to-end-encrypted cloud backup.
 | Authentication (email/password) | identifies the backup account only | never a vault credential |
 | Cloud Firestore | key envelope and a manifest of uploaded ids | rules in `firebase/firestore.rules` |
 | Cloud Storage | encrypted photo, thumbnail and index blobs | rules in `firebase/storage.rules` |
+| Cloud Functions | PayMongo checkout, webhook and entitlements (`functions/`) | codebase `silentsum`, see §8 |
 
 Not used: Cloud Messaging, Remote Config, Realtime Database, In-App Messaging. Cloud Messaging in
 particular would add a notification permission for no product benefit.
@@ -96,6 +97,29 @@ Analytics stays entirely silent until the user opts in. No user id or user prope
 
 Each backup upload is a full ciphertext copy of the photos, so Storage egress and storage are the
 cost drivers. Set a budget alert before inviting real users.
+
+## 8. Billing (Cloud Functions + PayMongo)
+
+Purchases (SilentSum Pro, SilentSum Cloud) run through five Cloud Functions in `functions/`
+(codebase `silentsum`) that hold the PayMongo keys as Firebase secrets; the app only ever calls
+them. `docs/billing.md` has the design, the configuration table and the setup steps. The short
+form:
+
+```bash
+cd functions && npm install && cd ..
+firebase functions:secrets:set PAYMONGO_SECRET_KEY --project eevee-mate
+firebase functions:secrets:set PAYMONGO_WEBHOOK_SECRET --project eevee-mate
+firebase deploy --only functions:silentsum --project eevee-mate
+```
+
+Register the webhook URL in the PayMongo dashboard, then ship the app, and **only then** deploy
+the rules (`firestore:rules,storage`): they gate backup writes on an active Cloud term, and
+deploying them first would stop every existing backup. The Storage rules read Firestore
+(`firestore.get`); the first such deploy asks to grant the Storage rules service agent access.
+
+`firebase deploy --only functions:silentsum` manages only this codebase's five functions. Never
+run a bare `--only functions` deploy from another project against `eevee-mate` without checking
+what it would delete: EVPAL's Stripe functions live there too.
 
 ## Production checklist
 

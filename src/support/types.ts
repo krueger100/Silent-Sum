@@ -7,8 +7,8 @@
  * schedule, or as a side effect of any other action.
  *
  * The transport is described by `SupportService` alone, so the app never depends on which provider
- * is behind it. `src/support/resendSupportService.ts` implements it against the Resend HTTP API
- * (or a relay that speaks the same shape).
+ * is behind it -- and it does not know: `src/support/relaySupportService.ts` posts to this project's
+ * own relay function, which holds the mail provider's credential and picks the recipient itself.
  */
 
 export type SupportTopic = 'unlock' | 'photos' | 'backup' | 'bug' | 'other';
@@ -46,12 +46,7 @@ export interface SupportMessage {
  * retrying will never succeed, so the screen says so instead of offering a retry.
  */
 export type SupportFailure =
-  | 'unreachable'
-  | 'configuration'
-  | 'rejected'
-  | 'rateLimited'
-  | 'server'
-  | 'unknown';
+  'unreachable' | 'configuration' | 'rejected' | 'rateLimited' | 'server' | 'unknown';
 
 export type SupportSendResult =
   | { readonly kind: 'sent'; readonly reference: string | null }

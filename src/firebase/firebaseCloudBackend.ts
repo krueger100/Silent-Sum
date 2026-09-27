@@ -10,7 +10,14 @@
  * was never configured.
  */
 import { CLOUD_ERROR_CODES } from '@/firebase/cloudBackend';
-import { CloudError, type CloudBackend, type CloudUser } from '@/firebase/types';
+import {
+  CloudError,
+  isFieldIncrement,
+  type CloudBackend,
+  type CloudUser,
+  type CollectionEntry,
+  type CollectionQuery,
+} from '@/firebase/types';
 import { uriDirname, type FileSystem } from '@/storage/fileSystem';
 import type { Bytes } from '@/utils/bytes';
 import type * as AppNamespace from '@react-native-firebase/app';
@@ -33,6 +40,28 @@ export interface CloudModules {
 
 /** Storage rules require this exact content type; uploading anything else is rejected. */
 export const BLOB_CONTENT_TYPE = 'application/octet-stream';
+
+/**
+ * Swaps the transport-neutral `FieldIncrement` markers for Firestore's own sentinel, everywhere
+ * they appear including inside nested maps. Nothing outside src/firebase knows what a FieldValue
+ * is, which is what keeps the rest of the app testable against the in-memory backend.
+ */
+function withFieldValues(
+  data: Record<string, unknown>,
+  increment: (n: number) => unknown,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (isFieldIncrement(value)) {
+      out[key] = increment(value.__increment);
+    } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      out[key] = withFieldValues(value as Record<string, unknown>, increment);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
 
 /**
  * Loads the three RNFirebase packages. Throws when a native module is missing, which is why the
@@ -246,9 +275,19 @@ export class FirebaseCloudBackend implements CloudBackend {
     await guard(() => auth.deleteUser(user));
   }
 
-  async putDocument(path: string, data: Record<string, unknown>): Promise<void> {
+  async putDocument(
+    path: string,
+    data: Record<string, unknown>,
+    options?: { readonly merge?: boolean },
+  ): Promise<void> {
     const { firestore } = this.m;
-    await guard(() => firestore.setDoc(firestore.doc(firestore.getFirestore(), path), data));
+    const payload = withFieldValues(data, firestore.increment);
+    const reference = firestore.doc(firestore.getFirestore(), path);
+    await guard(() =>
+      options?.merge === true
+        ? firestore.setDoc(reference, payload, { merge: true })
+        : firestore.setDoc(reference, payload),
+    );
   }
 
   async getDocument(path: string): Promise<Record<string, unknown> | null> {
@@ -263,6 +302,61 @@ export class FirebaseCloudBackend implements CloudBackend {
   async deleteDocument(path: string): Promise<void> {
     const { firestore } = this.m;
     await guard(() => firestore.deleteDoc(firestore.doc(firestore.getFirestore(), path)));
+  }
+
+  /**
+   * A live listener on one document. Firestore delivers the current value first, then every
+   * change, which is exactly the contract; a permission refusal arrives through `onError`.
+   */
+  watchDocument(
+    path: string,
+    onChange: (doc: Record<string, unknown> | null) => void,
+    onError?: (error: CloudError) => void,
+  ): () => void {
+    const { firestore } = this.m;
+    return firestore.onSnapshot(
+      firestore.doc(firestore.getFirestore(), path),
+      (snapshot) => {
+        const data = snapshot.data();
+        onChange(data === undefined ? null : data);
+      },
+      (error: unknown) => {
+        onError?.(toCloudError(error));
+      },
+    );
+  }
+
+  /**
+   * The collection form. Firestore needs an index for nothing here: one `orderBy` on a single
+   * collection is served by the automatic single-field index.
+   */
+  watchCollection(
+    path: string,
+    query: CollectionQuery,
+    onChange: (entries: CollectionEntry[]) => void,
+    onError?: (error: CloudError) => void,
+  ): () => void {
+    const { firestore } = this.m;
+    let built = firestore.query(firestore.collection(firestore.getFirestore(), path));
+    const filter = query.arrayContains;
+    if (filter !== undefined) {
+      built = firestore.query(built, firestore.where(filter.field, 'array-contains', filter.value));
+    }
+    if (query.orderBy !== undefined) {
+      built = firestore.query(built, firestore.orderBy(query.orderBy, query.direction ?? 'asc'));
+    }
+    if (query.limit !== undefined) {
+      built = firestore.query(built, firestore.limit(query.limit));
+    }
+    return firestore.onSnapshot(
+      built,
+      (snapshot) => {
+        onChange(snapshot.docs.map((entry) => ({ id: entry.id, data: entry.data() })));
+      },
+      (error: unknown) => {
+        onError?.(toCloudError(error));
+      },
+    );
   }
 
   async putBlob(path: string, bytes: Bytes): Promise<void> {

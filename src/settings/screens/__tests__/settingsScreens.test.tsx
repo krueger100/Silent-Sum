@@ -4,7 +4,8 @@ import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 
 import { DARK_PALETTE, LIGHT_PALETTE } from '@/app/theme';
 
-import { AboutScreen } from '@/settings/screens/AboutScreen';
+import { AboutScreen, AUTHOR_EMAIL, AUTHOR_NAME } from '@/settings/screens/AboutScreen';
+import { ERASE_PHRASE, ERASE_PHRASE_DISGUISED } from '@/auth/screens/ForgotPinDialog';
 import { AutoLockScreen } from '@/settings/screens/AutoLockScreen';
 import { SecurityScreen } from '@/settings/screens/SecurityScreen';
 import { SettingsScreen } from '@/settings/screens/SettingsScreen';
@@ -16,7 +17,66 @@ import { InMemoryCloudBackend } from '@/firebase/cloudBackend';
 import { NoopAnalyticsService, NoopCrashReporter } from '@/firebase/types';
 import type { SupportMessage, SupportSendResult, SupportService } from '@/support/types';
 
+jest.mock('expo-image', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const react = require('react');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { View } = require('react-native');
+  return {
+    Image: (props: Record<string, unknown>) => react.createElement(View, props),
+  };
+});
+
 const SENT: SupportSendResult = { kind: 'sent', reference: null };
+
+/**
+ * Words the disguised About page may not contain, anywhere, in any state.
+ *
+ * Shared rather than inlined because the page has more than one state to check: the warnings
+ * the honest page carries are themselves a tell, and so would be anything the easter egg said.
+ */
+const DISGUISE_FORBIDDEN: readonly RegExp[] = [
+  /vault/i,
+  /\bpin\b/i,
+  /passphrase/i,
+  /backup/i,
+  /photo/i,
+  /encrypt/i,
+  // A calculator has no reason to mention passwords, codes, or stripping digits out of what
+  // you send it.
+  /password/i,
+  /\bcodes?\b/i,
+  /digits are removed/i,
+];
+
+/**
+ * Drives `Date.now` for the tap counter on the name card.
+ *
+ * Real time would make an eight-tap test depend on how fast the machine is, and the window it
+ * measures is the whole point of two of these cases. Installed after render so nothing React
+ * does while mounting sees a frozen clock.
+ */
+function fakeClock(): { advance: (ms: number) => void; restore: () => void } {
+  let now = 1_000_000;
+  const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+  return {
+    advance: (ms: number) => {
+      now += ms;
+    },
+    restore: () => {
+      spy.mockRestore();
+    },
+  };
+}
+
+/** Presses the name card `count` times, quickly enough that the counter never resets. */
+async function tapCard(clock: { advance: (ms: number) => void }, count: number): Promise<void> {
+  const card = screen.getByTestId('about_identity');
+  for (let i = 0; i < count; i++) {
+    clock.advance(120);
+    await fireEvent.press(card);
+  }
+}
 
 /** Records what was handed to the transport, and decides what it answers. */
 function fakeSupport(): {
@@ -50,6 +110,7 @@ describe('SettingsScreen', () => {
       onSecurity: jest.fn(),
       onWipePin: jest.fn(),
       onCloudBackup: jest.fn(),
+      onPlans: jest.fn(),
       onSupport: jest.fn(),
       onAbout: jest.fn(),
     };
@@ -58,6 +119,9 @@ describe('SettingsScreen', () => {
 
     expect(screen.getByTestId('settings_auto_lock')).toHaveTextContent(/After 5 minutes/);
     expect(screen.getByTestId('settings_cloud_backup')).toHaveTextContent(/Not available/);
+    // A build that cannot sell says so on the row, and still lets the page be opened.
+    expect(screen.getByTestId('settings_plans')).toHaveTextContent(/SilentSum Pro and Cloud/);
+    expect(screen.getByTestId('settings_plans')).toHaveTextContent(/Not available in this build/);
 
     for (const [name, handler] of Object.entries(handlers)) {
       const testID = {
@@ -66,6 +130,7 @@ describe('SettingsScreen', () => {
         onSecurity: 'settings_security',
         onWipePin: 'settings_wipe_pin',
         onCloudBackup: 'settings_cloud_backup',
+        onPlans: 'settings_plans',
         onSupport: 'settings_support',
         onAbout: 'settings_about',
       }[name];
@@ -88,6 +153,7 @@ describe('SettingsScreen wipe PIN row', () => {
     onSecurity: jest.fn(),
     onWipePin: jest.fn(),
     onCloudBackup: jest.fn(),
+    onPlans: jest.fn(),
     onSupport: jest.fn(),
     onAbout: jest.fn(),
   };
@@ -104,9 +170,10 @@ describe('SettingsScreen wipe PIN row', () => {
     await renderWithServices(harness.services, <SettingsScreen {...handlers} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId('settings_wipe_pin')).toHaveTextContent(
-        new RegExp(`Wipe PIN active: ${label}\\.`),
-      );
+      // The armed scope must be readable WITHOUT opening anything -- that is the whole point of
+      // this row. Asserted on the scope itself rather than on a sentence, so rewording the row
+      // cannot quietly remove the thing that matters.
+      expect(screen.getByTestId('settings_wipe_pin')).toHaveTextContent(new RegExp(label, 'i'));
     });
   });
 
@@ -128,6 +195,7 @@ describe('SettingsScreen super secure', () => {
     onSecurity: jest.fn(),
     onWipePin: jest.fn(),
     onCloudBackup: jest.fn(),
+    onPlans: jest.fn(),
     onSupport: jest.fn(),
     onAbout: jest.fn(),
   };
@@ -155,6 +223,7 @@ describe('SettingsScreen night mode', () => {
     onSecurity: jest.fn(),
     onWipePin: jest.fn(),
     onCloudBackup: jest.fn(),
+    onPlans: jest.fn(),
     onSupport: jest.fn(),
     onAbout: jest.fn(),
   };
@@ -272,7 +341,9 @@ describe('AboutScreen', () => {
    * customer service has to live. What it must offer is an address -- never a way in.
    */
   it('names the configured support address without offering any way into the vault', async () => {
-    const harness = buildHarness({ support: { send: async () => SENT, contact: 'help@example.com' } });
+    const harness = buildHarness({
+      support: { send: async () => SENT, contact: 'help@example.com' },
+    });
 
     await renderWithServices(harness.services, <AboutScreen />);
 
@@ -280,10 +351,12 @@ describe('AboutScreen', () => {
     expect(screen.getByTestId('about_support_contact')).toHaveTextContent(/help@example\.com/);
     // And it says, in the same breath, what writing to that address cannot achieve.
     expect(screen.getByTestId('about_support_limits')).toHaveTextContent(/cannot do/);
-    expect(screen.getByTestId('about_support_limits')).toHaveTextContent(/reset or look up your PIN/);
+    expect(screen.getByTestId('about_support_limits')).toHaveTextContent(
+      /reset or look up your PIN/,
+    );
     expect(screen.getByTestId('about_support_limits')).toHaveTextContent(/decrypt a backup/);
     // Writing a message is the only thing it collects; nothing here leads into the vault.
-    expect(screen.queryByTestId('forgot_pin_dialog')).toBeNull();
+    expect(screen.queryByTestId('erase_explain_dialog')).toBeNull();
     expect(screen.queryByTestId('support_topic_unlock')).toBeNull();
   });
 
@@ -296,7 +369,10 @@ describe('AboutScreen', () => {
     await renderWithServices(harness.services, <AboutScreen />);
 
     await fireEvent.changeText(screen.getByTestId('about_support_reply_to'), ' me@example.com ');
-    await fireEvent.changeText(screen.getByTestId('about_support_body'), '  the app will not open  ');
+    await fireEvent.changeText(
+      screen.getByTestId('about_support_body'),
+      '  the app will not open  ',
+    );
     await fireEvent.press(screen.getByTestId('about_support_send'));
 
     await waitFor(() => {
@@ -346,25 +422,10 @@ describe('AboutScreen', () => {
       support: { send: async () => SENT, contact: 'help@example.com' },
     });
 
-    await renderWithServices(
-      harness.services,
-      <AboutScreen appName="Calculator" disguised />,
-    );
+    await renderWithServices(harness.services, <AboutScreen appName="Calculator" disguised />);
 
     const rendered = JSON.stringify(screen.toJSON());
-    for (const word of [
-      /vault/i,
-      /\bpin\b/i,
-      /passphrase/i,
-      /backup/i,
-      /photo/i,
-      /encrypt/i,
-      // The warnings the honest page carries are themselves a tell: a calculator has no
-      // reason to mention passwords, codes, or stripping digits out of what you send it.
-      /password/i,
-      /\bcodes?\b/i,
-      /digits are removed/i,
-    ]) {
+    for (const word of DISGUISE_FORBIDDEN) {
       expect(rendered).not.toMatch(word);
     }
     expect(screen.queryByTestId('about_security_summary')).toBeNull();
@@ -378,6 +439,217 @@ describe('AboutScreen', () => {
     expect(screen.getByTestId('about_support_reply_to')).toBeTruthy();
     expect(screen.getByTestId('about_support_body')).toBeTruthy();
     expect(screen.getByTestId('about_support_send')).toBeTruthy();
+  });
+
+  /**
+   * The easter egg on the name card. Eight taps, and not seven, because a card that gave way
+   * early would be a card someone could find by fidgeting.
+   */
+  it('reveals the portrait on the eighth tap and not before', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 7);
+      expect(screen.queryByTestId('about_portrait')).toBeNull();
+
+      await tapCard(clock, 1);
+      expect(screen.getByTestId('about_portrait')).toBeTruthy();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('closes the portrait again when it is tapped', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      await fireEvent.press(screen.getByTestId('about_portrait'));
+      expect(screen.queryByTestId('about_portrait')).toBeNull();
+
+      // And it can be opened again, which means the counter was left at zero and not at eight.
+      await tapCard(clock, 7);
+      expect(screen.queryByTestId('about_portrait')).toBeNull();
+      await tapCard(clock, 1);
+      expect(screen.getByTestId('about_portrait')).toBeTruthy();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  /**
+   * Seven stray touches spread over a session must not leave the card one tap from firing.
+   */
+  it('starts the tap count over when the taps are slow', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 7);
+      // Long enough that the next press is a first tap rather than an eighth.
+      clock.advance(5000);
+      await fireEvent.press(screen.getByTestId('about_identity'));
+      expect(screen.queryByTestId('about_portrait')).toBeNull();
+
+      // From there it takes another seven, which proves the slow tap counted as number one.
+      await tapCard(clock, 7);
+      expect(screen.getByTestId('about_portrait')).toBeTruthy();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  /**
+   * The reveal sits on the page the calculator opens, so it is held to the same word list as
+   * everything else there -- checked open, not merely checked closed.
+   */
+  it('gives nothing away when the portrait is open on the disguised page', async () => {
+    const harness = buildHarness({
+      support: { send: async () => SENT, contact: 'help@example.com' },
+    });
+    await renderWithServices(harness.services, <AboutScreen appName="Calculator" disguised />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      expect(screen.getByTestId('about_portrait')).toBeTruthy();
+
+      const rendered = JSON.stringify(screen.toJSON());
+      for (const word of DISGUISE_FORBIDDEN) {
+        expect(rendered).not.toMatch(word);
+      }
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('signs the reveal with a name and an address', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      expect(screen.getByTestId('about_author_name')).toHaveTextContent(AUTHOR_NAME);
+      expect(screen.getByTestId('about_author_email')).toHaveTextContent(AUTHOR_EMAIL);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  /**
+   * The escape hatch is rendered only where a navigator wired somewhere for it to go, which is
+   * the same rule the recovery-code entry follows. An unlocked About page has no business
+   * offering a hidden second door to something the gallery offers in the open.
+   */
+  it('offers no way to erase unless the navigator asked for one', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      expect(screen.getByTestId('about_portrait')).toBeTruthy();
+      expect(screen.queryByTestId('about_reset_device')).toBeNull();
+      expect(screen.queryByTestId('erase_explain_dialog')).toBeNull();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('closes the portrait before opening the erase flow', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen onErased={jest.fn()} />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      await fireEvent.press(screen.getByTestId('about_reset_device'));
+
+      // Two modals must never be up at once; the portrait goes first.
+      expect(screen.queryByTestId('about_portrait')).toBeNull();
+      expect(screen.getByTestId('erase_explain_dialog')).toBeTruthy();
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('speaks plainly about the vault when the page is not disguised', async () => {
+    const harness = buildHarness();
+    await renderWithServices(harness.services, <AboutScreen onErased={jest.fn()} />);
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      await fireEvent.press(screen.getByTestId('about_reset_device'));
+    } finally {
+      clock.restore();
+    }
+
+    expect(screen.getByText('Forgot your PIN?')).toBeTruthy();
+    expect(screen.getByTestId('erase_explain_dialog')).toHaveTextContent(/no backdoor/);
+    await fireEvent.press(screen.getByTestId('erase_explain_dialog-confirm'));
+    // And the honest gate is the honest phrase.
+    expect(screen.getByTestId('erase_confirm_dialog')).toHaveTextContent(new RegExp(ERASE_PHRASE));
+  });
+
+  /**
+   * The whole erase flow, driven to its end on the disguised page and checked word by word at
+   * every stage.
+   *
+   * This is the case the feature lives or dies on. The wipe itself is identical either way, so
+   * the only thing that can give the app away here is what the three dialogs SAY -- including
+   * the phrase the user is asked to type, which in the honest flow is DELETE MY VAULT.
+   */
+  it('never names the vault anywhere in the disguised erase flow', async () => {
+    const harness = buildHarness({
+      support: { send: async () => SENT, contact: 'help@example.com' },
+    });
+    await renderWithServices(
+      harness.services,
+      <AboutScreen appName="Calculator" disguised onErased={jest.fn()} />,
+    );
+    const clock = fakeClock();
+
+    try {
+      await tapCard(clock, 8);
+      await fireEvent.press(screen.getByTestId('about_reset_device'));
+    } finally {
+      clock.restore();
+    }
+
+    const clean = (): void => {
+      const rendered = JSON.stringify(screen.toJSON());
+      for (const word of DISGUISE_FORBIDDEN) {
+        expect(rendered).not.toMatch(word);
+      }
+    };
+
+    // 1. What it is about to do.
+    expect(screen.getByTestId('erase_explain_dialog')).toBeTruthy();
+    clean();
+    await fireEvent.press(screen.getByTestId('erase_explain_dialog-confirm'));
+
+    // 2. The typed gate, which must not ask for the honest phrase.
+    const confirm = screen.getByTestId('erase_confirm_dialog');
+    expect(confirm).toHaveTextContent(new RegExp(ERASE_PHRASE_DISGUISED));
+    expect(confirm).not.toHaveTextContent(new RegExp(ERASE_PHRASE));
+    clean();
+
+    await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), ERASE_PHRASE_DISGUISED);
+    await fireEvent.press(screen.getByTestId('erase_confirm_dialog-confirm'));
+
+    // 3. What it did, which is the stage that has to tell the truth.
+    await waitFor(() => {
+      expect(screen.getByTestId('erase_outcome_dialog')).toBeTruthy();
+    });
+    expect(screen.getByTestId('erase_outcome_dialog')).toHaveTextContent(/cannot be recovered/);
+    clean();
   });
 
   it('still sends from the disguised page', async () => {
@@ -426,7 +698,6 @@ describe('AboutScreen', () => {
 });
 
 describe('SupportScreen', () => {
-
   it('says plainly that this build cannot send, instead of offering a form that goes nowhere', async () => {
     const harness = buildHarness({ support: null });
 

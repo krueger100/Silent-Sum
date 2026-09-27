@@ -13,12 +13,15 @@
 import React, { useEffect, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 
-import { useServices, useSettings } from '@/app/ServicesProvider';
+import { useEntitlements, useServices, useSettings } from '@/app/ServicesProvider';
 import { spacing } from '@/app/theme';
 import type { WipeScope } from '@/auth/types';
 import { WIPE_SCOPE_LABEL } from '@/auth/wipePin';
+import { deriveCloudState, type CloudState } from '@/billing/entitlements';
+import { PLANS_TITLE, PRODUCTS } from '@/billing/products';
+import { formatDay } from '@/billing/screens/formatDay';
 import { Button } from '@/components/Button';
-import { ListRow, SwitchRow } from '@/components/ListRow';
+import { ListGroup, ListRow, SwitchRow } from '@/components/ListRow';
 import { Screen, SectionLabel } from '@/components/Screen';
 import { AUTO_LOCK_LABEL } from '@/settings/appSettings';
 
@@ -28,7 +31,11 @@ export interface SettingsScreenProps {
   onSecurity: () => void;
   onWipePin: () => void;
   onCloudBackup: () => void;
+  /** The SilentSum Pro and Cloud page: prices, status, and the way to buy. */
+  onPlans: () => void;
   onSupport: () => void;
+  /** Opens user-to-user messaging. Absent in a navigator that does not offer it. */
+  onMessages?: () => void;
   onAbout: () => void;
   onBack?: () => void;
   /** Optional: renders a "Lock vault now" action when the navigator wants one here. */
@@ -48,7 +55,9 @@ export function SettingsScreen({
   onSecurity,
   onWipePin,
   onCloudBackup,
+  onPlans,
   onSupport,
+  onMessages,
   onAbout,
   onBack,
   onLocked,
@@ -56,7 +65,11 @@ export function SettingsScreen({
 }: SettingsScreenProps): React.JSX.Element {
   const services = useServices();
   const settings = useSettings();
+  const { entitlements: owned } = useEntitlements();
   const cloudAvailable = services.backup !== null && services.firebase.available;
+  // Selling needs the cloud backend too: entitlements are read through it.
+  const billingAvailable = cloudAvailable && services.billing !== null;
+  const cloudState = deriveCloudState(owned, services.clock.now());
 
   // Undefined until the record has been read, so the row never claims "not set" before it knows.
   const [wipeScope, setWipeScope] = useState<WipeScope | null | undefined>(undefined);
@@ -78,103 +91,126 @@ export function SettingsScreen({
       testID="settings_screen"
       {...(onBack === undefined ? {} : { onBack })}
     >
+      {/*
+        Detail text is kept only where it reports STATE the user cannot otherwise see -- the
+        armed wipe scope, whether backup is on, where the plans stand. Rows that merely described
+        what the next screen does have lost it: that explanation belongs on the screen it
+        describes, and eleven paragraphs here turned an index into a document. Before this the
+        Messages row sat at y=3024 on a 3040px screen; the whole list now fits.
+      */}
       <SectionLabel>Vault</SectionLabel>
-      <ListRow
-        testID="settings_change_pin"
-        label="Change PIN"
-        detail="Re-wraps the vault key under a new PIN. Your photos are not re-encrypted."
-        onPress={onChangePin}
-      />
-      <ListRow
-        testID="settings_auto_lock"
-        label="Auto-lock"
-        detail="How long the vault may stay open in the background."
-        value={AUTO_LOCK_LABEL[settings.autoLockTimeout]}
-        onPress={onAutoLock}
-      />
-      <ListRow
-        testID="settings_security"
-        label="Security and privacy"
-        detail="Screenshot blocking, crash reports, usage statistics."
-        onPress={onSecurity}
-      />
+      <ListGroup>
+        <ListRow testID="settings_change_pin" label="Change PIN" onPress={onChangePin} />
+        <ListRow
+          testID="settings_auto_lock"
+          label="Auto-lock"
+          value={AUTO_LOCK_LABEL[settings.autoLockTimeout]}
+          onPress={onAutoLock}
+        />
+        <ListRow
+          testID="settings_security"
+          label="Security and privacy"
+          detail="Screenshot blocking, crash reports, usage statistics."
+          onPress={onSecurity}
+        />
+      </ListGroup>
 
-      <SectionLabel>Super secure</SectionLabel>
-      <SwitchRow
-        testID="settings_super_secure"
-        label="Super secure"
-        detail={
-          'Empties the ⋮ menu down to About, so nothing on the calculator suggests the app is ' +
-          'anything else. The menu itself stays -- a calculator has one -- but "Forgot PIN?" is ' +
-          'not in it, and your PIN becomes the only way in. It has no effect while there is no ' +
-          'vault to hide, or while the vault data cannot be read.'
-        }
-        value={settings.superSecure}
-        onValueChange={(next) => {
-          void services.settings.update({ superSecure: next });
-        }}
-      />
-      <ListRow
-        testID="settings_wipe_pin"
-        label="Wipe PIN"
-        detail={
-          wipeScope === undefined
-            ? 'A second PIN that destroys instead of opening.'
-            : wipeScope === null
-              ? 'Not set. A second PIN that destroys instead of opening: this device, the cloud ' +
-                'backup, or both.'
-              : `Wipe PIN active: ${WIPE_SCOPE_LABEL[wipeScope]}. Typed on the calculator it ` +
-                'destroys exactly that.'
-        }
-        value={
-          wipeScope === undefined || wipeScope === null ? undefined : WIPE_SCOPE_LABEL[wipeScope]
-        }
-        destructive
-        onPress={onWipePin}
-      />
+      <SectionLabel>Hiding the vault</SectionLabel>
+      <ListGroup>
+        <SwitchRow
+          testID="settings_super_secure"
+          label="Super secure"
+          detail={
+            'Empties the ⋮ menu down to About. "Forgot PIN?" goes with it, so your PIN becomes ' +
+            'the only way in.'
+          }
+          value={settings.superSecure}
+          onValueChange={(next) => {
+            void services.settings.update({ superSecure: next });
+          }}
+        />
+        {/*
+          The one row whose detail is not optional. It is the only place the armed scope appears
+          without opening anything, and it prints what was read from the stored record -- never a
+          guess. An owner should be able to see that their phone carries a PIN that destroys
+          their cloud backup without going to look for it.
+        */}
+        <ListRow
+          testID="settings_wipe_pin"
+          label="Wipe PIN"
+          detail={
+            wipeScope === undefined
+              ? 'A second PIN that destroys instead of opening.'
+              : wipeScope === null
+                ? 'Not set. A second PIN that destroys instead of opening.'
+                : `Typed on the calculator, it destroys ${WIPE_SCOPE_LABEL[wipeScope].toLowerCase()}.`
+          }
+          value={
+            wipeScope === undefined || wipeScope === null ? undefined : WIPE_SCOPE_LABEL[wipeScope]
+          }
+          destructive
+          onPress={onWipePin}
+        />
+      </ListGroup>
 
-      <SectionLabel>Cloud</SectionLabel>
-      <ListRow
-        testID="settings_cloud_backup"
-        label="Cloud backup"
-        detail={
-          !cloudAvailable
-            ? 'Not available in this build. Everything works offline.'
-            : settings.backupEnabled
-              ? 'On. Uploads are end-to-end encrypted with your recovery passphrase.'
-              : 'Off. Nothing leaves this device.'
-        }
-        onPress={onCloudBackup}
-      />
-
-      <SectionLabel>Support</SectionLabel>
-      <ListRow
-        testID="settings_support"
-        label="Customer service"
-        detail={
-          services.support === null
-            ? 'Not set up in this build. Nothing on that screen could reach anyone.'
-            : 'Write to us. You see the whole message before it is sent, and nothing else goes with it.'
-        }
-        onPress={onSupport}
-      />
+      <SectionLabel>Account</SectionLabel>
+      <ListGroup>
+        <ListRow
+          testID="settings_plans"
+          label={PLANS_TITLE}
+          detail={
+            billingAvailable
+              ? planDetail(owned.pro, cloudState)
+              : 'Not available in this build. Every feature is unlocked.'
+          }
+          value={billingAvailable ? (owned.pro ? 'Pro' : 'Free') : undefined}
+          onPress={onPlans}
+        />
+        <ListRow
+          testID="settings_cloud_backup"
+          label="Cloud backup"
+          value={
+            !cloudAvailable ? undefined : settings.backupEnabled ? 'On' : 'Off'
+          }
+          detail={
+            !cloudAvailable
+              ? 'Not available in this build. Everything works offline.'
+              : settings.backupEnabled
+                ? 'End-to-end encrypted with your recovery passphrase.'
+                : 'Nothing leaves this device.'
+          }
+          onPress={onCloudBackup}
+        />
+        {onMessages === undefined || !services.messaging.available ? null : (
+          <ListRow
+            testID="settings_messages"
+            label="Messages"
+            value={owned.pro ? undefined : 'Pro'}
+            onPress={onMessages}
+          />
+        )}
+      </ListGroup>
 
       <SectionLabel>App</SectionLabel>
-      <SwitchRow
-        testID="settings_night_mode"
-        label="Night mode"
-        detail="Dark screen. Turn it off for a light one."
-        value={settings.theme === 'night'}
-        onValueChange={(night) => {
-          void services.settings.update({ theme: night ? 'night' : 'day' });
-        }}
-      />
-      <ListRow
-        testID="settings_about"
-        label="About"
-        detail="Version and what the encryption actually does."
-        onPress={onAbout}
-      />
+      <ListGroup>
+        <SwitchRow
+          testID="settings_night_mode"
+          label="Night mode"
+          value={settings.theme === 'night'}
+          onValueChange={(night) => {
+            void services.settings.update({ theme: night ? 'night' : 'day' });
+          }}
+        />
+        <ListRow
+          testID="settings_support"
+          label="Customer service"
+          {...(services.support === null
+            ? { detail: 'Not set up in this build. Nothing on that screen could reach anyone.' }
+            : {})}
+          onPress={onSupport}
+        />
+        <ListRow testID="settings_about" label="About" onPress={onAbout} />
+      </ListGroup>
 
       {onLocked === undefined ? null : (
         <View style={styles.footer}>
@@ -191,6 +227,20 @@ export function SettingsScreen({
       )}
     </Screen>
   );
+}
+
+/** One line for the row: what Pro is, and where Cloud stands, without ever mixing the two. */
+function planDetail(pro: boolean, cloud: CloudState): string {
+  const proPart = pro
+    ? `${PRODUCTS.pro.name} is yours for good.`
+    : `${PRODUCTS.pro.name} is ${PRODUCTS.pro.price}.`;
+  const cloudPart =
+    cloud.kind === 'active'
+      ? `${PRODUCTS.cloud.name} is on until ${formatDay(cloud.until)}.`
+      : cloud.kind === 'expired'
+        ? `${PRODUCTS.cloud.name} ended on ${formatDay(cloud.on)}.`
+        : `${PRODUCTS.cloud.name} (${PRODUCTS.cloud.price}) is not on.`;
+  return `${proPart} ${cloudPart}`;
 }
 
 const styles = StyleSheet.create({

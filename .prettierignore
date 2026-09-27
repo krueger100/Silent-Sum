@@ -3,3 +3,5 @@ android
 ios
 .expo
 coverage
+functions/lib
+functions/node_modules

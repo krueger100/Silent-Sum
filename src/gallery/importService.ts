@@ -16,6 +16,7 @@
  */
 import * as ImagePicker from 'expo-image-picker';
 
+import { MAX_ITEM_BYTES } from '@/billing/entitlements';
 import type { AutoLockSuspension } from '@/privacy/autoLockSuspension';
 import type { FileSystem } from '@/storage/fileSystem';
 import type { SecureDelete } from '@/storage/secureDelete';
@@ -25,6 +26,8 @@ import { zeroBytes, type Bytes } from '@/utils/bytes';
 export interface ImportReport {
   readonly imported: number;
   readonly failed: number;
+  /** Assets the picker reported as larger than `MAX_ITEM_BYTES`, skipped without being read. */
+  readonly oversized: number;
 }
 
 export type LaunchImageLibrary = (
@@ -64,14 +67,33 @@ export class ImportService {
    * Undecodable images are counted as `failed` and the rest of the selection still imports. Any
    * other failure (a read error, a full disk) aborts the remaining assets and propagates, after
    * the temp copies have been wiped.
+   *
+   * `selectionLimit` is how the free tier's item cap reaches the picker: the OS lets the user
+   * choose at most that many, so the cap is enforced before any plaintext copy is made rather
+   * than by importing part of a selection and quietly dropping the rest. Zero means no room at
+   * all, and the picker is not opened; undefined means unlimited.
    */
-  async importFromLibrary(repository: VaultRepository): Promise<ImportReport> {
-    const assets = await this.pick();
+  async importFromLibrary(
+    repository: VaultRepository,
+    options: { readonly selectionLimit?: number } = {},
+  ): Promise<ImportReport> {
+    if (options.selectionLimit !== undefined && options.selectionLimit <= 0) {
+      return { imported: 0, failed: 0, oversized: 0 };
+    }
+    const assets = await this.pick(options.selectionLimit);
     let imported = 0;
     let failed = 0;
+    let oversized = 0;
 
     try {
       for (const asset of assets) {
+        // Checked from the picker's own metadata, before `readBytes` pulls the file into memory:
+        // refusing a 500 MB video must not cost 500 MB of heap first. A provider that omits
+        // `fileSize` is trusted -- an unknown size is not evidence of a large one.
+        if (asset.fileSize !== undefined && asset.fileSize > MAX_ITEM_BYTES) {
+          oversized += 1;
+          continue;
+        }
         let bytes: Bytes | null = null;
         try {
           bytes = await this.deps.fs.readBytes(asset.uri);
@@ -97,15 +119,19 @@ export class ImportService {
       for (const asset of assets) await this.wipeTempCopy(asset.uri);
     }
 
-    return { imported, failed };
+    return { imported, failed, oversized };
   }
 
   /** Suspends auto-lock for exactly the picker round trip. Cancel yields an empty selection. */
-  private async pick(): Promise<readonly ImagePicker.ImagePickerAsset[]> {
+  private async pick(selectionLimit?: number): Promise<readonly ImagePicker.ImagePickerAsset[]> {
     const launch = this.deps.launchImageLibrary ?? ImagePicker.launchImageLibraryAsync;
     this.deps.autoLockSuspension.suspend();
     try {
-      const result = await launch(IMPORT_PICKER_OPTIONS);
+      const result = await launch(
+        selectionLimit === undefined
+          ? IMPORT_PICKER_OPTIONS
+          : { ...IMPORT_PICKER_OPTIONS, selectionLimit },
+      );
       return result.canceled ? [] : result.assets;
     } finally {
       this.deps.autoLockSuspension.resume();

@@ -17,7 +17,10 @@
  * unconfigured build (or under Jest).
  */
 import { FirebaseAnalytics, type AnalyticsParams, type AnalyticsPort } from '@/firebase/analytics';
+import { CallableClient, type CallableTokens } from '@/firebase/callableClient';
 import { FirebaseCrashReporter, type CrashlyticsPort } from '@/firebase/crashReporter';
+import { FirebaseBillingService } from '@/firebase/firebaseBillingService';
+import { FirebaseDirectory } from '@/firebase/firebaseDirectory';
 import {
   FirebaseCloudBackend,
   loadCloudModules,
@@ -65,7 +68,18 @@ export interface FirebaseGatewayOptions {
 
   /** App-private storage for restore downloads; see `CloudBackendOptions.fs`. */
   readonly fs?: FileSystem;
+
+  /**
+   * Purchases. `enabled: false` builds an app that can never sell anything (every gate stays
+   * open, the plans screen says so). `functionsUrl` overrides the default
+   * `https://us-central1-<project>.cloudfunctions.net`; it must be https or it is ignored.
+   * Billing also needs a cloud backend (`storageBucket`): entitlements are read through it.
+   */
+  readonly billing?: { readonly enabled: boolean; readonly functionsUrl?: string };
 }
+
+/** Where the SilentSum functions are deployed. Matches `firebase.json` and `functions/src/index.ts`. */
+export const BILLING_FUNCTIONS_REGION = 'us-central1';
 
 type AppModule = typeof AppNamespace;
 type CrashlyticsModule = typeof CrashlyticsNamespace;
@@ -152,11 +166,20 @@ function analyticsPort(module: AnalyticsModule): AnalyticsPort {
  * App Check hardens the backend, and an app that cannot attest should still start, still unlock and
  * still work offline — it will simply be refused by the rules if it tries to sync.
  */
-function activateAppCheck(env: SilentSumEnv, app: AppModule, debugToken?: string): void {
+interface ActivatedAppCheck {
+  readonly module: AppCheckModule;
+  readonly instance: AppCheckNamespace.AppCheck;
+}
+
+function activateAppCheck(
+  env: SilentSumEnv,
+  app: AppModule,
+  debugToken?: string,
+): ActivatedAppCheck | null {
   const module = requireAppCheck();
   if (module === null) {
     note('App Check module unavailable, skipping activation');
-    return;
+    return null;
   }
   try {
     const isProd = env === 'prod';
@@ -165,10 +188,61 @@ function activateAppCheck(env: SilentSumEnv, app: AppModule, debugToken?: string
       android: { provider: isProd ? 'playIntegrity' : 'debug', debugToken },
       apple: { provider: isProd ? 'appAttestWithDeviceCheckFallback' : 'debug', debugToken },
     });
-    module.initializeAppCheck(app.getApp(), { provider, isTokenAutoRefreshEnabled: true });
+    const instance = module.initializeAppCheck(app.getApp(), {
+      provider,
+      isTokenAutoRefreshEnabled: true,
+    });
+    return { module, instance };
   } catch (error) {
     note(`App Check activation failed: ${String(error)}`);
+    return null;
   }
+}
+
+/**
+ * The functions base URL: an explicit https override, else the project's own
+ * `cloudfunctions.net` host. Null when neither can be had, in which case nothing is sold.
+ */
+function billingBaseUrl(app: AppModule, override: string | undefined): string | null {
+  if (override !== undefined && override !== '') {
+    if (/^https:\/\/[^/?#\s]+/i.test(override)) return override;
+    note('BILLING_FUNCTIONS_URL is not https, ignoring it');
+  }
+  let projectId: unknown;
+  try {
+    projectId = app.getApp().options.projectId;
+  } catch {
+    projectId = undefined;
+  }
+  if (typeof projectId !== 'string' || projectId === '') return null;
+  return `https://${BILLING_FUNCTIONS_REGION}-${projectId}.cloudfunctions.net`;
+}
+
+/**
+ * Purchases go through callables that carry the user's ID token and, when this build can get
+ * one, its App Check token. Either token failing to load is sent as nothing: the server decides,
+ * and the screens have copy for its refusal.
+ */
+function buildCallableClient(
+  app: AppModule,
+  cloud: CloudModules,
+  appCheck: ActivatedAppCheck | null,
+  functionsUrl: string | undefined,
+): CallableClient | null {
+  const baseUrl = billingBaseUrl(app, functionsUrl);
+  if (baseUrl === null) return null;
+  const tokens: CallableTokens = {
+    idToken: async () => {
+      const user = cloud.auth.getAuth().currentUser;
+      return user === null ? null : cloud.auth.getIdToken(user);
+    },
+    appCheckToken: async () => {
+      if (appCheck === null) return null;
+      const result = await appCheck.module.getToken(appCheck.instance);
+      return result.token;
+    },
+  };
+  return new CallableClient({ baseUrl, tokens });
 }
 
 /**
@@ -207,19 +281,32 @@ export async function initializeFirebase(
       return FIREBASE_UNAVAILABLE;
     }
 
-    activateAppCheck(env, app, options.appCheckDebugToken);
+    const appCheck = activateAppCheck(env, app, options.appCheckDebugToken);
+
+    const backend =
+      options.storageBucket === undefined || options.storageBucket === ''
+        ? null
+        : new FirebaseCloudBackend(cloud, {
+            storageBucket: options.storageBucket,
+            ...(options.fs === undefined ? {} : { fs: options.fs }),
+          });
+
+    const callable = buildCallableClient(app, cloud, appCheck, options.billing?.functionsUrl);
+    if (callable === null) note('no project id for callables, purchases and messaging not offered');
+    const sellable = backend !== null && options.billing?.enabled !== false && callable !== null;
 
     return {
       available: true,
       crash: new FirebaseCrashReporter(crashlyticsPort(crashlytics)),
       analytics: new FirebaseAnalytics(analyticsPort(analytics)),
-      cloud:
-        options.storageBucket === undefined || options.storageBucket === ''
+      cloud: backend,
+      billing:
+        !sellable || backend === null || callable === null
           ? null
-          : new FirebaseCloudBackend(cloud, {
-              storageBucket: options.storageBucket,
-              ...(options.fs === undefined ? {} : { fs: options.fs }),
-            }),
+          : new FirebaseBillingService(callable, () => backend.currentUser),
+      // Messaging needs the same callable for its one lookup. It rides on the billing switch
+      // because both are Pro features of the same deployment.
+      directory: sellable && callable !== null ? new FirebaseDirectory(callable) : null,
     };
   } catch (error) {
     note(`Firebase initialisation failed, continuing offline: ${String(error)}`);

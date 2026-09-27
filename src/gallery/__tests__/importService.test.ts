@@ -1,4 +1,5 @@
 import type { Services } from '@/app/services';
+import { MAX_ITEM_BYTES } from '@/billing/entitlements';
 import {
   ImportService,
   type ImportServiceDependencies,
@@ -55,11 +56,70 @@ describe('ImportService', () => {
 
     const report = await service.importFromLibrary(repository);
 
-    expect(report).toEqual({ imported: 2, failed: 1 });
+    expect(report).toEqual({ imported: 2, failed: 1, oversized: 0 });
     expect(repository.photos).toHaveLength(2);
     for (const picked of [first, broken, last]) {
       expect(await fs.exists(picked.uri)).toBe(false);
     }
+  });
+
+  it('refuses an oversized asset without reading it', async () => {
+    const { services, fs, repository } = await unlockedVault();
+    const readBytes = jest.fn();
+    const staged = await stageTempCopy(fs, 'huge.jpg');
+    const picked = { ...staged, fileSize: MAX_ITEM_BYTES + 1 };
+    const service = new ImportService(
+      deps(services, async () => ({ canceled: false, assets: [picked] }), { readBytes }),
+    );
+
+    const report = await service.importFromLibrary(repository);
+
+    expect(report).toEqual({ imported: 0, failed: 0, oversized: 1 });
+    // The point of the check: a 500 MB file must not be pulled into memory to be refused.
+    expect(readBytes).not.toHaveBeenCalled();
+    // And it is still cleaned up -- a refused asset leaves no plaintext copy behind.
+    expect(await fs.exists(picked.uri)).toBe(false);
+  });
+
+  it('imports an asset whose size the picker did not report', async () => {
+    // Some providers omit fileSize. An unknown size is not evidence of a large one.
+    const { services, fs, repository } = await unlockedVault();
+    const staged = await stageTempCopy(fs, 'ok.jpg');
+    const service = new ImportService(
+      deps(services, async () => ({ canceled: false, assets: [staged] })),
+    );
+
+    const report = await service.importFromLibrary(repository);
+
+    expect(report.imported).toBe(1);
+    expect(report.oversized).toBe(0);
+  });
+
+  it('refuses only the oversized asset and imports the rest of the selection', async () => {
+    const { services, fs, repository } = await unlockedVault();
+    const small = await stageTempCopy(fs, 'small.jpg');
+    const huge = { ...(await stageTempCopy(fs, 'huge.jpg')), fileSize: MAX_ITEM_BYTES + 1 };
+    const service = new ImportService(
+      deps(services, async () => ({ canceled: false, assets: [small, huge] })),
+    );
+
+    const report = await service.importFromLibrary(repository);
+
+    expect(report).toEqual({ imported: 1, failed: 0, oversized: 1 });
+    expect(repository.photos).toHaveLength(1);
+  });
+
+  it('accepts an asset exactly at the cap', async () => {
+    const { services, fs, repository } = await unlockedVault();
+    const staged = await stageTempCopy(fs, 'exact.jpg');
+    const picked = { ...staged, fileSize: MAX_ITEM_BYTES };
+    const service = new ImportService(
+      deps(services, async () => ({ canceled: false, assets: [picked] })),
+    );
+
+    const report = await service.importFromLibrary(repository);
+
+    expect(report).toEqual({ imported: 1, failed: 0, oversized: 0 });
   });
 
   it('wipes every temp copy even when an asset fails for a reason other than decoding', async () => {
@@ -125,7 +185,7 @@ describe('ImportService', () => {
 
     const report = await service.importFromLibrary(repository);
 
-    expect(report).toEqual({ imported: 0, failed: 0 });
+    expect(report).toEqual({ imported: 0, failed: 0, oversized: 0 });
     expect(calls).toHaveLength(1);
     const used = calls[0];
     expect(used?.allowsMultipleSelection).toBe(true);
@@ -155,5 +215,41 @@ describe('ImportService', () => {
     for (const buffer of handedOut) {
       expect(buffer.every((byte) => byte === 0)).toBe(true);
     }
+  });
+});
+
+describe('ImportService selection limit', () => {
+  it('caps the picker at the room the free tier leaves, and leaves it open otherwise', async () => {
+    const { services, repository } = await unlockedVault();
+    const calls: ImagePickerOptions[] = [];
+    const service = new ImportService(
+      deps(services, async (options) => {
+        calls.push(options);
+        return { canceled: true, assets: null };
+      }),
+    );
+
+    await service.importFromLibrary(repository, { selectionLimit: 3 });
+    await service.importFromLibrary(repository);
+
+    expect(calls[0]?.selectionLimit).toBe(3);
+    expect(calls[0]?.allowsMultipleSelection).toBe(true);
+    expect(calls[1]?.selectionLimit).toBeUndefined();
+  });
+
+  it('refuses a limit that leaves no room instead of opening a picker for nothing', async () => {
+    const { services, repository } = await unlockedVault();
+    const calls: ImagePickerOptions[] = [];
+    const service = new ImportService(
+      deps(services, async (options) => {
+        calls.push(options);
+        return { canceled: true, assets: null };
+      }),
+    );
+
+    const report = await service.importFromLibrary(repository, { selectionLimit: 0 });
+
+    expect(report).toEqual({ imported: 0, failed: 0, oversized: 0 });
+    expect(calls).toHaveLength(0);
   });
 });

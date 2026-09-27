@@ -36,11 +36,17 @@ export interface SupportScreenProps {
   onBack?: () => void;
   /** Defaults to the version in app.config.ts, matching the About screen. */
   version?: string;
+  /**
+   * Opens the two-way conversation. Absent in a build without it, and the row is then not shown;
+   * the one-way e-mail form below stays exactly as it was either way.
+   */
+  onSupportChat?: () => void;
 }
 
 export function SupportScreen({
   onBack,
   version = DEFAULT_APP_VERSION,
+  onSupportChat,
 }: SupportScreenProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
   const services = useServices();
@@ -72,10 +78,24 @@ export function SupportScreen({
     );
   }
 
-  return <SupportForm version={version} {...(onBack === undefined ? {} : { onBack })} />;
+  return (
+    <SupportForm
+      version={version}
+      {...(onBack === undefined ? {} : { onBack })}
+      {...(onSupportChat === undefined ? {} : { onSupportChat })}
+    />
+  );
 }
 
-function SupportForm({ onBack, version }: { onBack?: () => void; version: string }): React.JSX.Element {
+function SupportForm({
+  onBack,
+  version,
+  onSupportChat,
+}: {
+  onBack?: () => void;
+  version: string;
+  onSupportChat?: () => void;
+}): React.JSX.Element {
   const colors = useTheme();
   const styles = useStyles(makeStyles);
   const services = useServices();
@@ -174,6 +194,18 @@ function SupportForm({ onBack, version }: { onBack?: () => void; version: string
         Nothing is sent until you press Send, and only what is on this screen is sent. No photo, no
         file name and no key ever leaves the device - not even to support.
       </Paragraph>
+
+      {onSupportChat === undefined || !services.supportChat.available ? null : (
+        <>
+          <SectionLabel>Conversation</SectionLabel>
+          <ListRow
+            testID="support_open_chat"
+            label="Support chat"
+            detail="Answers come back in the app. Needs SilentSum Cloud to send."
+            onPress={onSupportChat}
+          />
+        </>
+      )}
 
       <SectionLabel>What is this about</SectionLabel>
       {SUPPORT_TOPICS.map((option) => (

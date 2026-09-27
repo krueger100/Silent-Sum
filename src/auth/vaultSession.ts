@@ -26,6 +26,7 @@ export class VaultSession {
 
   private keys: VaultKeys | null = null;
   private readonly lockListeners = new Set<() => void>();
+  private readonly unlockListeners = new Set<() => void>();
 
   constructor(private readonly monotonicMs: () => number) {
     this.store = createStore<VaultSessionState>()(() => LOCKED);
@@ -52,6 +53,8 @@ export class VaultSession {
     if (this.keys !== null && this.keys !== keys) this.lock();
     this.keys = keys;
     this.store.setState({ isUnlocked: true, unlockedAtMs: this.monotonicMs() });
+    // After the keys are in place, so a listener may derive from them straight away.
+    for (const listener of this.unlockListeners) listener();
   }
 
   /** Wipes the key material and notifies listeners so caches can be cleared. Idempotent. */
@@ -70,6 +73,17 @@ export class VaultSession {
     this.lockListeners.add(listener);
     return () => {
       this.lockListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Called after a session begins, for the things derived from the master key rather than stored
+   * beside it. A listener that throws would break unlocking, so listeners must not.
+   */
+  onUnlock(listener: () => void): () => void {
+    this.unlockListeners.add(listener);
+    return () => {
+      this.unlockListeners.delete(listener);
     };
   }
 }

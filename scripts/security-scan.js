@@ -54,6 +54,17 @@ const FORBIDDEN_CONTENT = [
     what: 'a Firebase service-account credential',
     pattern: /"type"\s*:\s*"service_account"/,
   },
+  // PayMongo credentials belong in Firebase Secret Manager, bound to the functions that use them.
+  // A secret key in tracked source can create charges; a webhook secret can forge "payment
+  // received" events. Neither may appear anywhere here, docs and test fixtures included.
+  {
+    what: 'a PayMongo secret key',
+    pattern: /\bsk_(?:live|test)_[A-Za-z0-9]{12,}/,
+  },
+  {
+    what: 'a PayMongo webhook signing secret',
+    pattern: /\bwhsk_[A-Za-z0-9]{12,}/,
+  },
 ];
 
 /** Files that must not be committed even if they are valid. */
@@ -84,6 +95,8 @@ function walk(dir, out = []) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
+      // The functions' compiled output is regenerated on every build and never committed.
+      if (entry.name === 'lib' && path.basename(dir) === 'functions') continue;
       walk(full, out);
     } else {
       out.push(full);
@@ -175,7 +188,10 @@ for (const file of AUTH_FILES) {
 
 // 6. Only the two modules that are allowed to talk to a server may reach for a network client.
 // Everything else in this app works offline and must keep working offline.
-const NETWORK_ALLOWED = [path.join('src', 'firebase') + path.sep, path.join('src', 'support') + path.sep];
+const NETWORK_ALLOWED = [
+  path.join('src', 'firebase') + path.sep,
+  path.join('src', 'support') + path.sep,
+];
 for (const file of files) {
   if (!/\.(ts|tsx)$/.test(file)) continue;
   const relative = path.relative(ROOT, file);
@@ -185,6 +201,74 @@ for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
   if (/\bfetch\(|XMLHttpRequest|\baxios\b/.test(text)) {
     report(file, 'reaches the network outside src/firebase and src/support');
+  }
+}
+
+// 7. The app never talks to PayMongo. Only the Cloud Functions (functions/) hold a PayMongo
+// credential, so a PayMongo host anywhere in the app is a design error, whatever it is doing.
+for (const file of files) {
+  if (!/\.(ts|tsx|js)$/.test(file)) continue;
+  const relative = path.relative(ROOT, file);
+  if (!relative.startsWith('src' + path.sep) && relative !== 'App.tsx') continue;
+  // Test doubles hand the screens a fake hosted page; that is the backend's answer, not a call.
+  if (relative.includes('__tests__')) continue;
+  const text = fs.readFileSync(file, 'utf8');
+  if (/paymongo\.com/i.test(text)) {
+    report(file, 'references a PayMongo host; payments go through functions/, never the app');
+  }
+}
+
+// 8. The app and the functions are separate programs with separate dependencies. Importing
+// server code into the bundle would drag firebase-admin and the billing internals into the APK.
+for (const file of files) {
+  if (!/\.(ts|tsx)$/.test(file)) continue;
+  const relative = path.relative(ROOT, file);
+  if (!relative.startsWith('src' + path.sep)) continue;
+  const text = fs.readFileSync(file, 'utf8');
+  if (/from\s+['"](?:\.\.\/)+functions\//.test(text)) {
+    report(file, 'imports from functions/; the app must not depend on the backend package');
+  }
+}
+
+// 9. No credential may be compiled into the bundle through the Expo config. Everything in `extra`
+// is plain text in the APK, so a bearer token there is published, not configured. The support
+// screen posts to a Cloud Function that holds the mail provider's key instead
+// (functions/src/supportRelay.ts); there is nothing left for the app to authenticate WITH.
+const CONFIG_FILE = path.join(ROOT, 'app.config.ts');
+if (fs.existsSync(CONFIG_FILE)) {
+  const text = fs.readFileSync(CONFIG_FILE, 'utf8');
+  for (const name of ['SUPPORT_API_KEY', 'RESEND_API_KEY']) {
+    // Mentioned in a comment is fine; read into the config is not.
+    if (new RegExp(`process\\.env\\.${name}`).test(text)) {
+      report(CONFIG_FILE, `reads ${name}; a credential in \`extra\` ships inside the APK`);
+    }
+  }
+  if (/\bapiKey\s*:/.test(text)) {
+    report(
+      CONFIG_FILE,
+      'puts an apiKey in the config; nothing in `extra` may carry a bearer token',
+    );
+  }
+}
+
+// 10. The generated Android project must not sign a release with the debug key. Play rejects it,
+// and `debug.keystore` is the same key in every React Native checkout, so anything it signs can be
+// replaced by anyone. `plugins/withReleaseSigning.js` rewrites this; the check is here because
+// `android/` is regenerated and gitignored, so a stale or unpatched prebuild is the way it comes
+// back. Skipped when the project has not been generated, which is how CI runs.
+const APP_GRADLE = path.join(ROOT, 'android', 'app', 'build.gradle');
+if (fs.existsSync(APP_GRADLE)) {
+  const gradle = fs.readFileSync(APP_GRADLE, 'utf8');
+  const buildTypes = gradle.indexOf('buildTypes {');
+  const releaseAt = buildTypes === -1 ? -1 : gradle.indexOf('release {', buildTypes);
+  const release =
+    releaseAt === -1 ? '' : gradle.slice(releaseAt, gradle.indexOf('\n        }', releaseAt));
+  if (releaseAt === -1) {
+    report(APP_GRADLE, 'has no release build type; the signing configuration cannot be checked');
+  } else if (release.includes('signingConfigs.debug')) {
+    report(APP_GRADLE, 'signs the release build with the DEBUG key; re-run `npx expo prebuild`');
+  } else if (!gradle.includes('SILENTSUM_RELEASE_SIGNING')) {
+    report(APP_GRADLE, 'was generated without withReleaseSigning; re-run `npx expo prebuild`');
   }
 }
 

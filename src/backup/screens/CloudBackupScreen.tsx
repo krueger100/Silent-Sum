@@ -22,9 +22,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
-import { useIsUnlocked, useServices, useSettings, useVaultState } from '@/app/ServicesProvider';
+import {
+  useEntitlements,
+  useIsUnlocked,
+  useServices,
+  useSettings,
+  useVaultState,
+} from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
 import { describeCloudError } from '@/backup/screens/cloudErrors';
+import { cloudActive } from '@/billing/entitlements';
+import { CloudRequiredCard } from '@/billing/screens/CloudRequiredCard';
 import { requestPasswordReset, RESET_REASSURANCE } from '@/backup/screens/passwordReset';
 import { validatePassphrase } from '@/backup/passphrasePolicy';
 import type { BackupService } from '@/backup/types';
@@ -43,6 +51,8 @@ import { constantTimeEquals, zeroBytes } from '@/utils/bytes';
 
 export interface CloudBackupScreenProps {
   onBack?: () => void;
+  /** Where "See plans" goes when Cloud is required and not on. */
+  onPlans?: () => void;
 }
 
 const HOW_IT_WORKS: readonly string[] = [
@@ -54,7 +64,7 @@ const HOW_IT_WORKS: readonly string[] = [
   'The vault keeps working offline whether backup is on or off.',
 ];
 
-export function CloudBackupScreen({ onBack }: CloudBackupScreenProps): React.JSX.Element {
+export function CloudBackupScreen({ onBack, onPlans }: CloudBackupScreenProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
   const services = useServices();
   const backup = services.backup;
@@ -85,7 +95,12 @@ export function CloudBackupScreen({ onBack }: CloudBackupScreenProps): React.JSX
   }
 
   return (
-    <CloudBackupBody backup={backup} cloud={cloud} {...(onBack === undefined ? {} : { onBack })} />
+    <CloudBackupBody
+      backup={backup}
+      cloud={cloud}
+      {...(onBack === undefined ? {} : { onBack })}
+      {...(onPlans === undefined ? {} : { onPlans })}
+    />
   );
 }
 
@@ -93,10 +108,12 @@ function CloudBackupBody({
   backup,
   cloud,
   onBack,
+  onPlans,
 }: {
   backup: BackupService;
   cloud: CloudBackend;
   onBack?: () => void;
+  onPlans?: () => void;
 }): React.JSX.Element {
   const colors = useTheme();
   const styles = useStyles(makeStyles);
@@ -104,6 +121,13 @@ function CloudBackupBody({
   const settings = useSettings();
   const isUnlocked = useIsUnlocked();
   const vault = useVaultState();
+  const { entitlements: owned } = useEntitlements();
+  /**
+   * Backup and restore are SilentSum Cloud features. In a build that can sell, an account with no
+   * active term sees the gate card where the controls would be; the account section and the
+   * Danger section stay, because paying and leaving must both remain possible.
+   */
+  const cloudGated = services.entitlements.enforced && !cloudActive(owned, services.clock.now());
 
   const [user, setUser] = useState<CloudUser | null>(cloud.currentUser);
   const [email, setEmail] = useState('');
@@ -156,23 +180,20 @@ function CloudBackupBody({
   }, [readEnvelope, user]);
 
   /** Runs an action with the busy flag, turning any failure into safe copy. */
-  const run = useCallback(
-    async (action: () => Promise<void>): Promise<void> => {
-      if (inFlight.current) return;
-      inFlight.current = true;
-      setBusy(true);
-      setError(null);
-      try {
-        await action();
-      } catch (cause) {
-        setError(describeCloudError(cause));
-      } finally {
-        inFlight.current = false;
-        setBusy(false);
-      }
-    },
-    [],
-  );
+  const run = useCallback(async (action: () => Promise<void>): Promise<void> => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      await action();
+    } catch (cause) {
+      setError(describeCloudError(cause));
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  }, []);
 
   /**
    * Typing into a credential field is an attempt to fix whatever the last message complained
@@ -275,7 +296,7 @@ function CloudBackupBody({
           report.total === 0
             ? 'There are no photos in the vault yet, so there was nothing to upload.'
             : `Every photo on this device is already in the backup, so nothing was uploaded. ` +
-              `${plural(report.total, 'photo')} are in the backup and none of them were changed.`,
+                `${plural(report.total, 'photo')} are in the backup and none of them were changed.`,
         );
       } else {
         setStatus(
@@ -354,11 +375,11 @@ function CloudBackupBody({
           report.restored === 0 && report.skipped === 0
             ? 'There was nothing in the backup to restore.'
             : `Restored ${plural(report.restored, 'photo')}. ` +
-              `${plural(report.skipped, 'photo')} already on this device, left untouched.` +
-              (foreign
-                ? ' That backup was made by an earlier vault, so its photos were re-encrypted for ' +
-                  'this one and the backup now follows this device.'
-                : ''),
+                `${plural(report.skipped, 'photo')} already on this device, left untouched.` +
+                (foreign
+                  ? ' That backup was made by an earlier vault, so its photos were re-encrypted for ' +
+                    'this one and the backup now follows this device.'
+                  : ''),
         );
       } finally {
         zeroBytes(recovered);
@@ -543,139 +564,144 @@ function CloudBackupBody({
             }
           />
 
-          <SectionLabel>Status</SectionLabel>
-          <Text testID="backup_state" style={styles.body}>
-            {hasEnvelope === null
-              ? 'Checking this account for a backup...'
-              : hasEnvelope
-                ? 'Backup is enabled for this account.'
-                : 'Backup is not enabled for this account yet.'}
-          </Text>
-          <Text testID="backup_last_backup" style={styles.muted}>
-            {settings.lastBackupAt === null
-              ? 'No backup has run on this device yet.'
-              : `Last backup: ${formatTimestamp(settings.lastBackupAt)}.`}
-          </Text>
-          {isUnlocked && vault.isOpen ? null : (
-            <Text testID="backup_locked_note" style={styles.muted}>
-              Open the vault to enable backup or upload photos.
-            </Text>
-          )}
-
-          {hasEnvelope === true ? (
+          {cloudGated ? (
+            <CloudRequiredCard feature="backup" {...(onPlans === undefined ? {} : { onPlans })} />
+          ) : (
             <>
-              <Button testID="backup_now" label="Back up now" busy={busy} onPress={backupNow} />
+              <SectionLabel>Status</SectionLabel>
+              <Text testID="backup_state" style={styles.body}>
+                {hasEnvelope === null
+                  ? 'Checking this account for a backup...'
+                  : hasEnvelope
+                    ? 'Backup is enabled for this account.'
+                    : 'Backup is not enabled for this account yet.'}
+              </Text>
+              <Text testID="backup_last_backup" style={styles.muted}>
+                {settings.lastBackupAt === null
+                  ? 'No backup has run on this device yet.'
+                  : `Last backup: ${formatTimestamp(settings.lastBackupAt)}.`}
+              </Text>
+              {isUnlocked && vault.isOpen ? null : (
+                <Text testID="backup_locked_note" style={styles.muted}>
+                  Open the vault to enable backup or upload photos.
+                </Text>
+              )}
 
-              <SectionLabel>Restore</SectionLabel>
-              <Paragraph>
-                Downloads photos that are in the backup but not on this device, straight into the
-                open vault. Photos already here are left exactly as they are, and nothing is
-                deleted - restoring twice is harmless.
-              </Paragraph>
-              {restoring ? (
-                <View style={styles.form}>
+              {hasEnvelope === true ? (
+                <>
+                  <Button testID="backup_now" label="Back up now" busy={busy} onPress={backupNow} />
+
+                  <SectionLabel>Restore</SectionLabel>
                   <Paragraph>
-                    This is the recovery passphrase you chose when you turned backup on, not your
-                    account password and not your PIN. It is the only thing that can unwrap the
-                    backed-up key, and it is checked before anything is downloaded.
+                    Downloads photos that are in the backup but not on this device, straight into
+                    the open vault. Photos already here are left exactly as they are, and nothing is
+                    deleted - restoring twice is harmless.
                   </Paragraph>
+                  {restoring ? (
+                    <View style={styles.form}>
+                      <Paragraph>
+                        This is the recovery passphrase you chose when you turned backup on, not
+                        your account password and not your PIN. It is the only thing that can unwrap
+                        the backed-up key, and it is checked before anything is downloaded.
+                      </Paragraph>
+                      <Field
+                        testID="backup_restore_passphrase"
+                        label="Recovery passphrase"
+                        value={restorePassphrase}
+                        onChangeText={setRestorePassphrase}
+                        secure
+                      />
+                      <Button
+                        testID="backup_restore_submit"
+                        label="Restore now"
+                        busy={busy}
+                        onPress={restoreNow}
+                      />
+                      <Button
+                        testID="backup_restore_cancel"
+                        label="Cancel"
+                        variant="ghost"
+                        disabled={busy}
+                        onPress={() => {
+                          setRestorePassphrase('');
+                          setRestoring(false);
+                          setError(null);
+                        }}
+                      />
+                    </View>
+                  ) : (
+                    <Button
+                      testID="backup_restore"
+                      label="Restore from backup"
+                      variant="secondary"
+                      disabled={busy}
+                      onPress={() => {
+                        setError(null);
+                        setStatus(null);
+                        setRestoring(true);
+                      }}
+                    />
+                  )}
+                </>
+              ) : prompting ? (
+                <View style={styles.form}>
+                  <View style={styles.warning} testID="backup_passphrase_warning">
+                    <Text style={styles.warningTitle}>Write this passphrase down first</Text>
+                    <Text style={styles.warningLine}>
+                      The recovery passphrase is the only thing that can ever unlock this backup. It
+                      is not stored anywhere, not on this device and not on the server, and it
+                      cannot be reset or recovered.
+                    </Text>
+                    <Text style={styles.warningLine}>
+                      If you lose it, the backup is permanently unreadable - by you and by everyone
+                      else. Use at least 12 characters and keep it somewhere safe.
+                    </Text>
+                  </View>
                   <Field
-                    testID="backup_restore_passphrase"
+                    testID="backup_passphrase"
                     label="Recovery passphrase"
-                    value={restorePassphrase}
-                    onChangeText={setRestorePassphrase}
+                    value={passphrase}
+                    onChangeText={setPassphrase}
+                    secure
+                  />
+                  <Field
+                    testID="backup_passphrase_confirm"
+                    label="Confirm recovery passphrase"
+                    value={passphraseConfirm}
+                    onChangeText={setPassphraseConfirm}
                     secure
                   />
                   <Button
-                    testID="backup_restore_submit"
-                    label="Restore now"
+                    testID="backup_passphrase_submit"
+                    label="Enable backup"
                     busy={busy}
-                    onPress={restoreNow}
+                    onPress={enableBackup}
                   />
                   <Button
-                    testID="backup_restore_cancel"
+                    testID="backup_passphrase_cancel"
                     label="Cancel"
                     variant="ghost"
                     disabled={busy}
                     onPress={() => {
-                      setRestorePassphrase('');
-                      setRestoring(false);
+                      setPassphrase('');
+                      setPassphraseConfirm('');
+                      setPrompting(false);
                       setError(null);
                     }}
                   />
                 </View>
               ) : (
                 <Button
-                  testID="backup_restore"
-                  label="Restore from backup"
-                  variant="secondary"
+                  testID="backup_enable"
+                  label="Enable backup"
                   disabled={busy}
                   onPress={() => {
                     setError(null);
-                    setStatus(null);
-                    setRestoring(true);
+                    setPrompting(true);
                   }}
                 />
               )}
-
             </>
-          ) : prompting ? (
-            <View style={styles.form}>
-              <View style={styles.warning} testID="backup_passphrase_warning">
-                <Text style={styles.warningTitle}>Write this passphrase down first</Text>
-                <Text style={styles.warningLine}>
-                  The recovery passphrase is the only thing that can ever unlock this backup. It is
-                  not stored anywhere, not on this device and not on the server, and it cannot be
-                  reset or recovered.
-                </Text>
-                <Text style={styles.warningLine}>
-                  If you lose it, the backup is permanently unreadable - by you and by everyone
-                  else. Use at least 12 characters and keep it somewhere safe.
-                </Text>
-              </View>
-              <Field
-                testID="backup_passphrase"
-                label="Recovery passphrase"
-                value={passphrase}
-                onChangeText={setPassphrase}
-                secure
-              />
-              <Field
-                testID="backup_passphrase_confirm"
-                label="Confirm recovery passphrase"
-                value={passphraseConfirm}
-                onChangeText={setPassphraseConfirm}
-                secure
-              />
-              <Button
-                testID="backup_passphrase_submit"
-                label="Enable backup"
-                busy={busy}
-                onPress={enableBackup}
-              />
-              <Button
-                testID="backup_passphrase_cancel"
-                label="Cancel"
-                variant="ghost"
-                disabled={busy}
-                onPress={() => {
-                  setPassphrase('');
-                  setPassphraseConfirm('');
-                  setPrompting(false);
-                  setError(null);
-                }}
-              />
-            </View>
-          ) : (
-            <Button
-              testID="backup_enable"
-              label="Enable backup"
-              disabled={busy}
-              onPress={() => {
-                setError(null);
-                setPrompting(true);
-              }}
-            />
           )}
 
           <SectionLabel>Danger</SectionLabel>
@@ -814,7 +840,6 @@ function HowItWorks(): React.JSX.Element {
     </View>
   );
 }
-
 
 function plural(count: number, noun: string): string {
   return `${String(count)} ${noun}${count === 1 ? '' : 's'}`;

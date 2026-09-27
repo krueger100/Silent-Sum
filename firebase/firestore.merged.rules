@@ -12,13 +12,25 @@
 //
 // The existing `stripe_customers` block below is copied byte for byte from the deployed ruleset
 // and must stay that way. Everything under "ADDED: SilentSum" is new, matches only
-// `users/{uid}/vault/...`, and cannot widen access to any other path: Firestore denies every
-// path no match allows, and rules are OR-ed, so a new match can only ever grant on its own paths.
+// `users/{uid}/vault/...` and `users/{uid}/billing/entitlements`, and cannot widen access to any
+// other path: Firestore denies every path no match allows, and rules are OR-ed, so a new match
+// can only ever grant on its own paths.
 //
 // SilentSum's standalone `firestore.rules` ends with `match /{document=**} { allow read, write:
 // if false; }`. That is deliberately NOT carried over: it is redundant here (unmatched paths are
 // denied anyway) and, because rules OR rather than AND, it could never revoke the stripe grants
 // even if someone assumed it would.
+//
+// BILLING (added 2026-09-21): `users/{uid}/billing/entitlements` is written only by the SilentSum
+// Cloud Functions through the Admin SDK, which bypasses these rules; a client may read its own
+// and write none. Backup writes (envelope, manifest) now also require an active Cloud term
+// (`ssCloudActive`). Reads and deletes deliberately do not, so a lapsed account can still take
+// its data out and delete itself. The server-only billing collections (`silentsum_billing_*`)
+// have no match here at all and are therefore closed to every client.
+//
+// ROLLOUT ORDER matters for the gate: deploy the `silentsum` functions codebase first, then ship
+// the app build that can buy Cloud, and only then deploy these rules. Deployed first, they stop
+// every existing backup until someone can subscribe.
 //
 // Realtime Database rules are a different service entirely and are untouched by this file.
 
@@ -45,6 +57,15 @@ service cloud.firestore {
 
     function ssOwner(uid) {
       return request.auth != null && request.auth.uid == uid;
+    }
+
+    // Cloud is on while the server-written `cloud.accessUntil` is in the future. Status is
+    // deliberately not consulted: the server sets the date to "now" when access is withdrawn,
+    // so the date alone is the truth, and a document with no date is a free account.
+    function ssCloudActive(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)/billing/entitlements)
+        && get(/databases/$(database)/documents/users/$(uid)/billing/entitlements).data.cloud.accessUntil is timestamp
+        && get(/databases/$(database)/documents/users/$(uid)/billing/entitlements).data.cloud.accessUntil > request.time;
     }
 
     function ssValidEnvelope(d) {
@@ -78,12 +99,251 @@ service cloud.firestore {
 
     match /users/{uid}/vault/envelope {
       allow read, delete: if ssOwner(uid);
-      allow create, update: if ssOwner(uid) && ssValidEnvelope(request.resource.data);
+      allow create, update: if ssOwner(uid) && ssCloudActive(uid) && ssValidEnvelope(request.resource.data);
     }
 
     match /users/{uid}/vault/manifest {
       allow read, delete: if ssOwner(uid);
-      allow create, update: if ssOwner(uid) && ssValidManifest(request.resource.data);
+      allow create, update: if ssOwner(uid) && ssCloudActive(uid) && ssValidManifest(request.resource.data);
     }
+
+    // ---- ADDED: SilentSum billing entitlements --------------------------------------------
+    // What the account has paid for. Server-written; the owner reads, nobody else does anything.
+    match /users/{uid}/billing/entitlements {
+      allow read: if ssOwner(uid);
+      allow write: if false;
+    }
+
+    // ---- ADDED: SilentSum support chat -----------------------------------------------------
+    // A support message the client is allowed to write: from the user, plain text within a sane
+    // length, with a client millisecond stamp the server pins to its own clock, so nobody can
+    // backdate or postdate a message.
+    function ssValidSupportMessage(d) {
+      return d.keys().hasOnly(['v', 'sender', 'body', 'createdAt'])
+        && d.v == 1
+        && d.sender == 'user'
+        && d.body is string
+        && d.body.size() > 0
+        && d.body.size() <= 2000
+        && d.createdAt is number
+        && d.createdAt <= request.time.toMillis() + 60000
+        && d.createdAt >= request.time.toMillis() - 300000;
+    }
+
+    // The thread document carries only the read marker, so an owner cannot invent a conversation
+    // state; support's replies and everything about them are written by the Admin SDK.
+    function ssValidSupportThread(uid, d) {
+      return d.keys().hasOnly(['v', 'uid', 'userLastReadAt'])
+        && d.v == 1
+        && d.uid == uid
+        && d.userLastReadAt is number
+        && d.userLastReadAt <= request.time.toMillis() + 60000;
+    }
+
+    // One conversation per account, readable only by that account. Reading is never gated: a
+    // lapsed Cloud term must still be able to read what support said, and the local vault is
+    // untouched either way. Sending a NEW message needs an active term.
+    match /users/{uid}/support/thread {
+      allow read: if ssOwner(uid);
+      allow create, update: if ssOwner(uid) && ssValidSupportThread(uid, request.resource.data);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if ssOwner(uid);
+        allow create: if ssOwner(uid)
+          && ssCloudActive(uid)
+          && ssValidSupportMessage(request.resource.data);
+        // A sent message is a record. Nobody edits or removes one from the client.
+        allow update, delete: if false;
+      }
+    }
+
+    // ---- ADDED: SilentSum user-to-user messaging -------------------------------------------
+    //
+    // Two accounts writing to one place, which nothing else in this file does. Three ideas keep
+    // it safe without a single extra document read on the hot path:
+    //
+    //   * A conversation id IS its membership: `<uidA>__<uidB>`, sorted. So "may you read this
+    //     message?" is answered from the path, not from a get() of the parent -- which matters,
+    //     because a rule that read the parent would cost a read for every message displayed.
+    //   * Bodies are ciphertext. These rules check shape and size and cannot check content,
+    //     because nothing on the server can read it.
+    //   * Pro is checked HERE, against the entitlement document only the webhook writes. A
+    //     patched client that claims Pro gets permission-denied.
+    //
+    // Reading is never gated on Pro: an account that lapses keeps its history.
+
+    function ssProActive(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)/billing/entitlements)
+        && get(/databases/$(database)/documents/users/$(uid)/billing/entitlements).data.pro == true;
+    }
+
+    // A client clock the server pins to its own: one minute of tolerance ahead, five behind.
+    function ssRecentMillis(t) {
+      return t is number
+        && t <= request.time.toMillis() + 60000
+        && t >= request.time.toMillis() - 300000;
+    }
+
+    function ssConvMembers(cid) {
+      return cid.split('__');
+    }
+
+    function ssInConv(cid) {
+      return request.auth != null && request.auth.uid in ssConvMembers(cid);
+    }
+
+    function ssConvPeer(cid) {
+      return ssConvMembers(cid)[0] == request.auth.uid
+        ? ssConvMembers(cid)[1]
+        : ssConvMembers(cid)[0];
+    }
+
+    // The published X25519 public key. Any signed-in account may read one -- that is what makes
+    // it public -- and only its owner may write it. A key is never deleted, because deleting one
+    // would make every conversation it protects unreadable.
+    match /messagingKeys/{uid} {
+      allow read: if request.auth != null;
+      allow create, update: if ssOwner(uid)
+        && request.resource.data.keys().hasOnly(['v', 'uid', 'publicKey', 'updatedAt'])
+        && request.resource.data.v == 1
+        && request.resource.data.uid == uid
+        && request.resource.data.publicKey is string
+        && request.resource.data.publicKey.size() > 0
+        && request.resource.data.publicKey.size() <= 128
+        && ssRecentMillis(request.resource.data.updatedAt);
+      allow delete: if false;
+    }
+
+    function ssValidNewConversation(cid, d) {
+      return d.keys().hasOnly([
+          'v', 'members', 'createdAt', 'createdBy', 'lastMessageAt', 'lastMessageFrom',
+          'unread', 'readAt'
+        ])
+        && d.v == 1
+        && d.members is list
+        && d.members.size() == 2
+        && d.members[0] is string
+        && d.members[1] is string
+        && d.members[0] < d.members[1]
+        && cid == d.members[0] + '__' + d.members[1]
+        && request.auth.uid in d.members
+        && d.createdBy == request.auth.uid
+        && ssRecentMillis(d.createdAt)
+        && ssRecentMillis(d.lastMessageAt)
+        && d.lastMessageFrom == null
+        && d.unread.keys().hasOnly(d.members)
+        && d.unread[d.members[0]] == 0
+        && d.unread[d.members[1]] == 0
+        && d.readAt.keys().hasOnly(d.members)
+        && d.readAt[d.members[0]] == 0
+        && d.readAt[d.members[1]] == 0;
+    }
+
+    // Sending bumps the sort key and adds exactly one to the OTHER side's unread count. It may
+    // not touch its own count, the read markers, or the membership.
+    function ssConvSend(cid) {
+      return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['lastMessageAt', 'lastMessageFrom', 'unread'])
+        && request.resource.data.lastMessageFrom == request.auth.uid
+        && ssRecentMillis(request.resource.data.lastMessageAt)
+        && request.resource.data.unread[ssConvPeer(cid)] == resource.data.unread[ssConvPeer(cid)] + 1
+        && request.resource.data.unread[request.auth.uid] == resource.data.unread[request.auth.uid];
+    }
+
+    // Opening the conversation clears only your own badge. Never gated on Pro: an account that
+    // lapses must still be able to put its own badge down.
+    function ssConvRead(cid) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['unread', 'readAt'])
+        && request.resource.data.unread[request.auth.uid] == 0
+        && ssRecentMillis(request.resource.data.readAt[request.auth.uid])
+        && request.resource.data.unread[ssConvPeer(cid)] == resource.data.unread[ssConvPeer(cid)]
+        && request.resource.data.readAt[ssConvPeer(cid)] == resource.data.readAt[ssConvPeer(cid)];
+    }
+
+    // `box` is XChaCha20-Poly1305 ciphertext, `nonce` is 24 bytes base64 (32 characters). The
+    // ceiling is generous enough for the longest message the app will send and small enough that
+    // the collection cannot be used as file storage.
+    // A message carrying a photo or a video. The media itself lives in Storage; the document
+    // holds only pointers, so this validates the pointers rather than any content.
+    //
+    // `kind` absent means text, which is what keeps every message sent before this feature
+    // existed valid. A kind that is present must be one this app understands -- an unknown one is
+    // refused here even though the client parses it leniently, because a writer inventing kinds
+    // is a different thing from a reader meeting one it does not know.
+    //
+    // The object names are pinned to THIS conversation's prefix. They are the only fields a
+    // client controls that name a path, and without the prefix check a member could point a
+    // message at an object belonging to a conversation they are not in.
+    function ssValidMediaFields(cid, d) {
+      return (!('kind' in d.keys()) && !('object' in d.keys()) && !('thumbObject' in d.keys()))
+        || (d.kind in ['photo', 'video']
+          && d.object is string
+          && d.object.matches('^messages/' + cid + '/(photo|video)/[^/]+$')
+          && d.bytes is int
+          && d.bytes > 0
+          && (!('thumbObject' in d.keys())
+            || (d.thumbObject is string
+              && d.thumbObject.matches('^messages/' + cid + '/thumb/[^/]+$'))));
+    }
+
+    function ssValidConvMessage(cid, d) {
+      return d.keys().hasOnly(['v', 'from', 'box', 'nonce', 'createdAt', 'kind', 'object', 'bytes', 'thumbObject'])
+        && d.v == 1
+        && d.from == request.auth.uid
+        && d.box is string
+        && d.box.size() > 0
+        && d.box.size() <= 16000
+        && d.nonce is string
+        && d.nonce.size() == 32
+        && ssRecentMillis(d.createdAt)
+        && ssValidMediaFields(cid, d);
+    }
+
+    match /conversations/{cid} {
+      // A `get` names the conversation it wants, so the id answers membership by itself, with no
+      // document read -- which is the whole reason the id carries the two uids.
+      allow get: if ssInConv(cid);
+      // A LIST cannot work that way, and splitting this off is not cosmetic. Rules are not
+      // filters: for a query the engine has to satisfy the condition from the query's own
+      // constraints BEFORE reading anything, and a query cannot constrain a document id. An
+      // id-based rule therefore refuses every query, whoever sends it. So a list is authorised
+      // from the members field instead, which is exactly what the client's
+      // `where('members', 'array-contains', uid)` constrains; a query without that clause is
+      // still refused. `ssValidNewConversation` pins that field to the id, so this is the same
+      // membership test arrived at another way, not a weaker one.
+      allow list: if request.auth != null && request.auth.uid in resource.data.members;
+      allow create: if ssInConv(cid)
+        && ssProActive(request.auth.uid)
+        && ssValidNewConversation(cid, request.resource.data);
+      allow update: if ssInConv(cid)
+        && ((ssProActive(request.auth.uid) && ssConvSend(cid)) || ssConvRead(cid));
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if ssInConv(cid);
+        allow create: if ssInConv(cid)
+          && ssProActive(request.auth.uid)
+          && ssValidConvMessage(cid, request.resource.data);
+        // A sent message is a record. Nobody edits or removes one from the client.
+        allow update, delete: if false;
+      }
+    }
+
+    // What this account privately calls another one: the address it typed to find them,
+    // encrypted with a key derived from its own vault. Owner-only, and opaque to the server.
+    match /users/{uid}/contacts/{peerUid} {
+      allow read, delete: if ssOwner(uid);
+      allow create, update: if ssOwner(uid)
+        && request.resource.data.keys().hasOnly(['v', 'box', 'nonce', 'updatedAt'])
+        && request.resource.data.v == 1
+        && request.resource.data.box is string
+        && request.resource.data.box.size() > 0
+        && request.resource.data.box.size() <= 2000
+        && request.resource.data.nonce is string
+        && request.resource.data.nonce.size() == 32
+        && ssRecentMillis(request.resource.data.updatedAt);
+    }
+
   }
 }

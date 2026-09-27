@@ -27,6 +27,8 @@ import { describeCloudError } from '@/backup/screens/cloudErrors';
 import { requestPasswordReset, RESET_REASSURANCE } from '@/backup/screens/passwordReset';
 import { validatePassphrase } from '@/backup/passphrasePolicy';
 import type { BackupService } from '@/backup/types';
+import { cloudActive } from '@/billing/entitlements';
+import { CloudRequiredCard } from '@/billing/screens/CloudRequiredCard';
 import { Button } from '@/components/Button';
 import { Field } from '@/components/Field';
 import { Paragraph, Screen } from '@/components/Screen';
@@ -38,11 +40,31 @@ export interface RestoreFlowScreenProps {
   onDone: () => void;
   /** Back affordance. Ignored while the restore is running. */
   onBack?: () => void;
+  /** Where "See plans" goes when the account's Cloud term has lapsed. */
+  onPlans?: () => void;
+  /**
+   * Replace a vault that is already on this device.
+   *
+   * Only ever true on the support-issued recovery path, where the user has told us they cannot
+   * open the vault that is here. Normally `adoptMasterKey` refuses outright, so that a restore
+   * can never silently orphan photos someone can still reach.
+   *
+   * The replacement happens at the END of the flow rather than the start, which is the whole
+   * reason this is a flag and not an erase step: by then the passphrase has already unwrapped
+   * the key, so the vault on the device is only given up once the replacement is certain. Erase
+   * first and a mistyped passphrase costs the user everything.
+   */
+  allowOverwrite?: boolean;
 }
 
-type Step = 'account' | 'missing' | 'passphrase' | 'pin' | 'working' | 'done';
+type Step = 'account' | 'cloudRequired' | 'missing' | 'passphrase' | 'pin' | 'working' | 'done';
 
-export function RestoreFlowScreen({ onDone, onBack }: RestoreFlowScreenProps): React.JSX.Element {
+export function RestoreFlowScreen({
+  onDone,
+  onBack,
+  onPlans,
+  allowOverwrite = false,
+}: RestoreFlowScreenProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
   const services = useServices();
   const backup = services.backup;
@@ -72,7 +94,9 @@ export function RestoreFlowScreen({ onDone, onBack }: RestoreFlowScreenProps): R
       backup={backup}
       cloud={cloud}
       onDone={onDone}
+      allowOverwrite={allowOverwrite}
       {...(onBack === undefined ? {} : { onBack })}
+      {...(onPlans === undefined ? {} : { onPlans })}
     />
   );
 }
@@ -82,11 +106,15 @@ function RestoreFlowBody({
   cloud,
   onDone,
   onBack,
+  onPlans,
+  allowOverwrite,
 }: {
   backup: BackupService;
   cloud: CloudBackend;
   onDone: () => void;
   onBack?: () => void;
+  onPlans?: () => void;
+  allowOverwrite: boolean;
 }): React.JSX.Element {
   const colors = useTheme();
   const styles = useStyles(makeStyles);
@@ -165,6 +193,14 @@ function RestoreFlowBody({
       setPassword('');
       try {
         await cloud.signIn(email.trim(), secret);
+        // Restore is a SilentSum Cloud feature. The live document is read here, not the cache:
+        // this is usually a new phone, and the cache on it says nothing about this account.
+        const owned = await services.entitlements.refresh();
+        if (!mounted.current) return;
+        if (services.entitlements.enforced && !cloudActive(owned, services.clock.now())) {
+          setStep('cloudRequired');
+          return;
+        }
         // Ask before promising. An account with no envelope has nothing to restore, and finding
         // that out after typing a passphrase and inventing a PIN reads like the passphrase was
         // wrong.
@@ -175,7 +211,7 @@ function RestoreFlowBody({
         if (mounted.current) setError(describeCloudError(cause));
       }
     })();
-  }, [backup, cloud, email, password]);
+  }, [backup, cloud, email, password, services]);
 
   /** Leaves the dead-end account. Signing out first, so the next attempt starts clean. */
   const useAnotherAccount = useCallback((): void => {
@@ -270,7 +306,9 @@ function RestoreFlowBody({
         setTimeout(resolve, 0);
       });
       try {
-        const keys = await services.auth.adoptMasterKey(master, pin);
+        const keys = await services.auth.adoptMasterKey(master, pin, {
+          overwrite: allowOverwrite,
+        });
         restoredKeys.current = keys;
         // The master key has done its one job: it is wrapped under the new PIN and the session
         // sub-keys are derived. Nothing below needs the raw bytes again.
@@ -291,7 +329,7 @@ function RestoreFlowBody({
         setStep('pin');
       }
     })();
-  }, [backup, pin, pinConfirm, services]);
+  }, [allowOverwrite, backup, pin, pinConfirm, services]);
 
   const canGoBack = onBack !== undefined && step !== 'working';
 
@@ -347,13 +385,29 @@ function RestoreFlowBody({
         </View>
       ) : null}
 
+      {step === 'cloudRequired' ? (
+        <View style={styles.form}>
+          <CloudRequiredCard
+            feature="restore"
+            testID="restore_cloud_required"
+            {...(onPlans === undefined ? {} : { onPlans })}
+          />
+          <Button
+            testID="restore_other_account"
+            label="Use a different account"
+            variant="secondary"
+            onPress={useAnotherAccount}
+          />
+        </View>
+      ) : null}
+
       {step === 'missing' ? (
         <View style={styles.form} testID="restore_missing">
           <Text style={styles.heading}>No backup found for this account</Text>
           <Paragraph>
             You are signed in, but this account has no encrypted backup stored against it. There is
-            nothing here to restore. If you used a different email for backup, sign in with that
-            one instead.
+            nothing here to restore. If you used a different email for backup, sign in with that one
+            instead.
           </Paragraph>
           <Button
             testID="restore_other_account"
@@ -411,6 +465,12 @@ function RestoreFlowBody({
             secure
             keyboardType="number-pad"
           />
+          {allowOverwrite ? (
+            <Text testID="restore_overwrite_warning" style={styles.warning}>
+              This replaces the vault already on this device. Anything added since the last backup
+              was taken is not in the backup and will not come back.
+            </Text>
+          ) : null}
           <Button testID="restore_submit" label="Restore vault" onPress={restore} />
         </View>
       ) : null}
@@ -455,7 +515,6 @@ function RestoreFlowBody({
   );
 }
 
-
 function plural(count: number, noun: string): string {
   return `${String(count)} ${noun}${count === 1 ? '' : 's'}`;
 }
@@ -471,6 +530,7 @@ const makeStyles = (colors: Palette) =>
     cardTitle: { ...typography.label, color: colors.text, fontSize: 16 },
     cardLine: { ...typography.body, color: colors.textMuted, lineHeight: 22 },
     form: { gap: spacing.sm },
+    warning: { ...typography.label, color: colors.danger, lineHeight: 19 },
     heading: { ...typography.title, color: colors.text, fontSize: 18 },
     body: { ...typography.body, color: colors.text },
     error: { ...typography.label, color: colors.danger },

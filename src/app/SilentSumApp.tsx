@@ -21,18 +21,25 @@ export function SilentSumApp({ services }: { services: Services }): React.JSX.El
 
   useEffect(() => {
     let cancelled = false;
+    let stopEntitlements: (() => void) | null = null;
     void (async () => {
       const settings = await services.settings.load();
       // Telemetry follows the stored preference: crash reports default on, analytics off.
       await services.firebase.crash.setEnabled(settings.crashReportsEnabled);
       await services.firebase.analytics.setEnabled(settings.analyticsEnabled);
-      if (!cancelled) setReady(true);
+      // The cached tier is read before the first screen paints, so Pro is never a flicker away
+      // on a phone with no network; the live document then follows the signed-in account.
+      await services.entitlements.load();
+      if (cancelled) return;
+      stopEntitlements = services.entitlements.start();
+      setReady(true);
     })().catch(() => {
       // A failed settings read must never block the calculator; defaults already apply.
       if (!cancelled) setReady(true);
     });
     return () => {
       cancelled = true;
+      stopEntitlements?.();
     };
   }, [services]);
 

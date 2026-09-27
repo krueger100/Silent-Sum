@@ -111,3 +111,51 @@ export const base64_variants = {
   URLSAFE: 5,
   URLSAFE_NO_PADDING: 7,
 } as const;
+
+export const crypto_sign_BYTES = 64;
+export const crypto_sign_PUBLICKEYBYTES = 32;
+export const crypto_sign_SECRETKEYBYTES = 64;
+
+/**
+ * Ed25519 verification, in the argument order both bindings use: signature, message, key.
+ *
+ * `crypto_sign_keypair` and `crypto_sign_detached` are here only so tests can mint fixtures. The
+ * app imports neither -- `@/crypto/sodium` deliberately exposes verification alone, because the
+ * signing half belongs on an offline machine and never in a shipped bundle.
+ */
+export function crypto_sign_verify_detached(
+  signature: Bytes,
+  message: string | Bytes,
+  publicKey: Bytes,
+): boolean {
+  const msg = typeof message === 'string' ? new TextEncoder().encode(message) : message;
+  return ensureReady().crypto_sign_verify_detached(signature, msg, publicKey);
+}
+
+export function crypto_sign_detached(message: string | Bytes, secretKey: Bytes): Bytes {
+  const msg = typeof message === 'string' ? new TextEncoder().encode(message) : message;
+  return ensureReady().crypto_sign_detached(msg, secretKey);
+}
+
+export function crypto_sign_keypair(): { publicKey: Bytes; privateKey: Bytes } {
+  const pair = ensureReady().crypto_sign_keypair();
+  return { publicKey: pair.publicKey, privateKey: pair.privateKey };
+}
+
+/**
+ * The messaging identity keypair. Same name and argument order as the JSI binding.
+ *
+ * There is deliberately no `crypto_box_beforenm` or `crypto_scalarmult` here, however easy
+ * `libsodium-wrappers-sumo` makes them: `lib.native.ts` bridges neither, so a shim that offered
+ * them would be lending the tests a primitive the phone does not have. That is exactly how the
+ * messaging screen shipped broken once. The Diffie-Hellman lives in `@/crypto/sodium` on
+ * `@noble/curves` instead, and `nativeSurface.test.ts` keeps this file honest.
+ */
+export function crypto_box_seed_keypair(seed: Bytes): {
+  publicKey: Bytes;
+  privateKey: Bytes;
+  keyType: string;
+} {
+  const pair = ensureReady().crypto_box_seed_keypair(seed);
+  return { publicKey: pair.publicKey, privateKey: pair.privateKey, keyType: pair.keyType };
+}

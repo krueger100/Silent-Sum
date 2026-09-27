@@ -25,6 +25,8 @@ type Extra = {
   firebaseConfigured?: boolean;
   /** SilentSum's own Storage bucket. Absent means cloud backup is not offered at all. */
   firebaseStorageBucket?: string;
+  /** Purchases: off switch and an optional override for where the functions live. */
+  billing?: { enabled?: boolean; functionsUrl?: string };
 };
 
 function readExtra(): Extra {
@@ -52,6 +54,12 @@ export default function App(): React.JSX.Element {
         ...(typeof extra.firebaseStorageBucket === 'string'
           ? { storageBucket: extra.firebaseStorageBucket }
           : {}),
+        billing: {
+          enabled: extra.billing?.enabled !== false,
+          ...(typeof extra.billing?.functionsUrl === 'string'
+            ? { functionsUrl: extra.billing.functionsUrl }
+            : {}),
+        },
       });
       if (!cancelled) setServices(createServices({ firebase, fs }));
     })().catch(() => {

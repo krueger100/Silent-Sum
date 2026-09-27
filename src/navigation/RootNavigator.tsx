@@ -10,10 +10,16 @@ import React, { useMemo, useState } from 'react';
 import { NavigationContainer, type Theme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 
-import { useIsUnlocked, useSettings } from '@/app/ServicesProvider';
+import {
+  useIsUnlocked,
+  useRecoveryAuthorized,
+  useServices,
+  useSettings,
+} from '@/app/ServicesProvider';
 import { useTheme, type Palette } from '@/app/theme';
 import { PinSetupScreen } from '@/auth/screens/PinSetupScreen';
 import { RestoreFlowScreen } from '@/backup/screens/RestoreFlowScreen';
+import { PlansScreen } from '@/billing/screens/PlansScreen';
 import { CloudBackupScreen } from '@/backup/screens/CloudBackupScreen';
 import { CalculatorScreen } from '@/calculator/CalculatorScreen';
 import { GalleryScreen } from '@/gallery/GalleryScreen';
@@ -23,13 +29,23 @@ import { AutoLockScreen } from '@/settings/screens/AutoLockScreen';
 import { SecurityScreen } from '@/settings/screens/SecurityScreen';
 import { SettingsScreen } from '@/settings/screens/SettingsScreen';
 import { SupportScreen } from '@/settings/screens/SupportScreen';
+import { ConversationScreen } from '@/messaging/screens/ConversationScreen';
+import { ConversationsScreen } from '@/messaging/screens/ConversationsScreen';
+import { SupportChatScreen } from '@/support/chat/SupportChatScreen';
 import { WipePinScreen } from '@/settings/screens/WipePinScreen';
 
+/**
+ * A name in both stacks is a name that can survive a lock -- see the container key at the bottom
+ * of this file for why, and keep collisions deliberate. `VaultAbout` is spelled that way rather
+ * than `About` for this reason.
+ */
 export type LockedStackParams = {
   Calculator: undefined;
   PinSetup: undefined;
   Restore: undefined;
   About: undefined;
+  /** Reachable only from the restore flow, which has already revealed the vault. */
+  Plans: undefined;
 };
 
 export type VaultStackParams = {
@@ -41,7 +57,11 @@ export type VaultStackParams = {
   Security: undefined;
   WipePin: undefined;
   CloudBackup: undefined;
+  Plans: undefined;
   Support: undefined;
+  SupportChat: undefined;
+  Messages: undefined;
+  Conversation: { conversationId: string };
   VaultAbout: undefined;
 };
 
@@ -78,6 +98,9 @@ function LockedFlow(): React.JSX.Element {
   // Super secure reaches About too: with it on, the only page the calculator's menu opens must
   // read like a calculator's About page and say nothing about a vault.
   const { superSecure } = useSettings();
+  const { recovery } = useServices();
+  // Drives the overwrite power below, and re-renders the stack the instant it is withdrawn.
+  const recoveryAuthorized = useRecoveryAuthorized();
 
   return (
     <LockedStack.Navigator screenOptions={screenOptions}>
@@ -123,9 +146,31 @@ function LockedFlow(): React.JSX.Element {
       <LockedStack.Screen name="Restore">
         {({ navigation }) => (
           <RestoreFlowScreen
+            // Replacing a vault that is already here is a power the recovery code lends, and
+            // only for as long as it is live. Arriving any other way, this is false and
+            // `adoptMasterKey` refuses, exactly as it always has.
+            allowOverwrite={recoveryAuthorized}
             onDone={() => {
+              // Recovered: the code has done its one job.
+              recovery.clear();
               if (navigation.canGoBack()) navigation.popToTop();
             }}
+            onBack={() => {
+              // Backing out spends it too. A code is for one attempt, not for a door left
+              // ajar behind whoever walks away from this screen.
+              recovery.clear();
+              navigation.goBack();
+            }}
+            onPlans={() => {
+              navigation.navigate('Plans');
+            }}
+          />
+        )}
+      </LockedStack.Screen>
+
+      <LockedStack.Screen name="Plans">
+        {({ navigation }) => (
+          <PlansScreen
             onBack={() => {
               navigation.goBack();
             }}
@@ -138,6 +183,18 @@ function LockedFlow(): React.JSX.Element {
           <AboutScreen
             appName="Calculator"
             disguised={superSecure}
+            onRecoveryVerified={() => {
+              navigation.navigate('Restore');
+            }}
+            // Super secure takes "Forgot PIN?" off the calculator menu, so this page is the only
+            // remaining way to erase and start again. Wired here and NOT on the unlocked About,
+            // where the gallery and settings already offer it in the open.
+            onErased={() => {
+              navigation.navigate('Calculator');
+            }}
+            onRestore={() => {
+              navigation.navigate('Restore');
+            }}
             onBack={() => {
               navigation.goBack();
             }}
@@ -164,6 +221,9 @@ function VaultFlow(): React.JSX.Element {
             }}
             onOpenSettings={() => {
               navigation.navigate('Settings');
+            }}
+            onOpenPlans={() => {
+              navigation.navigate('Plans');
             }}
           />
         )}
@@ -199,8 +259,14 @@ function VaultFlow(): React.JSX.Element {
             onCloudBackup={() => {
               navigation.navigate('CloudBackup');
             }}
+            onPlans={() => {
+              navigation.navigate('Plans');
+            }}
             onSupport={() => {
               navigation.navigate('Support');
+            }}
+            onMessages={() => {
+              navigation.navigate('Messages');
             }}
             onAbout={() => {
               navigation.navigate('VaultAbout');
@@ -264,6 +330,19 @@ function VaultFlow(): React.JSX.Element {
             onBack={() => {
               navigation.goBack();
             }}
+            onPlans={() => {
+              navigation.navigate('Plans');
+            }}
+          />
+        )}
+      </VaultStack.Screen>
+
+      <VaultStack.Screen name="Plans">
+        {({ navigation }) => (
+          <PlansScreen
+            onBack={() => {
+              navigation.goBack();
+            }}
           />
         )}
       </VaultStack.Screen>
@@ -273,6 +352,52 @@ function VaultFlow(): React.JSX.Element {
           <SupportScreen
             onBack={() => {
               navigation.goBack();
+            }}
+            onSupportChat={() => {
+              navigation.navigate('SupportChat');
+            }}
+          />
+        )}
+      </VaultStack.Screen>
+
+      <VaultStack.Screen name="Messages">
+        {({ navigation }) => (
+          <ConversationsScreen
+            onBack={() => {
+              navigation.goBack();
+            }}
+            onOpen={(conversationId) => {
+              navigation.navigate('Conversation', { conversationId });
+            }}
+            onPlans={() => {
+              navigation.navigate('Plans');
+            }}
+          />
+        )}
+      </VaultStack.Screen>
+
+      <VaultStack.Screen name="Conversation">
+        {({ navigation, route }) => (
+          <ConversationScreen
+            conversationId={route.params.conversationId}
+            onBack={() => {
+              navigation.goBack();
+            }}
+            onPlans={() => {
+              navigation.navigate('Plans');
+            }}
+          />
+        )}
+      </VaultStack.Screen>
+
+      <VaultStack.Screen name="SupportChat">
+        {({ navigation }) => (
+          <SupportChatScreen
+            onBack={() => {
+              navigation.goBack();
+            }}
+            onPlans={() => {
+              navigation.navigate('Plans');
             }}
           />
         )}
@@ -298,7 +423,20 @@ export function RootNavigator(): React.JSX.Element {
   const theme = useMemo(() => navigationThemeFor(colors), [colors]);
 
   return (
-    <NavigationContainer theme={theme}>
+    /**
+     * The key is what makes the swap a clean break, and it is load-bearing.
+     *
+     * A `NavigationContainer` keeps its navigation state when the navigator under it changes, and
+     * hands it to the new one to rehydrate. The router then keeps whatever route names the new
+     * navigator also declares and drops the rest. `Plans` is declared by both stacks, so locking
+     * on it used to leave the LOCKED app showing the plans screen -- the user's billing address,
+     * on a locked vault, where the calculator should be -- as the only route in the stack, which
+     * is also why going back from it had nowhere to go.
+     *
+     * Remounting the container on every lock and unlock throws that state away instead. Nothing
+     * should survive a lock; that is the whole point of the swap.
+     */
+    <NavigationContainer key={unlocked ? 'vault' : 'locked'} theme={theme}>
       {unlocked ? <VaultFlow /> : <LockedFlow />}
     </NavigationContainer>
   );

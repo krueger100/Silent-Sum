@@ -1,0 +1,6 @@
+{
+  "//": "TEMPORARY deploy config. `firebase/firestore.stage1.rules` is `firestore.merged.rules` with the Cloud-term gate on users/{uid}/vault/envelope|manifest left OFF, so the support chat can ship before the app build that sells Cloud. It is purely additive over the ruleset that was live before it: same stripe_customers block, same vault matches, plus the entitlements read and the support-chat block. When the app that can buy Cloud ships, deploy firebase.json (the merged file) instead and delete this config and firestore.stage1.rules. No storage entry here on purpose: this config can never touch a Storage bucket.",
+  "firestore": {
+    "rules": "firebase/firestore.stage1.rules"
+  }
+}

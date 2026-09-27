@@ -275,7 +275,11 @@ describe('toCloudError', () => {
 describe('InMemoryCloudBackend uid isolation', () => {
   const CIPHERTEXT = new Uint8Array([1, 2, 3, 4]);
 
-  async function twoAccounts(): Promise<{ alice: CloudUser; bob: CloudUser; backend: InMemoryCloudBackend }> {
+  async function twoAccounts(): Promise<{
+    alice: CloudUser;
+    bob: CloudUser;
+    backend: InMemoryCloudBackend;
+  }> {
     const backend = new InMemoryCloudBackend();
     const alice = await backend.signUp('alice@example.test', 'alice-password');
     await backend.putDocument(BACKUP_PATHS.envelope(alice.uid), { v: 1 });
@@ -322,5 +326,59 @@ describe('InMemoryCloudBackend uid isolation', () => {
 
     expect(await backend.getDocument(BACKUP_PATHS.envelope(alice.uid))).toEqual({ v: 1 });
     expect(await backend.getBlob(BACKUP_PATHS.photo(alice.uid, 'p1'))).toEqual(CIPHERTEXT);
+  });
+});
+
+describe('InMemoryCloudBackend watchDocument', () => {
+  it('emits the current value immediately and again on every change, and stops after unsubscribe', async () => {
+    const { backend, user } = await signedIn();
+    const path = `users/${user.uid}/billing/entitlements`;
+    const seen: (Record<string, unknown> | null)[] = [];
+
+    const stop = backend.watchDocument(path, (doc) => {
+      seen.push(doc);
+    });
+    expect(seen).toEqual([null]);
+
+    // The Admin SDK bypasses the owner rules; the fake models that with an admin write.
+    backend.adminPutDocument(path, { pro: true });
+    expect(seen).toEqual([null, { pro: true }]);
+
+    stop();
+    backend.adminDeleteDocument(path);
+    expect(seen).toHaveLength(2);
+  });
+
+  it('sees writes made through the ordinary owner path too', async () => {
+    const { backend, user } = await signedIn();
+    const path = BACKUP_PATHS.manifest(user.uid);
+    const seen: (Record<string, unknown> | null)[] = [];
+    backend.watchDocument(path, (doc) => {
+      seen.push(doc);
+    });
+    await backend.putDocument(path, { photoIds: [], photoCount: 0, updatedAt: 'x' });
+    await backend.deleteDocument(path);
+    expect(seen).toEqual([null, { photoIds: [], photoCount: 0, updatedAt: 'x' }, null]);
+  });
+
+  it('hands each watcher its own copy, so a listener cannot corrupt the store', async () => {
+    const { backend, user } = await signedIn();
+    const path = `users/${user.uid}/billing/entitlements`;
+    backend.adminPutDocument(path, { pro: false });
+    backend.watchDocument(path, (doc) => {
+      if (doc !== null) doc.pro = true;
+    });
+    expect(await backend.getDocument(path)).toEqual({ pro: false });
+  });
+
+  it('refuses to watch outside the owner prefix or while signed out', async () => {
+    const { backend } = await signedIn();
+    expect(() =>
+      backend.watchDocument('users/somebody-else/billing/entitlements', () => undefined),
+    ).toThrow(CloudError);
+    await backend.signOut();
+    expect(() => backend.watchDocument('users/x/billing/entitlements', () => undefined)).toThrow(
+      CloudError,
+    );
   });
 });

@@ -20,15 +20,20 @@ import { resolve } from 'path';
  *   FIREBASE_STORAGE_BUCKET  SilentSum's OWN Storage bucket (no gs:// prefix); without it
  *                            cloud backup is not offered, on purpose - see
  *                            CloudBackendOptions.storageBucket
- *   SUPPORT_ENDPOINT         Resend /emails, or your own relay (https only)
- *   SUPPORT_API_KEY          bearer token for that endpoint
+ *   SUPPORT_ENDPOINT         the deployed silentsumSupportRelay URL (https, never a mail provider)
  *   SUPPORT_FROM             sender, e.g. "Calculator <support@example.com>"
- *   SUPPORT_TO               the support inbox
+ *   SUPPORT_TO               the support inbox, for display; the relay decides where mail goes
+ *   BILLING_ENABLED          "false" builds an app that sells nothing (default true)
+ *   BILLING_FUNCTIONS_URL    https base URL of the SilentSum Cloud Functions; default derived
+ *                            from the Firebase project id - see docs/billing.md
  *
- * Support is optional in the same way Firebase is: with no SUPPORT_FROM/SUPPORT_TO the customer
+ * Support is optional in the same way Firebase is: without all three SUPPORT_ variables the customer
  * service screen says it is not set up in this build rather than offering a form that goes nowhere.
- * Note that anything put in `extra` is readable in the shipped bundle - see the warning in
- * src/support/supportConfig.ts before pointing SUPPORT_API_KEY at a real Resend key.
+ *
+ * NOTHING SECRET GOES IN `extra`. Everything in it is plain text in the shipped bundle, readable by
+ * anyone who unzips the APK. An earlier version of this file put a Resend API key there; the key now
+ * lives in Secret Manager, bound to the relay function, and the app authenticates with nothing at
+ * all. `scripts/security-scan.js` fails the build if a credential reappears here.
  */
 
 // Read statically, one property at a time: Expo inlines `process.env.X` at build time and cannot
@@ -41,19 +46,28 @@ const appId = pick(process.env.APP_ID, 'com.kruegerco.silentsum');
 const appCheckDebugToken = pick(process.env.APP_CHECK_DEBUG_TOKEN, '');
 const firebaseStorageBucket = pick(process.env.FIREBASE_STORAGE_BUCKET, '');
 
-const supportEndpoint = pick(process.env.SUPPORT_ENDPOINT, 'https://api.resend.com/emails');
-const supportApiKey = pick(process.env.SUPPORT_API_KEY, '');
+// The support relay: this project's own `silentsumSupportRelay` function, which holds the mail
+// provider's key. There is deliberately no default -- a build that forgets it offers no support
+// form, rather than quietly pointing the app at a provider it cannot authenticate with. No bearer
+// token is read here, or anywhere else in this file: everything in `extra` is plain text in the APK.
+const supportEndpoint = pick(process.env.SUPPORT_ENDPOINT, '');
 const supportFrom = pick(process.env.SUPPORT_FROM, '');
 const supportTo = pick(process.env.SUPPORT_TO, '');
+
+// The PUBLIC half of the recovery-code signing key. Safe to ship -- it verifies codes and
+// cannot mint them -- and absent by default, in which case codes are simply not accepted.
+const recoveryPublicKey = pick(process.env.RECOVERY_PUBLIC_KEY, '');
+
+// Purchases (SilentSum Pro / Cloud) go through the project's own Cloud Functions, which hold the
+// PayMongo secret. Nothing secret is here: only whether to offer them and, optionally, where the
+// functions live (default: https://us-central1-<project>.cloudfunctions.net). With billing off,
+// or without a cloud backend, the app sells nothing and every Pro gate stays open.
+const billingEnabled = pick(process.env.BILLING_ENABLED, 'true') !== 'false';
+const billingFunctionsUrl = pick(process.env.BILLING_FUNCTIONS_URL, '');
 const support =
-  supportFrom === '' || supportTo === ''
+  supportEndpoint === '' || supportFrom === '' || supportTo === ''
     ? undefined
-    : {
-        endpoint: supportEndpoint,
-        apiKey: supportApiKey === '' ? undefined : supportApiKey,
-        from: supportFrom,
-        to: supportTo,
-      };
+    : { endpoint: supportEndpoint, from: supportFrom, to: supportTo };
 
 const googleServicesJson = pick(
   process.env.GOOGLE_SERVICES_JSON,
@@ -105,9 +119,17 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   },
   android: {
     package: appId,
+    // Declared here, not left to the template: `expo prebuild` regenerates `android/` and writes
+    // whatever this says, so a versionCode edited in `build.gradle` silently returns to 1 and Play
+    // refuses the upload as a duplicate. Bump it for every build that is uploaded, independently of
+    // `version` above -- Play compares only this number.
+    versionCode: 1,
     ...(firebaseAndroid ? { googleServicesFile: googleServicesJson } : {}),
     adaptiveIcon: {
-      backgroundColor: '#1F2937',
+      // `surfaceAlt` from DARK_PALETTE, matching `android-icon-background.png`. A launcher that
+      // ignores the background IMAGE falls back to this colour, so the two have to agree or the
+      // keys would sit on the wrong ground on some devices.
+      backgroundColor: '#374151',
       foregroundImage: './assets/android-icon-foreground.png',
       backgroundImage: './assets/android-icon-background.png',
       monochromeImage: './assets/android-icon-monochrome.png',
@@ -219,10 +241,18 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     ],
     ...firebasePlugins,
     './plugins/withGradleMemory',
+    // Replaces the template's debug-signed release build. Credentials are read from
+    // `keystore.properties` in the project root, or the environment, at BUILD time -- never from
+    // here, and never from anything committed. See docs/building.md.
+    './plugins/withReleaseSigning',
     // Runs last so it also strips filters contributed by the plugins above.
     './plugins/withoutDeepLinks',
   ],
   extra: {
+    // The EXISTING EAS project. `eas build` refuses to run without it, and `eas init` would create a
+    // second project rather than adopt this one, so it is pinned here by hand. Not a secret: a
+    // project id identifies the project, it does not grant anything.
+    eas: { projectId: '2b829f8f-0354-46b3-a02b-4367b4773b55' },
     silentsumEnv,
     firebaseConfigured,
     firebaseAndroid,
@@ -230,5 +260,10 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     appCheckDebugToken: appCheckDebugToken === '' ? undefined : appCheckDebugToken,
     firebaseStorageBucket: firebaseStorageBucket === '' ? undefined : firebaseStorageBucket,
     support,
+    recoveryPublicKey: recoveryPublicKey === '' ? undefined : recoveryPublicKey,
+    billing: {
+      enabled: billingEnabled,
+      functionsUrl: billingFunctionsUrl === '' ? undefined : billingFunctionsUrl,
+    },
   },
 });

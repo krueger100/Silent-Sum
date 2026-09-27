@@ -1,8 +1,34 @@
 /** A settings-style row: label, optional detail, optional trailing control. */
-import React, { type ReactNode } from 'react';
+import React, { Children, type ReactNode } from 'react';
 import { Pressable, StyleSheet, Switch, Text, View } from 'react-native';
 
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
+
+/**
+ * Related rows as one card, separated by hairlines rather than gaps.
+ *
+ * Rows used to be individual cards floating on the background, which gave every row the same
+ * visual weight and made a screen of eleven of them read as eleven unrelated things. Grouping
+ * costs nothing and says what belongs with what -- and the hairline between rows is a quarter of
+ * the height of the gap it replaces, which is most of why the settings screen now fits.
+ */
+export function ListGroup({ children }: { children: ReactNode }): React.JSX.Element {
+  const styles = useStyles(makeStyles);
+  // `Children.toArray` already drops null and false; the filter is only for safety if that
+  // changes, so it tests truthiness rather than the two literals React happens to strip today.
+  const rows = Children.toArray(children).filter(Boolean);
+  return (
+    <View style={styles.group}>
+      {rows.map((child, index) => (
+        // Index keys are safe here: the rows are written literally at each call site and never
+        // reorder, insert or delete.
+        <View key={index} style={index === 0 ? null : styles.divider}>
+          {child}
+        </View>
+      ))}
+    </View>
+  );
+}
 
 export interface ListRowProps {
   label: string;
@@ -90,6 +116,12 @@ export function SwitchRow({
 
 const makeStyles = (colors: Palette) =>
   StyleSheet.create({
+    group: {
+      backgroundColor: colors.surface,
+      borderRadius: radius.md,
+      overflow: 'hidden',
+    },
+    divider: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border },
     row: {
       flexDirection: 'row',
       alignItems: 'center',

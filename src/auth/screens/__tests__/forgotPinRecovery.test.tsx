@@ -16,7 +16,11 @@
 import React from 'react';
 import { fireEvent, screen, waitFor } from '@testing-library/react-native';
 
-import { ERASE_PHRASE, ForgotPinDialog } from '@/auth/screens/ForgotPinDialog';
+import {
+  ERASE_PHRASE,
+  ERASE_PHRASE_DISGUISED,
+  ForgotPinDialog,
+} from '@/auth/screens/ForgotPinDialog';
 import { buildHarness, renderWithServices, type Harness } from '@/auth/screens/__tests__/harness';
 import { wipeLocalVault } from '@/auth/vaultWipe';
 import { RestoreFlowScreen } from '@/backup/screens/RestoreFlowScreen';
@@ -106,9 +110,9 @@ async function seedDevice(harness: Harness, cloud: InMemoryCloudBackend): Promis
 }
 
 async function eraseThroughDialog(): Promise<void> {
-  await fireEvent.press(screen.getByTestId('forgot_pin_dialog-confirm'));
+  await fireEvent.press(screen.getByTestId('erase_explain_dialog-confirm'));
   await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), ERASE_PHRASE);
-  await fireEvent.press(screen.getByTestId('erase_vault_dialog-confirm'));
+  await fireEvent.press(screen.getByTestId('erase_confirm_dialog-confirm'));
   await waitFor(() => {
     expect(screen.getByTestId('erase_outcome_dialog')).toBeTruthy();
   });
@@ -132,8 +136,8 @@ describe('forgot PIN recovery', () => {
     );
 
     // The explanation names the consequence before the typed phrase is ever shown.
-    expect(screen.getByTestId('forgot_pin_dialog')).toHaveTextContent(/no backdoor/);
-    expect(screen.getByTestId('forgot_pin_dialog')).toHaveTextContent(/NOT deleted/);
+    expect(screen.getByTestId('erase_explain_dialog')).toHaveTextContent(/no backdoor/);
+    expect(screen.getByTestId('erase_explain_dialog')).toHaveTextContent(/NOT deleted/);
 
     await eraseThroughDialog();
 
@@ -181,7 +185,7 @@ describe('forgot PIN recovery', () => {
       <ForgotPinDialog visible onDismiss={jest.fn()} onErased={jest.fn()} onRestore={onRestore} />,
     );
 
-    expect(screen.getByTestId('forgot_pin_dialog')).toHaveTextContent(/erasing it is final/);
+    expect(screen.getByTestId('erase_explain_dialog')).toHaveTextContent(/erasing it is final/);
     await eraseThroughDialog();
 
     expect(screen.getByTestId('erase_outcome_dialog')).toHaveTextContent(/cannot be recovered/);
@@ -189,6 +193,57 @@ describe('forgot PIN recovery', () => {
     // Nothing to restore means nothing to offer, and no way to reach the flow from here.
     await fireEvent.press(screen.getByTestId('erase_outcome_dialog-confirm'));
     expect(onRestore).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The same journey in the disguised vocabulary, which is the only way a super secure user can
+   * reach it at all: their calculator menu does not offer "Forgot PIN?", so the About page is the
+   * door. The wording is the only thing that differs, and this pins that down -- the device ends
+   * up just as erased, and the cloud copy they are being sent back to is byte for byte untouched.
+   */
+  it('erases identically through the disguised wording and still spares the cloud', async () => {
+    const cloud = new InMemoryCloudBackend();
+    const harness = cloudHarness(cloud);
+    const uid = await seedDevice(harness, cloud);
+
+    const cloudBefore = snapshotCloud(cloud);
+    expect(filesContaining(harness, MARKER).length).toBeGreaterThan(0);
+
+    await renderWithServices(
+      harness.services,
+      <ForgotPinDialog visible disguised onDismiss={jest.fn()} onErased={jest.fn()} />,
+    );
+
+    // It warns exactly as hard. It simply never says what is being erased.
+    const explain = screen.getByTestId('erase_explain_dialog');
+    expect(explain).toHaveTextContent(/is NOT removed/);
+    expect(explain).toHaveTextContent(/cannot be undone|start again/);
+    expect(explain).not.toHaveTextContent(/vault/i);
+
+    await fireEvent.press(screen.getByTestId('erase_explain_dialog-confirm'));
+    // The honest phrase is not the gate here; typing it would be typing the wrong thing.
+    const gate = screen.getByTestId('erase_confirm_dialog');
+    expect(gate).toHaveTextContent(new RegExp(ERASE_PHRASE_DISGUISED));
+    expect(gate).not.toHaveTextContent(new RegExp(ERASE_PHRASE));
+
+    await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), ERASE_PHRASE_DISGUISED);
+    await fireEvent.press(screen.getByTestId('erase_confirm_dialog-confirm'));
+    await waitFor(() => {
+      expect(screen.getByTestId('erase_outcome_dialog')).toBeTruthy();
+    });
+
+    // --- the device is gone, decrypted temporaries included -----------------------------
+    expect(await harness.services.auth.isConfigured()).toBe(false);
+    expect(harness.services.session.isUnlocked).toBe(false);
+    expect(vaultFileCount(harness)).toBe(0);
+    expect(filesContaining(harness, MARKER)).toEqual([]);
+    expect(harness.services.playbackScratch.outstanding).toEqual([]);
+
+    // --- and the copy they are being sent back to is exactly as it was ------------------
+    expect(snapshotCloud(cloud)).toBe(cloudBefore);
+    expect(cloud.documents.has(BACKUP_PATHS.envelope(uid))).toBe(true);
+    expect(cloud.currentUser).toBeNull();
+    expect(cloud.passwordFor(EMAIL)).toBe(OLD_PASSWORD);
   });
 
   it('restores after an account password reset and re-wraps the key under a new PIN', async () => {

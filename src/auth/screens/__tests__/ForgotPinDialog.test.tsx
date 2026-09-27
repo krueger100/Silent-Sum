@@ -36,19 +36,19 @@ describe('ForgotPinDialog', () => {
     );
 
     expect(screen.getByText('Forgot your PIN?')).toBeTruthy();
-    expect(screen.getByTestId('forgot_pin_dialog')).toHaveTextContent(/no backdoor/);
+    expect(screen.getByTestId('erase_explain_dialog')).toHaveTextContent(/no backdoor/);
 
-    await fireEvent.press(screen.getByTestId('forgot_pin_dialog-confirm'));
+    await fireEvent.press(screen.getByTestId('erase_explain_dialog-confirm'));
 
     // A near miss must not be enough to destroy a vault.
     await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), 'delete my vault');
-    await fireEvent.press(screen.getByTestId('erase_vault_dialog-confirm'));
+    await fireEvent.press(screen.getByTestId('erase_confirm_dialog-confirm'));
     expect(onErased).not.toHaveBeenCalled();
     expect(await harness.services.auth.isConfigured()).toBe(true);
     expect(vaultFileCount(harness)).toBeGreaterThan(0);
 
     await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), ERASE_PHRASE);
-    await fireEvent.press(screen.getByTestId('erase_vault_dialog-confirm'));
+    await fireEvent.press(screen.getByTestId('erase_confirm_dialog-confirm'));
 
     // The dialog reports what happened before it closes: the caller is not told the vault is gone
     // until the user has been told what that means for their photos.

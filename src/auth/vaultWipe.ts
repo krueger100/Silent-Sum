@@ -91,6 +91,11 @@ export async function wipeLocalVault(
   //    anything, which is why this step is reported on separately.
   const credentialsErased = await quietly(() => services.auth.eraseCredentials());
 
+  // 4b. The mirror of what the account has paid for. It is a copy of a server document, so
+  //     nothing is lost: signing in again brings it back. What it must not do is survive an
+  //     erase and say "Pro" on a phone that is supposed to hold no trace of the vault.
+  await quietly(() => services.entitlements.reset());
+
   // 5. Every preference, including the record that a cloud backup existed -- or, when the caller
   //    must leave no visible trace, only that record.
   await quietly(() =>
@@ -133,9 +138,7 @@ export async function performScopedWipe(
     // The vault itself survives, so the only local change is that this device must stop believing
     // it has a backup to fall back on. The wipe PIN stays armed: the user may enable backup again,
     // and disarming it silently would leave them thinking they were still protected.
-    await quietly(() =>
-      services.settings.update({ backupEnabled: false, lastBackupAt: null }),
-    );
+    await quietly(() => services.settings.update({ backupEnabled: false, lastBackupAt: null }));
     return { scope, deviceWiped: false, backupDeleted };
   }
 

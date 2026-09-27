@@ -38,6 +38,10 @@ config/firebase/*.plist
 *.key
 credentials.json
 key.properties
+# Read at build time by plugins/withReleaseSigning.js. Lives in the project root rather than
+# android/, which `expo prebuild` deletes. The example carries the key names and no values.
+keystore.properties
+!keystore.properties.example
 
 # OS / editor
 .DS_Store

@@ -3,15 +3,71 @@ rules_version = '2';
 // SilentSum cloud backup blobs: users/{uid}/index.enc, photos/{id}.enc,
 // thumbs/{id}.enc. All are XChaCha20-Poly1305 ciphertext produced on the
 // device; the server never sees keys. Owner-only, bounded size, opaque type.
+//
+// Uploads are a SilentSum Cloud feature: creating or replacing an object needs
+// an active Cloud term, read from the account's entitlement document in
+// Firestore (cross-service rules; the Storage rules service agent must be able
+// to read Firestore, which the first deploy that uses `firestore.get` sets up).
+// Reads and deletes never need it, so a lapsed account can still restore what
+// it has -- from the app's own gate onwards -- and can always delete itself.
 service firebase.storage {
   match /b/{bucket}/o {
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function cloudActive(uid) {
+      return firestore.exists(/databases/(default)/documents/users/$(uid)/billing/entitlements)
+        && firestore.get(/databases/(default)/documents/users/$(uid)/billing/entitlements).data.cloud.accessUntil is timestamp
+        && firestore.get(/databases/(default)/documents/users/$(uid)/billing/entitlements).data.cloud.accessUntil > request.time;
+    }
+
     match /users/{uid}/{allPaths=**} {
-      allow read, delete: if request.auth != null && request.auth.uid == uid;
-      allow write: if request.auth != null
-        && request.auth.uid == uid
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && cloudActive(uid)
         && request.resource.size < 100 * 1024 * 1024
         && request.resource.contentType == 'application/octet-stream';
     }
+    // Chat media: the Storage half of `conversations/{cid}` in Firestore. Both participants read
+    // and write; nobody else touches it. Membership comes from the conversation id, which is the
+    // two uids sorted and joined -- the same test the Firestore rules make, arrived at the same
+    // way, and costing no document read. (`split()` in the Storage rules language was proven
+    // against the emulator on 2026-09-25 rather than assumed; see the design doc, section 6.)
+    //
+    // No entitlement is checked here, deliberately. Pro is enforced on the message DOCUMENT by
+    // `ssProActive` in the Firestore rules, and an object with no document pointing at it is
+    // invisible to every reader and is swept by the 30-day lifecycle rule -- so there is nothing
+    // to gain by uploading one. Cloud is not checked because chat media is not a Cloud feature:
+    // an account with no term, or a lapsed one, sends and receives normally.
+    //
+    // The caps are resource limits, not a security boundary. The object is opaque ciphertext, so
+    // the server cannot tell a photo from a video by inspection; the paths differ only so the
+    // three ceilings can. The thumbnail lives here rather than inline in Firestore so that one
+    // lifecycle rule expires a preview with the media it previews.
+    function ssConvMember(cid) {
+      return request.auth != null && request.auth.uid in cid.split('__');
+    }
+
+    match /messages/{cid}/photo/{objectId} {
+      allow read, delete: if ssConvMember(cid);
+      allow create, update: if ssConvMember(cid)
+        && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType == 'application/octet-stream';
+    }
+    match /messages/{cid}/video/{objectId} {
+      allow read, delete: if ssConvMember(cid);
+      allow create, update: if ssConvMember(cid)
+        && request.resource.size < 100 * 1024 * 1024
+        && request.resource.contentType == 'application/octet-stream';
+    }
+    match /messages/{cid}/thumb/{objectId} {
+      allow read, delete: if ssConvMember(cid);
+      allow create, update: if ssConvMember(cid)
+        && request.resource.size < 32 * 1024
+        && request.resource.contentType == 'application/octet-stream';
+    }
+
     match /{allPaths=**} {
       allow read, write: if false;
     }

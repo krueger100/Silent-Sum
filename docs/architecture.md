@@ -16,9 +16,12 @@ src/
   gallery/        grid, tile, viewer, video surface, import service
   firebase/       interfaces, availability gateway, Crashlytics/Analytics/cloud adapters, fakes
   backup/         envelope, BackupService, passphrase policy, backup and restore screens
+  billing/        products and copy, entitlement model and gates, entitlements controller
+                  (store + offline mirror + live sync), BillingService contract and simulator,
+                  plans screen, Cloud-required card, Pro upsell dialog
   privacy/        auto-lock policy, suspension, lifecycle guard, curtain, screen protection
   settings/       settings model, stores, settings screens
-  support/        customer service: message shape, scrub-on-send, Resend/relay transport
+  support/        customer service: message shape, scrub-on-send, relay transport (no credential)
   navigation/     session-gated navigator
   components/     shared UI primitives
   utils/          bytes, base64, clock, ISO-8601
@@ -82,14 +85,25 @@ files exist, so a build without them contains no Firebase native initialisation 
 
 The vault and the authenticator have no compile-time or runtime dependency on any of this.
 
+## Billing
+
+`src/billing` never reaches the network. It talks to two contracts: `BillingService` (create a
+checkout, reconcile one, cancel Cloud), implemented over the project's Cloud Functions by
+`src/firebase/firebaseBillingService.ts` through a small callable-protocol client
+(`src/firebase/callableClient.ts`, plain `fetch` with the ID and App Check tokens), and
+`CloudBackend.watchDocument`, which follows the server-written entitlement document. The backend
+itself is a separate package in `functions/` with its own tests; the app never imports it, and
+the security scan enforces both boundaries. Design and operation: `docs/billing.md`.
+
 ## Enforcement
 
 `npm run security:scan` fails the build on the mistakes a type checker cannot see: an import of
 libsodium, Firebase or expo-secure-store from outside its owning module, a key-shaped string or a
 credential file committed to the repository, a reference to the OS media library from vault code,
 a Resend API key in tracked source, any network client reachable from the offline authentication
-path, and any reach for the network from outside `src/firebase` and `src/support` - the two
-modules allowed to talk to a server. It runs as part of `npm run check`.
+path, any reach for the network from outside `src/firebase` and `src/support` - the two
+modules allowed to talk to a server - a PayMongo key or host anywhere in the app, and any import
+of the backend package from the app. It runs as part of `npm run check`.
 
 ## Testing
 

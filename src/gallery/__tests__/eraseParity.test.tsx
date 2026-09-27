@@ -146,9 +146,9 @@ describe('the two erase paths', () => {
       a.services,
       <ForgotPinDialog visible onDismiss={jest.fn()} onErased={jest.fn()} />,
     );
-    await fireEvent.press(dialog.getByTestId('forgot_pin_dialog-confirm'));
+    await fireEvent.press(dialog.getByTestId('erase_explain_dialog-confirm'));
     await fireEvent.changeText(dialog.getByTestId('typed-confirm-input'), ERASE_PHRASE);
-    await fireEvent.press(dialog.getByTestId('erase_vault_dialog-confirm'));
+    await fireEvent.press(dialog.getByTestId('erase_confirm_dialog-confirm'));
     await waitFor(() => {
       expect(dialog.getByTestId('erase_outcome_dialog')).toBeTruthy();
     });

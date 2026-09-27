@@ -3,6 +3,8 @@
  * only src/firebase/* imports @react-native-firebase packages. When Firebase is not configured the
  * app receives `FIREBASE_UNAVAILABLE` (no-op crash/analytics, no cloud backend).
  */
+import type { BillingService } from '@/billing/billingService';
+import type { Directory } from '@/messaging/directory';
 import type { Bytes } from '@/utils/bytes';
 
 export interface CrashReporter {
@@ -53,6 +55,51 @@ export class CloudError extends Error {
   }
 }
 
+/** One document of a watched collection, with the id the store gave it. */
+export interface CollectionEntry {
+  readonly id: string;
+  readonly data: Record<string, unknown>;
+}
+
+/** How a watched collection is filtered, ordered and how much of it is kept. */
+export interface CollectionQuery {
+  /**
+   * Field to sort on. Documents missing it sort last in the in-memory backend. Omit to leave the
+   * order to the store (document id), which is what a filtered listing does so that no composite
+   * index is needed -- the caller sorts the handful of results itself.
+   */
+  readonly orderBy?: string;
+  readonly direction?: 'asc' | 'desc';
+  /** Maximum documents delivered; applied after ordering. */
+  readonly limit?: number;
+  /** Keeps only documents whose array field contains this value. */
+  readonly arrayContains?: { readonly field: string; readonly value: string };
+}
+
+/**
+ * A numeric field the STORE adds to, rather than a value the client computes and overwrites.
+ *
+ * Two people writing to one conversation at the same moment would each compute "old + 1" from
+ * their own stale copy and one of the two would be lost. An increment is applied by the server to
+ * whatever is actually there, so an unread count cannot drift, and the security rules can still
+ * insist the result is exactly one more than before.
+ */
+export interface FieldIncrement {
+  readonly __increment: number;
+}
+
+export function increment(by: number): FieldIncrement {
+  return { __increment: by };
+}
+
+export function isFieldIncrement(value: unknown): value is FieldIncrement {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as FieldIncrement).__increment === 'number'
+  );
+}
+
 /** Auth + document store + blob store, owner-scoped under `users/<uid>/...`. */
 export interface CloudBackend {
   readonly currentUser: CloudUser | null;
@@ -83,9 +130,40 @@ export interface CloudBackend {
   sendPasswordReset(email: string): Promise<void>;
   signOut(): Promise<void>;
   deleteAccount(): Promise<void>;
-  putDocument(path: string, data: Record<string, unknown>): Promise<void>;
+  /**
+   * Writes a document. By default the document becomes exactly `data`; `merge` instead leaves
+   * untouched fields (and untouched keys of nested maps) alone, which is what lets each side of
+   * a conversation update its own corner of a shared document. Values may be `FieldIncrement`.
+   */
+  putDocument(
+    path: string,
+    data: Record<string, unknown>,
+    options?: { readonly merge?: boolean },
+  ): Promise<void>;
   getDocument(path: string): Promise<Record<string, unknown> | null>;
   deleteDocument(path: string): Promise<void>;
+  /**
+   * Subscribes to one document. `onChange` fires with the current value straight away (null when
+   * the document does not exist) and again after every change; `onError` reports a listener
+   * failure, after which nothing more arrives. Returns the unsubscribe function. Throws
+   * synchronously for a path the signed-in user may not read, like every other method here.
+   */
+  watchDocument(
+    path: string,
+    onChange: (doc: Record<string, unknown> | null) => void,
+    onError?: (error: CloudError) => void,
+  ): () => void;
+  /**
+   * The same subscription over a whole collection, ordered and capped. `onChange` fires with the
+   * current contents straight away (an empty list when the collection has none) and again after
+   * every change. Only what a chat needs: one sort field and a limit, no filters.
+   */
+  watchCollection(
+    path: string,
+    query: CollectionQuery,
+    onChange: (entries: CollectionEntry[]) => void,
+    onError?: (error: CloudError) => void,
+  ): () => void;
   /** Uploads with contentType application/octet-stream (required by storage rules). */
   putBlob(path: string, bytes: Bytes): Promise<void>;
   /**
@@ -108,6 +186,17 @@ export interface FirebaseServices {
   readonly crash: CrashReporter;
   readonly analytics: AnalyticsService;
   readonly cloud: CloudBackend | null;
+  /**
+   * Purchases, through the project's Cloud Functions. Null (or absent) when this build cannot
+   * sell anything: no cloud backend, or billing switched off in the build config. Optional so
+   * that test doubles built before billing existed keep compiling.
+   */
+  readonly billing?: BillingService | null;
+  /**
+   * Looking up who to message, through the project's Cloud Functions. Null (or absent) when this
+   * build cannot reach them, in which case user-to-user messaging is not offered at all.
+   */
+  readonly directory?: Directory | null;
 }
 
 export class NoopCrashReporter implements CrashReporter {
@@ -126,4 +215,6 @@ export const FIREBASE_UNAVAILABLE: FirebaseServices = {
   crash: new NoopCrashReporter(),
   analytics: new NoopAnalyticsService(),
   cloud: null,
+  billing: null,
+  directory: null,
 };

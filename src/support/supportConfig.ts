@@ -6,32 +6,41 @@
  * fully supported: `readSupportConfig` returns null and the screen says so plainly instead of
  * offering a form that could not deliver anything.
  *
- * SHIPPING A RESEND API KEY
- * -------------------------
- * `https://api.resend.com/emails` needs an `Authorization: Bearer re_...` header, and a key
- * compiled into a mobile app is readable by anyone who unzips the APK. Whoever extracts it can
- * send mail as your verified domain until you rotate it. So:
+ * NO CREDENTIAL IS CARRIED HERE, AND THERE IS NOWHERE TO PUT ONE
+ * --------------------------------------------------------------
+ * This configuration used to include a bearer token, because the app posted straight to Resend's
+ * `/emails`. Everything in `extra` is plain text in the APK, so that key was published with every
+ * build: whoever unzipped one could send mail as the verified domain until it was rotated.
  *
- *   - Preferred: point SUPPORT_ENDPOINT at a small relay you control (Cloud Function, Worker)
- *     that holds the Resend key server-side and forwards the same JSON body. Leave
- *     SUPPORT_API_KEY empty, or set it to a token that only your relay accepts.
- *   - Acceptable for a private/internal build: a Resend key restricted to *sending only*, on a
- *     domain you are willing to rotate. Never a full-access key.
+ * The endpoint is now the project's own relay (`functions/src/supportRelay.ts`), which holds the
+ * provider's key and decides the recipient itself. The app authenticates with nothing, so there is
+ * no token to leak -- and a mail provider is refused as an endpoint below, so the old arrangement
+ * cannot come back by editing an environment variable.
  *
- * Either way the endpoint must be https; plaintext is refused below rather than downgraded.
+ * The endpoint must be https; plaintext is refused rather than downgraded.
  */
 import Constants from 'expo-constants';
 
-export const RESEND_ENDPOINT = 'https://api.resend.com/emails';
+/**
+ * Mail-provider hosts that must never be the endpoint. Reaching one directly would need a bearer
+ * token, and the only place this app could keep a token is the bundle, where it is published.
+ */
+export const FORBIDDEN_SUPPORT_HOSTS: readonly string[] = [
+  'api.resend.com',
+  'api.sendgrid.com',
+  'api.mailgun.net',
+  'api.postmarkapp.com',
+  'api.mailjet.com',
+  'api.brevo.com',
+  'email.us-east-1.amazonaws.com',
+];
 
 export interface SupportConfig {
-  /** The Resend `/emails` endpoint, or a relay that accepts the same JSON body. */
+  /** The relay that accepts the message and decides where it goes. Never a mail provider. */
   readonly endpoint: string;
-  /** Bearer token for the endpoint, or null when the relay authenticates some other way. */
-  readonly apiKey: string | null;
-  /** Sender, as Resend wants it: `Name <address@your-domain>` or a bare address. */
+  /** Sender, as the provider wants it: `Name <address@your-domain>` or a bare address. */
   readonly from: string;
-  /** The support inbox. */
+  /** The support inbox. Shown to the user; the relay, not this, decides where mail is delivered. */
   readonly to: string;
 }
 
@@ -60,16 +69,16 @@ export function parseSupportConfig(raw: unknown): SupportConfig | null {
   const endpoint = text(o.endpoint);
   const from = text(o.from);
   const to = text(o.to);
-  const apiKey = text(o.apiKey);
   if (endpoint === null || from === null || to === null) return null;
 
   const host = httpsHost(endpoint);
   if (host === null) return null;
-  // Resend itself always needs the bearer token; offering the form without one would only produce
-  // a 401 the user cannot do anything about.
-  if (host === 'api.resend.com' && apiKey === null) return null;
+  // A mail provider needs a bearer token, and the only place this app could keep one is the bundle,
+  // where it would be published. Refused outright rather than attempted and 401'd, so the mistake
+  // cannot be made by setting an environment variable.
+  if (FORBIDDEN_SUPPORT_HOSTS.includes(host)) return null;
 
-  return { endpoint, apiKey, from, to };
+  return { endpoint, from, to };
 }
 
 /** The configuration compiled into this build, or null when it has none. */
