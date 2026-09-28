@@ -35,6 +35,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, typography, useStyles, type Palette } from '@/app/theme';
 import { Button } from '@/components/Button';
+import { gridColumns } from '@/gallery/gridColumns';
 import { openRepository } from '@/gallery/vaultAccess';
 import { PhotoTile } from '@/gallery/PhotoTile';
 import { isVideo } from '@/vault/mediaKind';
@@ -48,7 +49,6 @@ export interface VaultPickerSheetProps {
   onSend: (entry: PhotoEntry) => void;
 }
 
-const COLUMNS = 3;
 const GUTTER = spacing.xs;
 /** Big enough to recognise the picture, small enough to leave room for the actions. */
 const MAX_PREVIEW = 320;
@@ -66,15 +66,25 @@ export function VaultPickerSheet({
   const repository = openRepository(services);
   const [chosen, setChosen] = useState<PhotoEntry | null>(null);
 
-  // Tiles are sized from the window rather than fixed, so three columns reach both edges on a
-  // small phone and on a tablet without a second layout.
-  const tile = Math.floor((width - spacing.md * 2 - GUTTER * (COLUMNS - 1)) / COLUMNS);
+  // Tiles are sized from the width the grid actually has rather than fixed, so they reach both
+  // edges on a small phone and on a tablet without a second layout. This sheet is a Modal and so
+  // applies its own safe area: the horizontal pair has to come off before the tile maths, or in
+  // landscape the last column ends up under the navigation bar.
+  const contentWidth = width - insets.left - insets.right;
+  const columns = gridColumns(contentWidth);
+  const tile = Math.floor((contentWidth - spacing.md * 2 - GUTTER * (columns - 1)) / columns);
   const items: readonly PhotoEntry[] = repository?.photos ?? [];
   const noun = chosen !== null && isVideo(chosen) ? 'video' : 'photo';
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onCancel}>
-      <View style={[styles.screen, { paddingTop: insets.top }]} testID="vault_picker">
+      <View
+        style={[
+          styles.screen,
+          { paddingTop: insets.top, paddingLeft: insets.left, paddingRight: insets.right },
+        ]}
+        testID="vault_picker"
+      >
         <View style={styles.header}>
           {chosen === null ? (
             <View style={styles.headerSide} />
@@ -120,7 +130,10 @@ export function VaultPickerSheet({
             <FlatList
               testID="vault_picker_grid"
               data={items}
-              numColumns={COLUMNS}
+              // FlatList cannot change `numColumns` in place; the key remounts it when the count
+              // moves, which only happens on a rotation or an unfold.
+              key={columns}
+              numColumns={columns}
               keyExtractor={(entry) => entry.id}
               contentContainerStyle={[styles.grid, { paddingBottom: insets.bottom + spacing.md }]}
               columnWrapperStyle={styles.gridRow}
@@ -149,7 +162,7 @@ export function VaultPickerSheet({
             repository={repository}
             styles={styles}
             noun={noun}
-            preview={Math.min(width - spacing.md * 2, MAX_PREVIEW)}
+            preview={Math.min(contentWidth - spacing.md * 2, MAX_PREVIEW)}
             showNotice={!noticeSeen}
             bottomInset={insets.bottom}
             onSend={() => {

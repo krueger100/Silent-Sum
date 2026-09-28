@@ -1,13 +1,6 @@
 /** Page chrome: safe area, background, an optional title row with a back affordance. */
 import React, { type ReactNode } from 'react';
-import {
-  KeyboardAvoidingView,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { KeyboardAvoidingView, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { spacing, type Palette, typography, useStyles } from '@/app/theme';
@@ -47,11 +40,7 @@ export function Screen({
    * reflow the whole page.
    */
   const body = scroll ? (
-    <KeyboardAvoidingView
-      testID="screen-keyboard-avoider"
-      behavior="padding"
-      style={styles.flex}
-    >
+    <KeyboardAvoidingView testID="screen-keyboard-avoider" behavior="padding" style={styles.flex}>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
@@ -64,10 +53,30 @@ export function Screen({
     <View style={styles.flex}>{children}</View>
   );
 
+  /**
+   * All four edges, not just the vertical pair.
+   *
+   * Under edge-to-edge the window covers the system bars on every side, and in landscape the side
+   * the navigation bar moves to is a horizontal one. With only top and bottom applied, a phone
+   * rotated into landscape with three-button navigation drew its trailing content -- the
+   * calculator's last keypad column, a row's chevron -- underneath that bar. Gesture navigation
+   * hides the bug, because its horizontal insets are nearly zero, which is why it survived.
+   *
+   * In portrait `left` and `right` are 0 on effectively every device, so this changes nothing
+   * there.
+   */
   return (
     <View
       testID={testID}
-      style={[styles.root, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+      style={[
+        styles.root,
+        {
+          paddingTop: insets.top,
+          paddingBottom: insets.bottom,
+          paddingLeft: insets.left,
+          paddingRight: insets.right,
+        },
+      ]}
     >
       {title === undefined && onBack === undefined && actions === undefined ? null : (
         <View style={styles.header}>

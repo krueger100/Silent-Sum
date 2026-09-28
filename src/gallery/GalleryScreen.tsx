@@ -13,6 +13,7 @@
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FlatList, Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useServices, usePhotos, useVaultState } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles } from '@/app/theme';
@@ -22,13 +23,13 @@ import { VaultUpsellDialog } from '@/billing/screens/VaultUpsellDialog';
 import { Button } from '@/components/Button';
 import { ConfirmDialog, TypedConfirmDialog } from '@/components/Dialog';
 import { Paragraph, Screen } from '@/components/Screen';
+import { gridColumns } from '@/gallery/gridColumns';
 import { ImportService } from '@/gallery/importService';
 import { PhotoTile } from '@/gallery/PhotoTile';
 import { openRepository } from '@/gallery/vaultAccess';
 import { CameraSheet } from '@/camera/CameraSheet';
 import type { PhotoEntry } from '@/vault/types';
 
-const COLUMNS = 3;
 const GAP = 4;
 const EDGE = 4;
 /** Clears the floating action buttons. */
@@ -52,6 +53,7 @@ export function GalleryScreen({
   const photos = usePhotos();
   const vaultState = useVaultState();
   const { width } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
 
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -75,7 +77,11 @@ export function GalleryScreen({
   const importService = useMemo(() => new ImportService(services), [services]);
   const repository = openRepository(services);
   const selecting = selectedIds.size > 0;
-  const tileSize = Math.floor((width - EDGE * 2 - GAP * (COLUMNS - 1)) / COLUMNS);
+  // `Screen` pads by the horizontal safe area, so the grid gets less than the window in landscape.
+  // Sizing from the window there would push the last column under the navigation bar.
+  const contentWidth = width - insets.left - insets.right;
+  const columns = gridColumns(contentWidth);
+  const tileSize = Math.floor((contentWidth - EDGE * 2 - GAP * (columns - 1)) / columns);
 
   const clearSelection = useCallback(() => {
     setSelectedIds(new Set());
@@ -270,7 +276,10 @@ export function GalleryScreen({
           data={photos}
           extraData={selectedIds}
           keyExtractor={(item) => item.id}
-          numColumns={COLUMNS}
+          // FlatList refuses to change `numColumns` in place, so the key remounts it on the rare
+          // occasions the count actually moves: a rotation or an unfold, not a scroll.
+          key={columns}
+          numColumns={columns}
           renderItem={renderTile}
           columnWrapperStyle={styles.column}
           contentContainerStyle={styles.grid}
