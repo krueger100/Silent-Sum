@@ -123,7 +123,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // whatever this says, so a versionCode edited in `build.gradle` silently returns to 1 and Play
     // refuses the upload as a duplicate. Bump it for every build that is uploaded, independently of
     // `version` above -- Play compares only this number.
-    versionCode: 1,
+    versionCode: 2,
     ...(firebaseAndroid ? { googleServicesFile: googleServicesJson } : {}),
     adaptiveIcon: {
       // `surfaceAlt` from DARK_PALETTE, matching `android-icon-background.png`. A launcher that
@@ -261,6 +261,9 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // `keystore.properties` in the project root, or the environment, at BUILD time -- never from
     // here, and never from anything committed. See docs/building.md.
     './plugins/withReleaseSigning',
+    // Undoes Play's assumption that requesting CAMERA means the app needs one. Without it the
+    // listing is filtered off every device without a rear autofocus camera.
+    './plugins/withOptionalCamera',
     // Runs last so it also strips filters contributed by the plugins above.
     './plugins/withoutDeepLinks',
   ],
