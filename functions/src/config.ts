@@ -29,6 +29,13 @@ export interface BillingConfig {
   /** Which PayMongo mode this deployment accepts events from. */
   readonly livemode: boolean;
   readonly region: string;
+  /**
+   * The vault bucket, for deleting a conversation's media. Named explicitly and defaulting to
+   * NULL rather than to the project's default bucket: on this shared project the default bucket
+   * is `eevee-mate.appspot.com`, which belongs to EVPAL. An unset value means media is left alone,
+   * which is inert; reaching for the wrong bucket would not be.
+   */
+  readonly storageBucket: string | null;
 }
 
 export const DEFAULT_PAYMENT_METHODS: readonly string[] = [
@@ -75,6 +82,7 @@ export function readConfig(
     .filter((s) => s !== '');
   const returnUrl = env.SILENTSUM_BILLING_RETURN_URL?.trim() ?? '';
   const region = env.SILENTSUM_REGION?.trim() ?? '';
+  const storageBucket = env.SILENTSUM_STORAGE_BUCKET?.trim() ?? '';
   const supportFrom = env.SILENTSUM_SUPPORT_FROM?.trim() ?? '';
   const supportTo = env.SILENTSUM_SUPPORT_TO?.trim() ?? '';
   return {
@@ -92,6 +100,7 @@ export function readConfig(
     enforceAppCheck: flag(env.SILENTSUM_ENFORCE_APP_CHECK) !== false,
     livemode: flag(env.PAYMONGO_LIVEMODE) ?? (secretKey ?? '').startsWith('sk_live_'),
     region: region === '' ? 'us-central1' : region,
+    storageBucket: storageBucket === '' ? null : storageBucket,
   };
 }
 

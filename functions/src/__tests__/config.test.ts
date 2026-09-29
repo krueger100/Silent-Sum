@@ -76,4 +76,20 @@ describe('products', () => {
     expect(priceFor(config, 'pro')).toBe(29900);
     expect(priceFor(config, 'cloud')).toBe(12900);
   });
+
+  describe('the storage bucket', () => {
+    it('is read from the environment', () => {
+      expect(readConfig({ SILENTSUM_STORAGE_BUCKET: 'silentsum-vault-eevee-mate' }).storageBucket)
+        .toBe('silentsum-vault-eevee-mate');
+    });
+
+    // Null, never a default. On this shared project the default bucket is eevee-mate.appspot.com,
+    // which belongs to EVPAL -- so an unset value must mean "delete nothing", not "delete from
+    // whichever bucket the SDK picks".
+    it('is null when unset or blank, rather than falling back to a default', () => {
+      expect(readConfig({}).storageBucket).toBeNull();
+      expect(readConfig({ SILENTSUM_STORAGE_BUCKET: '' }).storageBucket).toBeNull();
+      expect(readConfig({ SILENTSUM_STORAGE_BUCKET: '   ' }).storageBucket).toBeNull();
+    });
+  });
 });

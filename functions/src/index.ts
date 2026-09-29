@@ -38,10 +38,12 @@ import {
 
 import { cancelCloud } from './cancel';
 import { createCheckout } from './checkout';
+import { deleteConversation } from './conversations';
 import { readConfig, type BillingConfig } from './config';
 import { findPeerEmail, findUserByEmail } from './directory';
 import { BillingFailure } from './errors';
 import { FirestoreDirectoryStore } from './firestoreDirectoryStore';
+import { FirestoreConversationStore } from './firestoreConversationStore';
 import { FirestoreBillingStore } from './firestoreStore';
 import { FirestoreSupportRelayCounters, FirestoreSupportStore } from './firestoreSupportStore';
 import { PayMongoClient } from './paymongo/client';
@@ -259,6 +261,37 @@ export const silentsumPeerEmail = onCall(
       );
     } catch (error) {
       throw toHttpsError(error, 'peerEmail');
+    }
+  },
+);
+
+/**
+ * Deleting a whole conversation, for both people.
+ *
+ * The client cannot do this: the rules refuse to delete a conversation or a message, and no
+ * client can delete a subcollection at all. So the permission check that would have been a rule
+ * lives in `conversations.ts` and runs before anything is touched -- see that module for why
+ * EITHER member is allowed to, and why no placeholder is left behind.
+ *
+ * App Check is enforced exactly as it is for the purchase callables. The PayMongo secret is
+ * deliberately NOT bound: ending a conversation has no business holding a payment key.
+ */
+export const silentsumDeleteConversation = onCall(
+  { invoker: 'public', enforceAppCheck: STATIC.enforceAppCheck },
+  async (request) => {
+    const callerUid = requireUid(request);
+    try {
+      return await deleteConversation(
+        {
+          store: new FirestoreConversationStore(getFirestore(), STATIC.storageBucket),
+          log: (message, data) => {
+            logger.info(message, data);
+          },
+        },
+        { callerUid, conversationId: field(request.data, 'conversationId') },
+      );
+    } catch (error) {
+      throw toHttpsError(error, 'deleteConversation');
     }
   },
 );
