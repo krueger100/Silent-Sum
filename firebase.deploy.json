@@ -1,0 +1,6 @@
+{
+  "//": "Deploys ONLY `firebase/firestore.deploy.rules`: the live ruleset plus the message-deletion rules and nothing else. Kept separate from `firebase.json` so that the main config keeps pointing at `firestore.merged.rules`, which still carries the undeployed Cloud-backup gate (ssCloudActive on the vault envelope and manifest) for a later rollout. Use with: firebase deploy --only firestore:rules --config firebase.deploy.json --project eevee-mate",
+  "firestore": {
+    "rules": "firebase/firestore.deploy.rules"
+  }
+}
