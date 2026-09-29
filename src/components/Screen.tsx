@@ -4,6 +4,7 @@ import { KeyboardAvoidingView, Pressable, ScrollView, StyleSheet, Text, View } f
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { spacing, type Palette, typography, useStyles } from '@/app/theme';
+import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
 
 export interface ScreenProps {
   title?: string;
@@ -40,7 +41,11 @@ export function Screen({
    * reflow the whole page.
    */
   const body = scroll ? (
-    <KeyboardAvoidingView testID="screen-keyboard-avoider" behavior="padding" style={styles.flex}>
+    <KeyboardAvoidingView
+      testID="screen-keyboard-avoider"
+      behavior={KEYBOARD_BEHAVIOR}
+      style={styles.flex}
+    >
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"

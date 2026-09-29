@@ -300,6 +300,33 @@ service cloud.firestore {
         && ssValidMediaFields(cid, d);
     }
 
+    // Withdrawing a message for everyone: "delete for me" never reaches the server at all.
+    //
+    // This is the whole server-side permission check, so it is written to be readable rather than
+    // clever. Four things must hold, and the first is the one that matters:
+    //
+    //  1. ONLY the sender. `resource.data.from` is the record already stored, not anything the
+    //     caller sends, so a member cannot withdraw the other side's message.
+    //  2. The result is a tombstone and nothing else -- exactly these four keys. `hasOnly` is not
+    //     enough on its own here, because the point is that `box`, `nonce` and every media
+    //     pointer must be GONE, not merely optional; naming the complete key set is what
+    //     guarantees a write cannot leave ciphertext behind while claiming to be a deletion.
+    //  3. Identity is preserved: a tombstone may not change who sent it or when, which stops this
+    //     being a way to rewrite history or reorder a thread.
+    //  4. A tombstone is final. `!('deletedAt' in resource.data.keys())` means an already
+    //     withdrawn message cannot be written again -- so this path can never be used to put
+    //     content back, and re-deleting is a no-op refusal rather than a fresh write.
+    function ssValidTombstone(before, after) {
+      return before.from == request.auth.uid
+        && after.keys().hasOnly(['v', 'from', 'createdAt', 'deletedAt'])
+        && after.keys().hasAll(['v', 'from', 'createdAt', 'deletedAt'])
+        && after.v == 1
+        && after.from == before.from
+        && after.createdAt == before.createdAt
+        && ssRecentMillis(after.deletedAt)
+        && !('deletedAt' in before.keys());
+    }
+
     match /conversations/{cid} {
       // A `get` names the conversation it wants, so the id answers membership by itself, with no
       // document read -- which is the whole reason the id carries the two uids.
@@ -325,8 +352,17 @@ service cloud.firestore {
         allow create: if ssInConv(cid)
           && ssProActive(request.auth.uid)
           && ssValidConvMessage(cid, request.resource.data);
-        // A sent message is a record. Nobody edits or removes one from the client.
-        allow update, delete: if false;
+        // A sent message is still not editable. The single exception is its sender withdrawing
+        // it, and `ssValidTombstone` is what keeps that from being an edit: the only reachable
+        // end state is a document with no ciphertext in it at all.
+        //
+        // NOT gated on Pro. Pro buys the ability to send; taking back something already sent must
+        // keep working for an account that has lapsed, or a user could be left unable to withdraw
+        // a message they regret because a subscription ran out.
+        allow update: if ssInConv(cid) && ssValidTombstone(resource.data, request.resource.data);
+        // Still no hard delete: the peer's thread would lose the message with no trace, and the
+        // placeholder is the thing that tells them it was withdrawn rather than never sent.
+        allow delete: if false;
       }
     }
 

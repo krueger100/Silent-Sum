@@ -303,4 +303,96 @@ describe('viewing media', () => {
     expect(view.getByTestId(`conversation_media_expired_${sent.id}`)).toHaveTextContent(/expired/i);
     expect(view.queryByTestId(`conversation_media_${sent.id}`)).toBeNull();
   });
+
+  it('keeps the composer above the keyboard on Android as well as iOS', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    await world.join(BOB, 2);
+    const conversationId = await alice.messaging.startConversation(BOB);
+
+    const view = await renderWithServices(
+      alice.services,
+      <ConversationScreen conversationId={conversationId} />,
+    );
+    await flush();
+
+    // Presence only. Which behaviour it is given cannot be read back here -- KeyboardAvoidingView
+    // destructures `behavior` out before spreading the rest onto the View underneath, so it never
+    // reaches the host element -- and that half is pinned by keyboardAvoidance.test.ts instead.
+    // Between the two, neither deleting the wrapper nor neutering it can pass.
+    expect(view.getByTestId('conversation_keyboard_avoider')).toBeTruthy();
+    expect(view.getByTestId('conversation_input')).toBeTruthy();
+  });
+});
+
+describe('deleting a message from the thread', () => {
+  it('offers both deletions on your own message, and hides it for you', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    await world.join(BOB, 2);
+    const conversationId = await alice.messaging.startConversation(BOB);
+    await alice.messaging.send(conversationId, 'mine to delete');
+    await flush();
+
+    const view = await renderWithServices(
+      alice.services,
+      <ConversationScreen conversationId={conversationId} />,
+    );
+    await flush();
+
+    const bubble = view.getByLabelText('You: mine to delete');
+    await fireEvent(bubble, 'longPress');
+
+    expect(view.getByTestId('message_delete_for_me')).toBeTruthy();
+    expect(view.getByTestId('message_delete_for_everyone')).toBeTruthy();
+    expect(view.getByTestId('message_actions_cancel')).toBeTruthy();
+
+    await fireEvent.press(view.getByTestId('message_delete_for_me'));
+    await flush();
+
+    expect(view.queryByLabelText('You: mine to delete')).toBeNull();
+  });
+
+  it('does not offer "delete for everyone" on the other person’s message', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    const bob = await world.join(BOB, 2);
+    const conversationId = await alice.messaging.startConversation(BOB);
+    await bob.messaging.send(conversationId, 'his, not hers');
+    await flush();
+
+    const view = await renderWithServices(
+      alice.services,
+      <ConversationScreen conversationId={conversationId} />,
+    );
+    await flush();
+
+    await fireEvent(view.getByLabelText('Them: his, not hers'), 'longPress');
+    // Hiding it for herself is always allowed; withdrawing it for him is not offered at all,
+    // which is the client half of a rule the server enforces independently.
+    expect(view.getByTestId('message_delete_for_me')).toBeTruthy();
+    expect(view.queryByTestId('message_delete_for_everyone')).toBeNull();
+  });
+
+  it('shows the placeholder to the other side once a message is withdrawn', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    const bob = await world.join(BOB, 2);
+    const conversationId = await alice.messaging.startConversation(BOB);
+    const sent = await alice.messaging.send(conversationId, 'regretted');
+    await flush();
+    await alice.messaging.deleteForEveryone(conversationId, sent);
+    await flush();
+
+    const view = await renderWithServices(
+      bob.services,
+      <ConversationScreen conversationId={conversationId} />,
+    );
+    await flush();
+
+    expect(view.getByTestId('conversation_deleted_' + sent.id)).toHaveTextContent(
+      'This message was deleted',
+    );
+    expect(view.queryByText('regretted')).toBeNull();
+  });
 });

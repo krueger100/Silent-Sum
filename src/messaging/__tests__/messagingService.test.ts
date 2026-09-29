@@ -16,7 +16,9 @@ import { SequentialRandom } from '@/crypto/random';
 import { MASTER_KEY_LENGTH } from '@/crypto/types';
 import { InMemoryCloudBackend, InMemoryCloudStore } from '@/firebase/cloudBackend';
 import { InMemorySecureStore } from '@/secure-storage/secureStore';
+import { InMemoryConversationAdmin } from '@/messaging/conversationAdmin';
 import { InMemoryDirectory } from '@/messaging/directory';
+import { HiddenMessages } from '@/messaging/hiddenMessages';
 import { deriveMessagingIdentity, type MessagingIdentity } from '@/messaging/identity';
 import {
   MESSAGING_PATHS,
@@ -120,6 +122,28 @@ class World {
         clock: this.clock,
         random,
         identity: () => side.identity,
+        // One per side, like the filesystem above: "delete for me" is a property of a device, so
+        // a shared store would make the two sides wrongly agree about what is hidden.
+        hidden: new HiddenMessages(new InMemorySecureStore()),
+        // Stands in for the callable. It purges through the backend rather than the raw maps so
+        // that both sides' open listeners fire, which is the behaviour under test.
+        conversationAdmin: new InMemoryConversationAdmin(
+          () => side.uid,
+          async (cid) => {
+            for (const path of [...this.store.documents.keys()]) {
+              if (path === `conversations/${cid}` || path.startsWith(`conversations/${cid}/`)) {
+                await cloud.deleteDocument(path);
+              }
+            }
+            for (const key of [...this.store.blobs.keys()]) {
+              if (key.startsWith(`messages/${cid}/`)) await cloud.deleteBlob(key);
+            }
+            for (const uid of cid.split('__')) {
+              const peer = cid.split('__').find((u) => u !== uid);
+              this.store.documents.delete(`users/${uid}/contacts/${peer ?? ''}`);
+            }
+          },
+        ),
         media: {
           fs,
           secureDelete,
@@ -877,5 +901,225 @@ describe('opening received media', () => {
     await expect(
       bob.messaging.fetchMediaBytes(conversationId, message),
     ).rejects.toMatchObject({ code: 'expired' });
+  });
+});
+
+describe('deleting messages', () => {
+  async function pair() {
+    const world = new World();
+    const alice = await world.join(ALICE, 1, { pro: true });
+    const bob = await world.join(BOB, 2, { pro: true });
+    const conversationId = await alice.messaging.startConversation(BOB);
+    return { world, alice, bob, conversationId };
+  }
+
+  function threadOf(side: Side, conversationId: string) {
+    return collect<ConversationState>((on) =>
+      side.messaging.watchConversation(conversationId, on),
+    );
+  }
+
+  describe('for me', () => {
+    it('hides it on this device and leaves the other side untouched', async () => {
+      const { alice, bob, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'only I will stop seeing this');
+      await flush();
+
+      const hers = threadOf(alice, conversationId);
+      const his = threadOf(bob, conversationId);
+      await flush();
+      const message = hers.last().messages[0];
+      if (message === undefined) throw new Error('nothing to delete');
+
+      await alice.messaging.deleteForMe(conversationId, message.id);
+      await flush();
+
+      // Gone from her OPEN thread, without reopening it, and still ordinary for him.
+      expect(hers.last().messages).toEqual([]);
+      expect(his.last().messages.map((m) => m.body)).toEqual(['only I will stop seeing this']);
+      expect(his.last().messages[0]?.deleted).toBe(false);
+      hers.stop();
+      his.stop();
+    });
+
+    // The requirement is that it STAYS hidden, so this reopens the thread rather than trusting
+    // the in-memory listener proved above.
+    it('stays hidden when the thread is opened again', async () => {
+      const { alice, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'hidden');
+      await flush();
+      const first = threadOf(alice, conversationId);
+      await flush();
+      await alice.messaging.deleteForMe(conversationId, first.last().messages[0]?.id ?? '');
+      first.stop();
+
+      const reopened = threadOf(alice, conversationId);
+      await flush();
+      expect(reopened.last().messages).toEqual([]);
+      reopened.stop();
+    });
+
+    it('can hide the other side of the conversation too', async () => {
+      const { alice, bob, conversationId } = await pair();
+      await bob.messaging.send(conversationId, 'from him');
+      await flush();
+      const hers = threadOf(alice, conversationId);
+      await flush();
+      await alice.messaging.deleteForMe(conversationId, hers.last().messages[0]?.id ?? '');
+      await flush();
+      expect(hers.last().messages).toEqual([]);
+      hers.stop();
+    });
+
+    it('never writes anything the server could read', async () => {
+      const { world, alice, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'private decision');
+      await flush();
+      const hers = threadOf(alice, conversationId);
+      await flush();
+      const before = JSON.stringify([...world.store.documents.entries()]);
+      await alice.messaging.deleteForMe(conversationId, hers.last().messages[0]?.id ?? '');
+      await flush();
+      expect(JSON.stringify([...world.store.documents.entries()])).toBe(before);
+      hers.stop();
+    });
+  });
+
+  describe('for everyone', () => {
+    it('replaces the message for both sides with a withdrawn marker', async () => {
+      const { alice, bob, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'said too much');
+      await flush();
+      const hers = threadOf(alice, conversationId);
+      const his = threadOf(bob, conversationId);
+      await flush();
+      const message = hers.last().messages[0];
+      if (message === undefined) throw new Error('nothing to delete');
+
+      await alice.messaging.deleteForEveryone(conversationId, message);
+      await flush();
+
+      for (const side of [hers, his]) {
+        expect(side.last().messages).toHaveLength(1);
+        expect(side.last().messages[0]?.deleted).toBe(true);
+        expect(side.last().messages[0]?.body).toBeNull();
+      }
+      hers.stop();
+      his.stop();
+    });
+
+    // The point of replacing rather than flagging: no ciphertext is left in the database for any
+    // client, or anyone reading it directly, to decrypt later.
+    it('leaves no ciphertext behind in the stored document', async () => {
+      const { world, alice, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'unrecoverable');
+      await flush();
+      const hers = threadOf(alice, conversationId);
+      await flush();
+      const message = hers.last().messages[0];
+      if (message === undefined) throw new Error('nothing to delete');
+      const path = MESSAGING_PATHS.message(conversationId, message.id);
+      expect(world.store.documents.get(path)).toHaveProperty('box');
+
+      await alice.messaging.deleteForEveryone(conversationId, message);
+      const stored = world.store.documents.get(path) ?? {};
+      expect(Object.keys(stored).sort()).toEqual(['createdAt', 'deletedAt', 'from', 'v']);
+      hers.stop();
+    });
+
+    it('refuses to withdraw a message this account did not send', async () => {
+      const { alice, bob, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'hers to withdraw, not his');
+      await flush();
+      const his = threadOf(bob, conversationId);
+      await flush();
+      const message = his.last().messages[0];
+      if (message === undefined) throw new Error('nothing to delete');
+
+      await expect(bob.messaging.deleteForEveryone(conversationId, message)).rejects.toMatchObject({
+        code: 'not-mine',
+      });
+      expect(his.last().messages[0]?.deleted).toBe(false);
+      his.stop();
+    });
+
+    it('is idempotent: withdrawing an already withdrawn message changes nothing', async () => {
+      const { world, alice, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'twice');
+      await flush();
+      const hers = threadOf(alice, conversationId);
+      await flush();
+      const message = hers.last().messages[0];
+      if (message === undefined) throw new Error('nothing to delete');
+      await alice.messaging.deleteForEveryone(conversationId, message);
+      await flush();
+
+      const withdrawn = hers.last().messages[0];
+      if (withdrawn === undefined) throw new Error('the placeholder vanished');
+      const path = MESSAGING_PATHS.message(conversationId, message.id);
+      const after = JSON.stringify(world.store.documents.get(path));
+      await alice.messaging.deleteForEveryone(conversationId, withdrawn);
+      expect(JSON.stringify(world.store.documents.get(path))).toBe(after);
+      hers.stop();
+    });
+
+    it('removes the whole conversation for both sides, with no placeholder left', async () => {
+      const { world, alice, bob, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'first');
+      await bob.messaging.send(conversationId, 'second');
+      await flush();
+
+      const herList = collect<MessagingState>((on) => alice.messaging.watch(on));
+      const hisList = collect<MessagingState>((on) => bob.messaging.watch(on));
+      const hisThread = threadOf(bob, conversationId);
+      await flush();
+      expect(herList.last().conversations).toHaveLength(1);
+      expect(hisThread.last().messages).toHaveLength(2);
+
+      await alice.messaging.deleteConversation(conversationId);
+      await flush();
+
+      // Gone from BOTH lists -- this is the one action that reaches into the other person's copy.
+      expect(herList.last().conversations).toEqual([]);
+      expect(hisList.last().conversations).toEqual([]);
+      // And nothing of it is left in the database.
+      const leftovers = [...world.store.documents.keys()].filter((p) => p.includes(conversationId));
+      expect(leftovers).toEqual([]);
+      herList.stop();
+      hisList.stop();
+      hisThread.stop();
+    });
+
+    it('refuses a conversation this account is not in, and deletes nothing', async () => {
+      const { world, alice, conversationId } = await pair();
+      await alice.messaging.send(conversationId, 'still here');
+      await flush();
+      const before = [...world.store.documents.keys()].filter((p) => p.includes(conversationId));
+      expect(before.length).toBeGreaterThan(0);
+
+      // A conversation between two other accounts.
+      const theirs = ['zzz-other-one', 'zzz-other-two'].sort().join('__');
+      await expect(alice.messaging.deleteConversation(theirs)).rejects.toMatchObject({
+        code: 'unavailable',
+      });
+      expect(
+        [...world.store.documents.keys()].filter((p) => p.includes(conversationId)),
+      ).toEqual(before);
+    });
+
+    it('takes the media objects with it', async () => {
+      const { world, alice, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///photo.jpg', new Uint8Array([0xff, 0xd8, 0xff, 1, 2, 3]));
+      const sent = await alice.messaging.sendMedia(conversationId, {
+        uri: 'file:///photo.jpg',
+        kind: 'photo',
+      });
+      await flush();
+      expect(world.store.blobs.has(sent.object ?? '')).toBe(true);
+
+      await alice.messaging.deleteForEveryone(conversationId, sent);
+      expect(world.store.blobs.has(sent.object ?? '')).toBe(false);
+      if (sent.thumbObject !== null) expect(world.store.blobs.has(sent.thumbObject)).toBe(false);
+    });
   });
 });

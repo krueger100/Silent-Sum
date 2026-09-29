@@ -37,6 +37,7 @@ import { RelaySupportService } from '@/support/relaySupportService';
 import { readSupportConfig } from '@/support/supportConfig';
 import { RecoveryAccess } from '@/support/recoveryAccess';
 import { readRecoveryPublicKey } from '@/support/recoveryConfig';
+import { HiddenMessages } from '@/messaging/hiddenMessages';
 import { deriveMessagingIdentity, type MessagingIdentity } from '@/messaging/identity';
 import { MessagingService } from '@/messaging/messagingService';
 import { SupportChatService } from '@/support/chat/supportChatService';
@@ -209,10 +210,13 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
   const messaging = new MessagingService({
     cloud: firebase.cloud,
     directory: firebase.directory ?? null,
+    conversationAdmin: firebase.conversationAdmin ?? null,
     entitlements,
     clock,
     random,
     identity: () => messagingIdentity,
+    // Device-local, never uploaded: see `@/messaging/hiddenMessages`.
+    hidden: new HiddenMessages(secureStore),
     // Chat media shares the vault's own machinery: the same thumbnail generators, the same
     // scratch space that purges on background, the same secure delete. Nothing here is a second
     // implementation of something the vault already does.

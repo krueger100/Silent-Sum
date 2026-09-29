@@ -199,6 +199,9 @@ export function byRecency(a: Conversation, b: Conversation): number {
  */
 export type StoredMessageKind = 'photo' | 'video' | 'unknown' | null;
 
+/** What every reader shows in place of a message its sender withdrew. */
+export const DELETED_MESSAGE_TEXT = 'This message was deleted';
+
 /** A message exactly as stored: the body is ciphertext and stays that way until it is opened. */
 export interface StoredMessage {
   readonly id: string;
@@ -213,6 +216,12 @@ export interface StoredMessage {
   readonly bytes: number;
   /** The Storage path of the preview. Null for text, and for media that produced none. */
   readonly thumbObject: string | null;
+  /**
+   * The sender withdrew this message for everyone. The ciphertext is not hidden but GONE: the
+   * document was overwritten, so `box` and `nonce` are empty here because there is nothing left
+   * to read, not because this reader declined to.
+   */
+  readonly deleted: boolean;
 }
 
 function readKind(value: unknown): StoredMessageKind {
@@ -229,13 +238,31 @@ export function parseStoredMessage(
   data: Record<string, unknown>,
 ): StoredMessage | null {
   const from = data.from;
-  const box = data.box;
-  const nonce = data.nonce;
   const createdAt = readMillis(data.createdAt);
   if (typeof from !== 'string' || from === '') return null;
+  if (createdAt === null) return null;
+
+  // A tombstone is kept rather than dropped. Dropping it would leave a silent gap, which a reader
+  // cannot tell from "they never wrote" -- the same reason an unknown `kind` is kept below.
+  if (readMillis(data.deletedAt) !== null) {
+    return {
+      id,
+      from,
+      box: '',
+      nonce: '',
+      createdAt,
+      kind: null,
+      object: null,
+      bytes: 0,
+      thumbObject: null,
+      deleted: true,
+    };
+  }
+
+  const box = data.box;
+  const nonce = data.nonce;
   if (typeof box !== 'string' || box === '') return null;
   if (typeof nonce !== 'string' || nonce === '') return null;
-  if (createdAt === null) return null;
 
   const kind = readKind(data.kind);
   const object = readPath(data.object);
@@ -255,7 +282,27 @@ export function parseStoredMessage(
     object,
     bytes: kind === null ? 0 : bytes,
     thumbObject: readPath(data.thumbObject),
+    deleted: false,
   };
+}
+
+/**
+ * What replaces a message its sender withdraws for everyone.
+ *
+ * Written with `putDocument` and NO merge, so this becomes the whole document: `box`, `nonce` and
+ * every media pointer stop existing rather than being masked. That is the difference between a
+ * deletion and a flag a determined reader could ignore -- the peer's own listener delivers this
+ * same document, so there is no copy of the ciphertext left for any client to render.
+ *
+ * `from` and `createdAt` survive because the rules compare them with the record being replaced,
+ * and because the thread still needs to know whose side the placeholder sits on and where it goes.
+ */
+export function deletedMessageRecord(
+  from: string,
+  createdAt: number,
+  now: number,
+): Record<string, unknown> {
+  return { v: 1, from, createdAt, deletedAt: now };
 }
 
 /**
@@ -314,6 +361,8 @@ export interface DecryptedMessage {
   readonly object: string | null;
   /** The Storage path of the preview, or null for text and for media that produced none. */
   readonly thumbObject: string | null;
+  /** Withdrawn by its sender for everyone. `body` is null and there is nothing to fetch. */
+  readonly deleted: boolean;
 }
 
 // ---------------------------------------------------------------------------------------------

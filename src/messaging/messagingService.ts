@@ -25,6 +25,8 @@ import type { EntitlementsController } from '@/billing/entitlementsController';
 import type { SecureRandom } from '@/crypto/types';
 import { increment, type CloudBackend } from '@/firebase/types';
 import { DirectoryError, type Directory } from '@/messaging/directory';
+import { ConversationAdminError, type ConversationAdmin } from '@/messaging/conversationAdmin';
+import type { HiddenMessages } from '@/messaging/hiddenMessages';
 import type { MessagingIdentity } from '@/messaging/identity';
 import {
   CONVERSATION_PAGE_SIZE,
@@ -34,6 +36,7 @@ import {
   checkMessage,
   conversationIdFor,
   conversationRecord,
+  deletedMessageRecord,
   mediaRecord,
   membersOf,
   messageRecord,
@@ -79,6 +82,11 @@ export type VaultSink = Pick<VaultRepository, 'photos' | 'addPhoto' | 'addVideo'
 export type MessagingErrorCode =
   /** Nobody is signed in to a backup account. */
   | 'unauthenticated'
+  /**
+   * Signed in, but App Check could not vouch for this build, so the lookup was refused. Distinct
+   * from `unauthenticated` because the remedy is different and the user is already past sign-in.
+   */
+  | 'attestation'
   /** The vault is locked, so there is no key to encrypt or decrypt with. */
   | 'locked'
   /** Not Pro. Starting and sending both need it; reading never does. */
@@ -91,6 +99,8 @@ export type MessagingErrorCode =
   | 'peer-has-no-key'
   /** The text was refused before anything was written. */
   | 'rejected'
+  /** Only a message's own sender may withdraw it for everyone. */
+  | 'not-mine'
   /**
    * The vault would not take this item: its 50-item free cap or its 100 MB per-item cap. Kept
    * separate from `rejected` because the remedy is different -- one is a limit with an upsell
@@ -121,6 +131,11 @@ export function describeMessagingError(code: MessagingErrorCode): string {
   switch (code) {
     case 'unauthenticated':
       return 'Sign in to your backup account first.';
+    case 'attestation':
+      return (
+        'This device could not prove to the server that the app is genuine. Update Google Play ' +
+        'Store, or install SilentSum from the store, and try again.'
+      );
     case 'locked':
       return 'Unlock the vault to read and send messages.';
     case 'pro-required':
@@ -133,6 +148,8 @@ export function describeMessagingError(code: MessagingErrorCode): string {
       return 'That person has not set up messaging yet. Ask them to open Messages once.';
     case 'rejected':
       return 'That message was not sent.';
+    case 'not-mine':
+      return 'You can only delete your own messages for everyone.';
     case 'vault-refused':
       return 'The vault would not take this item.';
     case 'expired':
@@ -210,11 +227,18 @@ export interface ConversationState {
 export interface MessagingDeps {
   readonly cloud: CloudBackend | null;
   readonly directory: Directory | null;
+  /** Ending a conversation for both sides. Null when this build cannot reach the functions. */
+  readonly conversationAdmin?: ConversationAdmin | null;
   readonly entitlements: EntitlementsController;
   readonly clock: Clock;
   readonly random: SecureRandom;
   /** The unlocked session's messaging identity, or null while the vault is locked. */
   readonly identity: () => MessagingIdentity | null;
+  /**
+   * Messages hidden on this device only. Absent in a build or a test without one, in which case
+   * "delete for me" is simply unavailable and nothing else changes.
+   */
+  readonly hidden?: HiddenMessages;
   /**
    * Everything media needs. Absent in a build or a test with no media: `sendMedia` and the fetch
    * pair then refuse with `unavailable` rather than crashing, exactly as an absent cloud does.
@@ -266,6 +290,9 @@ export class MessagingService {
    * named would spend the hourly budget on an answer it is holding.
    */
   private contactsLoaded = false;
+
+  /** Open threads that want telling when this device hides a message. */
+  private readonly hiddenChanged = new Set<() => void>();
 
   constructor(private readonly deps: MessagingDeps) {}
 
@@ -540,27 +567,38 @@ export class MessagingService {
     let key: Bytes | null = null;
     let problem: MessagingErrorCode | null = null;
     let loaded = false;
+    // Applied on every emit rather than once, so a message hidden while the thread is open
+    // disappears from it without needing the screen to be closed and reopened.
+    let hidden: ReadonlySet<string> = new Set();
 
     const emit = (): void => {
-      const messages: DecryptedMessage[] = stored.map((message) => ({
-        id: message.id,
-        from: message.from,
-        createdAt: message.createdAt,
-        mine: message.from === uid,
-        // A media message's `box` holds its caption envelope, which is empty today; the media
-        // itself is fetched separately. Opening it is harmless either way and keeps one path.
-        body:
-          key === null
-            ? null
-            : openMessage(
-                { box: message.box, nonce: message.nonce },
-                key,
-                { conversationId, from: message.from, createdAt: message.createdAt },
-              ),
-        kind: message.kind,
-        object: message.object,
-        thumbObject: message.thumbObject,
-      }));
+      const messages: DecryptedMessage[] = stored
+        // Dropped here, at the one place the thread is built, so there is no path that assembles
+        // a list of messages without this filter having run.
+        .filter((message) => !hidden.has(message.id))
+        .map((message) => ({
+          id: message.id,
+          from: message.from,
+          createdAt: message.createdAt,
+          mine: message.from === uid,
+          // A withdrawn message has no ciphertext left to open -- the document it came from no
+          // longer carries any. The placeholder is the screen's job, not this layer's.
+          //
+          // A media message's `box` holds its caption envelope, which is empty today; the media
+          // itself is fetched separately. Opening it is harmless either way and keeps one path.
+          body:
+            message.deleted || key === null
+              ? null
+              : openMessage(
+                  { box: message.box, nonce: message.nonce },
+                  key,
+                  { conversationId, from: message.from, createdAt: message.createdAt },
+                ),
+          kind: message.kind,
+          object: message.object,
+          thumbObject: message.thumbObject,
+          deleted: message.deleted,
+        }));
       const canSend = this.canMessage() && key !== null;
       onChange({
         id: conversationId,
@@ -576,7 +614,18 @@ export class MessagingService {
       });
     };
 
+    const refreshHidden = (): void => {
+      void this.deps.hidden?.forConversation(conversationId).then((ids) => {
+        hidden = ids;
+        emit();
+      });
+    };
+
     emit();
+    refreshHidden();
+    // Re-read when this device hides something, so the message leaves an OPEN thread rather than
+    // only a reopened one. `deleteForMe` fires this after the write, never before.
+    this.hiddenChanged.add(refreshHidden);
     void this.conversationKey(conversationId, peerUid)
       .then((derived) => {
         key = derived;
@@ -605,7 +654,10 @@ export class MessagingService {
         emit();
       },
     );
-    return stop;
+    return () => {
+      this.hiddenChanged.delete(refreshHidden);
+      stop();
+    };
   }
 
   private async conversationKey(conversationId: string, peerUid: string): Promise<Bytes> {
@@ -639,6 +691,9 @@ export class MessagingService {
       }
       if (error instanceof DirectoryError && error.code === 'unauthenticated') {
         throw new MessagingError('unauthenticated');
+      }
+      if (error instanceof DirectoryError && error.code === 'attestation') {
+        throw new MessagingError('attestation');
       }
       throw new MessagingError('unavailable');
     }
@@ -752,6 +807,7 @@ export class MessagingService {
       kind: null,
       object: null,
       thumbObject: null,
+      deleted: false,
     };
   }
 
@@ -836,6 +892,7 @@ export class MessagingService {
       kind: source.kind,
       object: objectPath,
       thumbObject,
+      deleted: false,
     };
   }
 
@@ -1024,5 +1081,93 @@ export class MessagingService {
     } catch {
       // Leaving the badge up is the correct failure here.
     }
+  }
+
+  /**
+   * Hides one message on THIS device. The peer is not told and the server never learns of it.
+   *
+   * Works on anything in the thread, including the other person's messages and one already
+   * withdrawn -- it is a decision about what this person wants to look at, so nothing about who
+   * sent it comes into it.
+   */
+  async deleteForMe(conversationId: string, messageId: string): Promise<void> {
+    const { hidden } = this.deps;
+    if (hidden === undefined) throw new MessagingError('unavailable');
+    if (peerOf(conversationId, this.requireUid()) === null) {
+      throw new MessagingError('unavailable');
+    }
+    await hidden.hide(conversationId, messageId);
+    // Only after the write, so a thread never hides a message this device would show again on
+    // the next launch.
+    for (const listener of this.hiddenChanged) listener();
+  }
+
+  /**
+   * Withdraws one of this account's own messages for both sides.
+   *
+   * The document is REPLACED by a tombstone rather than flagged, so the ciphertext stops existing
+   * instead of merely going unrendered; the peer's own listener delivers that same document, so
+   * no client is left holding a copy it could choose to show. The rules enforce the same thing
+   * independently -- this method being wrong could not turn into a way past them.
+   *
+   * Media is deleted from Storage as well, because the document pointer disappearing would
+   * otherwise leave the object readable by anyone who had noted its path. Best effort and
+   * deliberately after the tombstone: a failed blob delete must not leave the message readable,
+   * whereas a leftover object that nothing points at is inert.
+   */
+  async deleteForEveryone(conversationId: string, message: DecryptedMessage): Promise<void> {
+    const cloud = this.requireCloud();
+    const uid = this.requireUid();
+    if (peerOf(conversationId, uid) === null) throw new MessagingError('unavailable');
+    if (!message.mine || message.from !== uid) throw new MessagingError('not-mine');
+    if (message.deleted) return;
+
+    try {
+      await cloud.putDocument(
+        MESSAGING_PATHS.message(conversationId, message.id),
+        deletedMessageRecord(message.from, message.createdAt, this.deps.clock.now()),
+      );
+    } catch (error) {
+      throw error instanceof MessagingError ? error : new MessagingError('unavailable');
+    }
+
+    for (const object of [message.object, message.thumbObject]) {
+      if (object === null) continue;
+      try {
+        await cloud.deleteBlob(object);
+      } catch {
+        // Unreachable from the app either way: nothing points at it any more.
+      }
+    }
+  }
+
+  /**
+   * Deletes a whole conversation for BOTH members: every message, its media, and each side's
+   * private label for the other.
+   *
+   * Irreversible, and it leaves nothing behind -- the thread disappears from the other person's
+   * list with no placeholder, which is the one way this differs from withdrawing a message. The
+   * screen confirms before calling it.
+   *
+   * Goes through a callable because it has to: the rules refuse to delete a conversation or a
+   * message, and no client can delete a subcollection. Membership is checked again on the server,
+   * from the conversation id, so this check is a courtesy rather than the gate.
+   */
+  async deleteConversation(conversationId: string): Promise<void> {
+    const admin = this.deps.conversationAdmin;
+    if (admin === undefined || admin === null) throw new MessagingError('unavailable');
+    const uid = this.requireUid();
+    if (peerOf(conversationId, uid) === null) throw new MessagingError('unavailable');
+    try {
+      await admin.deleteForBoth(conversationId);
+    } catch (error) {
+      if (error instanceof ConversationAdminError) {
+        throw new MessagingError(
+          error.code === 'unauthenticated' ? 'unauthenticated' : 'unavailable',
+        );
+      }
+      throw new MessagingError('unavailable');
+    }
+    this.labels.delete(peerOf(conversationId, uid) ?? '');
   }
 }

@@ -83,4 +83,61 @@ describe('ConversationsScreen', () => {
 
     expect(screen.getByTestId('messages_error')).toHaveTextContent(/nobody here uses/i);
   });
+
+  it('lifts the new-conversation sheet above the keyboard', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+
+    await renderWithServices(alice.services, <ConversationsScreen />);
+    await fireEvent.press(screen.getByTestId('messages_new'));
+
+    // The sheet is docked to the bottom and its only field autoFocuses, so the keyboard opens
+    // directly over the thing being typed into unless the sheet is lifted out of the way.
+    // Presence only; which behaviour the wrapper gets is pinned by keyboardAvoidance.test.ts.
+    expect(screen.getByTestId('messages_sheet_keyboard_avoider')).toBeTruthy();
+    expect(screen.getByTestId('messages_email')).toBeTruthy();
+  });
+});
+
+describe('deleting a conversation', () => {
+  it('asks before deleting, and removes the row once confirmed', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    const bob = await world.join(BOB, 2);
+    const conversationId = await alice.messaging.startConversation(BOB);
+    await bob.messaging.send(conversationId, 'hello');
+    await flush();
+
+    await renderWithServices(alice.services, <ConversationsScreen />);
+    await flush();
+    expect(screen.getByTestId('messages_row_' + conversationId)).toBeTruthy();
+
+    // A long press must not delete anything on its own.
+    await fireEvent(screen.getByTestId('messages_row_' + conversationId), 'longPress');
+    expect(screen.getByTestId('messages_delete_confirm')).toBeTruthy();
+    expect(screen.getByTestId('messages_row_' + conversationId)).toBeTruthy();
+
+    await fireEvent.press(screen.getByText('Delete for both'));
+    await flush();
+    await flush();
+
+    expect(screen.queryByTestId('messages_row_' + conversationId)).toBeNull();
+  });
+
+  it('leaves the conversation alone when the confirmation is declined', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    await world.join(BOB, 2);
+    const conversationId = await alice.messaging.startConversation(BOB);
+    await flush();
+
+    await renderWithServices(alice.services, <ConversationsScreen />);
+    await flush();
+
+    await fireEvent(screen.getByTestId('messages_row_' + conversationId), 'longPress');
+    await fireEvent.press(screen.getByText('Cancel'));
+    await flush();
+
+    expect(screen.getByTestId('messages_row_' + conversationId)).toBeTruthy();
+  });
 });

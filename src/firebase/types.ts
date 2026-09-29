@@ -4,6 +4,7 @@
  * app receives `FIREBASE_UNAVAILABLE` (no-op crash/analytics, no cloud backend).
  */
 import type { BillingService } from '@/billing/billingService';
+import type { ConversationAdmin } from '@/messaging/conversationAdmin';
 import type { Directory } from '@/messaging/directory';
 import type { Bytes } from '@/utils/bytes';
 
@@ -197,6 +198,12 @@ export interface FirebaseServices {
    * build cannot reach them, in which case user-to-user messaging is not offered at all.
    */
   readonly directory?: Directory | null;
+  /**
+   * Ending a conversation for both members, through the project's Cloud Functions. Null (or
+   * absent) when this build cannot reach them, in which case the option is not offered. It has no
+   * client-side implementation by design: the rules forbid the deletes it performs.
+   */
+  readonly conversationAdmin?: ConversationAdmin | null;
 }
 
 export class NoopCrashReporter implements CrashReporter {
@@ -217,4 +224,5 @@ export const FIREBASE_UNAVAILABLE: FirebaseServices = {
   cloud: null,
   billing: null,
   directory: null,
+  conversationAdmin: null,
 };

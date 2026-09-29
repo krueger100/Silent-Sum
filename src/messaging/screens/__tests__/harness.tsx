@@ -19,6 +19,7 @@ import {
   NoopCrashReporter,
   type FirebaseServices,
 } from '@/firebase/types';
+import { InMemoryConversationAdmin } from '@/messaging/conversationAdmin';
 import { InMemoryDirectory } from '@/messaging/directory';
 import type { MessagingService } from '@/messaging/messagingService';
 import { RecordingScreenProtection } from '@/privacy/types';
@@ -77,6 +78,21 @@ export class MessagingWorld {
         () => services.entitlements.isPro(),
         (peerUid) =>
           this.store.documents.has(`conversations/${[user.uid, peerUid].sort().join('__')}`),
+      ),
+      // Stands in for the `silentsumDeleteConversation` callable, enforcing the same membership
+      // gate and purging through the backend so open listeners on both sides fire.
+      conversationAdmin: new InMemoryConversationAdmin(
+        () => user.uid,
+        async (cid) => {
+          for (const path of [...this.store.documents.keys()]) {
+            if (path === `conversations/${cid}` || path.startsWith(`conversations/${cid}/`)) {
+              await cloud.deleteDocument(path);
+            }
+          }
+          for (const key of [...this.store.blobs.keys()]) {
+            if (key.startsWith(`messages/${cid}/`)) await cloud.deleteBlob(key);
+          }
+        },
       ),
     };
     const services = createServices({

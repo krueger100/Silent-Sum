@@ -5,6 +5,7 @@ import {
   checkMessage,
   conversationIdFor,
   conversationRecord,
+  deletedMessageRecord,
   looksLikeEmail,
   membersOf,
   parseConversation,
@@ -101,10 +102,61 @@ describe('parsing', () => {
       object: null,
       bytes: 0,
       thumbObject: null,
+      deleted: false,
     });
     expect(parseStoredMessage('m1', { from: A, box: '', nonce: 'n', createdAt: 5 })).toBeNull();
     expect(parseStoredMessage('m1', { from: A, box: 'b', nonce: 'n' })).toBeNull();
     expect(parseStoredMessage('m1', { box: 'b', nonce: 'n', createdAt: 5 })).toBeNull();
+  });
+
+  describe('withdrawn messages', () => {
+    const tombstone = { v: 1, from: A, createdAt: 5, deletedAt: 9 };
+
+    // The alternative -- dropping it -- leaves a hole the reader cannot tell from "they never
+    // wrote", which is the one failure the placeholder exists to prevent.
+    it('is kept and marked rather than dropped, even with no ciphertext left', () => {
+      expect(parseStoredMessage('m1', tombstone)).toEqual({
+        id: 'm1',
+        from: A,
+        box: '',
+        nonce: '',
+        createdAt: 5,
+        kind: null,
+        object: null,
+        bytes: 0,
+        thumbObject: null,
+        deleted: true,
+      });
+    });
+
+    // The tombstone wins over anything else in the document, so a record that somehow still
+    // carried ciphertext could not be rendered as readable by this client.
+    it('never surfaces content that survived beside the tombstone', () => {
+      const parsed = parseStoredMessage('m1', {
+        ...tombstone,
+        box: 'Ym94',
+        nonce: 'bm9uY2U=',
+        kind: 'photo',
+        object: `messages/${CID}/photo/m1`,
+        bytes: 1234,
+        thumbObject: `messages/${CID}/thumb/m1`,
+      });
+      expect(parsed?.deleted).toBe(true);
+      expect(parsed?.box).toBe('');
+      expect(parsed?.nonce).toBe('');
+      expect(parsed?.object).toBeNull();
+      expect(parsed?.thumbObject).toBeNull();
+      expect(parsed?.kind).toBeNull();
+    });
+
+    it('still refuses one with no sender or no timestamp', () => {
+      expect(parseStoredMessage('m1', { v: 1, createdAt: 5, deletedAt: 9 })).toBeNull();
+      expect(parseStoredMessage('m1', { v: 1, from: A, deletedAt: 9 })).toBeNull();
+    });
+
+    it('writes a record with nothing in it but who and when', () => {
+      expect(deletedMessageRecord(A, 5, 9)).toEqual({ v: 1, from: A, createdAt: 5, deletedAt: 9 });
+    });
   });
 
   describe('media records', () => {

@@ -6,18 +6,22 @@
  * nothing useful the user could do about the second, so both are reported the same way.
  */
 import { CallableError, type CallableInvoker } from '@/firebase/callableClient';
+import type { CloudUser } from '@/firebase/types';
 import { DirectoryError, type Directory } from '@/messaging/directory';
 
 /** The deployed function names. Keep in step with `functions/src/index.ts`. */
 export const DIRECTORY_FUNCTION = 'silentsumFindUser';
 export const PEER_EMAIL_FUNCTION = 'silentsumPeerEmail';
 
-function toDirectoryError(error: unknown): DirectoryError {
+function toDirectoryError(error: unknown, signedIn: boolean): DirectoryError {
   if (error instanceof DirectoryError) return error;
   if (!(error instanceof CallableError)) return new DirectoryError('unavailable');
   switch (error.code) {
     case 'unauthenticated':
-      return new DirectoryError('unauthenticated');
+      // The server sends the same refusal for "no ID token" and "no App Check token", because it
+      // saw neither. Only this side knows which, and telling a signed-in user to sign in is the
+      // one answer that is certainly wrong. Same split as `FirebaseBillingService`.
+      return new DirectoryError(signedIn ? 'attestation' : 'unauthenticated');
     case 'permission-denied':
       return new DirectoryError('pro-required');
     case 'resource-exhausted':
@@ -30,7 +34,11 @@ function toDirectoryError(error: unknown): DirectoryError {
 }
 
 export class FirebaseDirectory implements Directory {
-  constructor(private readonly callable: CallableInvoker) {}
+  constructor(
+    private readonly callable: CallableInvoker,
+    /** Reads through to the backend each time, because signing out must change the answer. */
+    private readonly currentUser: () => CloudUser | null,
+  ) {}
 
   async findByEmail(email: string): Promise<string | null> {
     try {
@@ -41,7 +49,7 @@ export class FirebaseDirectory implements Directory {
       if (result.found !== true || typeof result.uid !== 'string' || result.uid === '') return null;
       return result.uid;
     } catch (error) {
-      throw toDirectoryError(error);
+      throw toDirectoryError(error, this.currentUser() !== null);
     }
   }
 

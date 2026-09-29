@@ -25,6 +25,7 @@ function message(id: string, from: string, createdAt: number): DecryptedMessage 
     kind: null,
     object: null,
     thumbObject: null,
+    deleted: false,
   };
 }
 

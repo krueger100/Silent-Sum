@@ -16,6 +16,7 @@ import {
 
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
 import { Button } from '@/components/Button';
+import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
 
 export interface ConfirmDialogProps {
   visible: boolean;
@@ -53,9 +54,7 @@ export function ConfirmDialog({
   const styles = useStyles(makeStyles);
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
-      {/* `padding` on Android too: edge-to-edge stops the window resizing, so relying on
-          `adjustResize` leaves the typed-confirmation field under the keyboard. */}
-      <KeyboardAvoidingView style={styles.backdrop} behavior="padding">
+      <KeyboardAvoidingView style={styles.backdrop} behavior={KEYBOARD_BEHAVIOR}>
         <View style={styles.card} testID={testID}>
           <Text style={styles.title}>{title}</Text>
           <Text style={styles.message}>{message}</Text>

@@ -15,6 +15,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   FlatList,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   StyleSheet,
@@ -27,6 +28,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, typography, useStyles, useTheme, type Palette } from '@/app/theme';
 import { Button } from '@/components/Button';
+import { ConfirmDialog } from '@/components/Dialog';
+import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
 import { Paragraph, Screen } from '@/components/Screen';
 import { looksLikeEmail } from '@/messaging/messaging';
 import {
@@ -71,6 +74,9 @@ export function ConversationsScreen({
   const [state, setState] = useState<MessagingState>(EMPTY_MESSAGING_STATE);
   const [composing, setComposing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** The conversation awaiting a delete confirmation, or null. */
+  const [deleting, setDeleting] = useState<ConversationView | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   useEffect(() => {
     const stop = messaging.watch(setState, () => {
@@ -164,7 +170,12 @@ export function ConversationsScreen({
             contentContainerStyle={styles.listContent}
             ItemSeparatorComponent={Separator}
             renderItem={({ item }) => (
-              <ConversationRow conversation={item} now={now} onOpen={open} />
+              <ConversationRow
+                conversation={item}
+                now={now}
+                onOpen={open}
+                onLongPress={setDeleting}
+              />
             )}
           />
         )}
@@ -197,6 +208,44 @@ export function ConversationsScreen({
         }}
         onStarted={started}
       />
+      {/*
+        A confirmation, not a menu row. This is the one action in messaging that destroys the
+        other person's copy as well, and unlike a withdrawn message it leaves them no placeholder
+        to explain where the thread went -- so it is worth one deliberate tap.
+      */}
+      <ConfirmDialog
+        testID="messages_delete_confirm"
+        visible={deleting !== null}
+        destructive
+        busy={deleteBusy}
+        title="Delete this conversation?"
+        message={
+          deleting === null
+            ? ''
+            : `Every message with ${nameFor(deleting)}, and anything sent in it, is deleted for ` +
+              'both of you. This cannot be undone, and they are not told.'
+        }
+        confirmLabel="Delete for both"
+        onCancel={() => {
+          setDeleting(null);
+        }}
+        onConfirm={() => {
+          const target = deleting;
+          if (target === null) return;
+          setDeleteBusy(true);
+          void (async () => {
+            try {
+              await messaging.deleteConversation(target.id);
+              setDeleting(null);
+            } catch (caught) {
+              setError(describeError(caught));
+              setDeleting(null);
+            } finally {
+              setDeleteBusy(false);
+            }
+          })();
+        }}
+      />
     </Screen>
   );
 }
@@ -210,9 +259,15 @@ interface ConversationRowProps {
   readonly conversation: ConversationView;
   readonly now: number;
   readonly onOpen: (conversationId: string) => void;
+  readonly onLongPress: (conversation: ConversationView) => void;
 }
 
-function ConversationRow({ conversation, now, onOpen }: ConversationRowProps): React.JSX.Element {
+function ConversationRow({
+  conversation,
+  now,
+  onOpen,
+  onLongPress,
+}: ConversationRowProps): React.JSX.Element {
   const styles = useStyles(createStyles);
   const name = nameFor(conversation);
   const unread = conversation.unread > 0;
@@ -228,6 +283,11 @@ function ConversationRow({ conversation, now, onOpen }: ConversationRowProps): R
       onPress={() => {
         onOpen(conversation.id);
       }}
+      // Hold to reach the destructive action; a tap opens the thread, as it always did.
+      onLongPress={() => {
+        onLongPress(conversation);
+      }}
+      delayLongPress={350}
       style={({ pressed }) => [styles.row, pressed ? styles.pressed : null]}
     >
       <Avatar seed={conversation.peerUid} name={name} size={AVATAR_SIZE} />
@@ -303,46 +363,56 @@ function NewConversationSheet({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
-      <Pressable style={styles.backdrop} accessibilityLabel="Close" onPress={close} />
-      <View style={[styles.sheet, { paddingBottom: insets.bottom + spacing.lg }]}>
-        <View style={styles.grabber} />
-        <Text style={styles.sheetTitle}>New conversation</Text>
-        <TextInput
-          testID="messages_email"
-          style={styles.input}
-          value={email}
-          onChangeText={setEmail}
-          autoCapitalize="none"
-          autoCorrect={false}
-          autoFocus
-          keyboardType="email-address"
-          editable={!busy}
-          placeholder="their@email.address"
-          placeholderTextColor={theme.textMuted}
-          onSubmitEditing={() => {
-            if (!busy && looksLikeEmail(email)) void start();
-          }}
-        />
-        <Paragraph>
-          They need a SilentSum account with the same address, and must have opened Messages once
-          so their key is published.
-        </Paragraph>
-        {error === null ? null : (
-          <Text testID="messages_error" style={styles.error}>
-            {error}
-          </Text>
-        )}
-        <Button
-          testID="messages_start"
-          label="Start conversation"
-          onPress={() => {
-            void start();
-          }}
-          busy={busy}
-          disabled={busy || !looksLikeEmail(email)}
-        />
-        <Button testID="messages_cancel" label="Cancel" variant="ghost" onPress={close} />
-      </View>
+      {/* The sheet is docked to the bottom and its only field autoFocuses, so the keyboard opens
+          directly over the thing being typed into. The backdrop above it is the flexing child, so
+          the padding this adds is surrendered by the backdrop and the sheet rises by exactly the
+          keyboard's height. */}
+      <KeyboardAvoidingView
+        testID="messages_sheet_keyboard_avoider"
+        style={styles.avoider}
+        behavior={KEYBOARD_BEHAVIOR}
+      >
+        <Pressable style={styles.backdrop} accessibilityLabel="Close" onPress={close} />
+        <View style={[styles.sheet, { paddingBottom: insets.bottom + spacing.lg }]}>
+          <View style={styles.grabber} />
+          <Text style={styles.sheetTitle}>New conversation</Text>
+          <TextInput
+            testID="messages_email"
+            style={styles.input}
+            value={email}
+            onChangeText={setEmail}
+            autoCapitalize="none"
+            autoCorrect={false}
+            autoFocus
+            keyboardType="email-address"
+            editable={!busy}
+            placeholder="their@email.address"
+            placeholderTextColor={theme.textMuted}
+            onSubmitEditing={() => {
+              if (!busy && looksLikeEmail(email)) void start();
+            }}
+          />
+          <Paragraph>
+            They need a SilentSum account with the same address, and must have opened Messages once
+            so their key is published.
+          </Paragraph>
+          {error === null ? null : (
+            <Text testID="messages_error" style={styles.error}>
+              {error}
+            </Text>
+          )}
+          <Button
+            testID="messages_start"
+            label="Start conversation"
+            onPress={() => {
+              void start();
+            }}
+            busy={busy}
+            disabled={busy || !looksLikeEmail(email)}
+          />
+          <Button testID="messages_cancel" label="Cancel" variant="ghost" onPress={close} />
+        </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -438,6 +508,8 @@ function createStyles(palette: Palette) {
       fontWeight: '300',
     },
 
+    /** Fills the modal so the backdrop below has somewhere to give height back from. */
+    avoider: { flex: 1 },
     backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)' },
     sheet: {
       backgroundColor: palette.surface,

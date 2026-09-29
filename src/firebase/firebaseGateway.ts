@@ -20,6 +20,7 @@ import { FirebaseAnalytics, type AnalyticsParams, type AnalyticsPort } from '@/f
 import { CallableClient, type CallableTokens } from '@/firebase/callableClient';
 import { FirebaseCrashReporter, type CrashlyticsPort } from '@/firebase/crashReporter';
 import { FirebaseBillingService } from '@/firebase/firebaseBillingService';
+import { FirebaseConversationAdmin } from '@/firebase/firebaseConversationAdmin';
 import { FirebaseDirectory } from '@/firebase/firebaseDirectory';
 import {
   FirebaseCloudBackend,
@@ -306,7 +307,18 @@ export async function initializeFirebase(
           : new FirebaseBillingService(callable, () => backend.currentUser),
       // Messaging needs the same callable for its one lookup. It rides on the billing switch
       // because both are Pro features of the same deployment.
-      directory: sellable && callable !== null ? new FirebaseDirectory(callable) : null,
+      directory:
+        sellable && callable !== null
+          ? new FirebaseDirectory(callable, () => (backend === null ? null : backend.currentUser))
+          : null,
+      // Ending a conversation rides the same callable client. Not gated on `sellable`: a lapsed
+      // account must still be able to delete a thread it can no longer write to.
+      conversationAdmin:
+        callable === null
+          ? null
+          : new FirebaseConversationAdmin(callable, () =>
+              backend === null ? null : backend.currentUser,
+            ),
     };
   } catch (error) {
     note(`Firebase initialisation failed, continuing offline: ${String(error)}`);

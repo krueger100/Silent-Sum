@@ -16,7 +16,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   FlatList,
   KeyboardAvoidingView,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -27,13 +26,16 @@ import {
 import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, typography, useStyles, useTheme, type Palette } from '@/app/theme';
 import { Button } from '@/components/Button';
+import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
 import { Screen } from '@/components/Screen';
 import {
+  DELETED_MESSAGE_TEXT,
   MAX_MESSAGE_LENGTH,
   describeMessageProblem,
   type DecryptedMessage,
   type MessageProblem,
 } from '@/messaging/messaging';
+import { MessageActionsSheet } from '@/messaging/screens/MessageActionsSheet';
 import {
   MessagingError,
   describeMessagingError,
@@ -76,6 +78,12 @@ function describeSendError(error: unknown): string {
     return describeMessagingError(error.code);
   }
   return 'That message could not be sent. Try again.';
+}
+
+/** Its own describer: the send fallback says "could not be sent", which is untrue of a deletion. */
+function describeDeleteError(error: unknown): string {
+  if (error instanceof MessagingError) return describeMessagingError(error.code);
+  return 'That message could not be deleted. Try again.';
 }
 
 function isMessageProblem(problem: unknown): problem is MessageProblem {
@@ -130,6 +138,8 @@ export function ConversationScreen({
   const [pickingVault, setPickingVault] = useState(false);
   const [noticeSeen, setNoticeSeen] = useState(false);
   const [viewing, setViewing] = useState<ViewerItem | null>(null);
+  /** The message whose action sheet is open, or null. */
+  const [actionsFor, setActionsFor] = useState<DecryptedMessage | null>(null);
   /** The scratch file behind an open video, so closing can release it. */
   const viewerScratch = useRef<string | null>(null);
   const notice = useMemo(() => new VaultSendNotice(services.secureStore), [services]);
@@ -349,8 +359,9 @@ export function ConversationScreen({
       }
     >
       <KeyboardAvoidingView
+        testID="conversation_keyboard_avoider"
         style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={KEYBOARD_BEHAVIOR}
       >
         {state === null || state.problem === null ? null : (
           <View style={styles.banner} testID="conversation_problem">
@@ -388,13 +399,14 @@ export function ConversationScreen({
             contentContainerStyle={styles.listContent}
             renderItem={({ item }) => (
               <ChatRow
-              item={item}
-              now={now}
-              peerName={state?.label ?? null}
-              media={media}
-              onOpenMedia={openMedia}
-              onSaveToVault={saveToVault}
-            />
+                item={item}
+                now={now}
+                peerName={state?.label ?? null}
+                media={media}
+                onOpenMedia={openMedia}
+                onSaveToVault={saveToVault}
+                onLongPress={setActionsFor}
+              />
             )}
           />
         )}
@@ -555,6 +567,39 @@ export function ConversationScreen({
           void onAttach(source);
         }}
       />
+      <MessageActionsSheet
+        visible={actionsFor !== null}
+        // Your own message, and only while it still has something in it. The server checks both
+        // again; this only decides whether the row is worth offering.
+        canDeleteForEveryone={actionsFor !== null && actionsFor.mine && !actionsFor.deleted}
+        onClose={() => {
+          setActionsFor(null);
+        }}
+        onDeleteForMe={() => {
+          const target = actionsFor;
+          setActionsFor(null);
+          if (target === null) return;
+          void (async () => {
+            try {
+              await messaging.deleteForMe(conversationId, target.id);
+            } catch (caught) {
+              setError(describeDeleteError(caught));
+            }
+          })();
+        }}
+        onDeleteForEveryone={() => {
+          const target = actionsFor;
+          setActionsFor(null);
+          if (target === null) return;
+          void (async () => {
+            try {
+              await messaging.deleteForEveryone(conversationId, target);
+            } catch (caught) {
+              setError(describeDeleteError(caught));
+            }
+          })();
+        }}
+      />
     </Screen>
   );
 }
@@ -566,6 +611,7 @@ interface ChatRowProps {
   readonly media: ChatMedia;
   readonly onOpenMedia: (message: DecryptedMessage) => void;
   readonly onSaveToVault: (message: DecryptedMessage) => void;
+  readonly onLongPress: (message: DecryptedMessage) => void;
 }
 
 function ChatRow({
@@ -575,6 +621,7 @@ function ChatRow({
   media,
   onOpenMedia,
   onSaveToVault,
+  onLongPress,
 }: ChatRowProps): React.JSX.Element {
   const styles = useStyles(createStyles);
   if (item.kind === 'day') {
@@ -591,6 +638,7 @@ function ChatRow({
       media={media}
       onOpenMedia={onOpenMedia}
       onSaveToVault={onSaveToVault}
+      onLongPress={onLongPress}
     />
   );
 }
@@ -601,12 +649,14 @@ function Bubble({
   media,
   onOpenMedia,
   onSaveToVault,
+  onLongPress,
 }: {
   readonly item: MessageItem;
   readonly peerName: string | null;
   readonly media: ChatMedia;
   readonly onOpenMedia: (message: DecryptedMessage) => void;
   readonly onSaveToVault: (message: DecryptedMessage) => void;
+  readonly onLongPress: (message: DecryptedMessage) => void;
 }): React.JSX.Element {
   const styles = useStyles(createStyles);
   const { message, firstOfGroup, lastOfGroup } = item;
@@ -616,11 +666,15 @@ function Bubble({
   // words, and the group tails that make a run of texts read as one are wrong for a photo.
   if (message.kind !== null) {
     return (
-      <View
+      <Pressable
         testID={'conversation_message_' + message.id}
         accessibilityLabel={`${mine ? 'You' : (peerName ?? 'Them')}: ${
           message.kind === 'video' ? 'video' : 'photo'
         }`}
+        onLongPress={() => {
+          onLongPress(message);
+        }}
+        delayLongPress={350}
         style={[styles.mediaRow, mine ? styles.mediaMine : styles.mediaTheirs]}
       >
         <MediaBubble
@@ -642,16 +696,24 @@ function Bubble({
         <Text style={[styles.time, mine ? styles.mineTime : null]}>
           {clockLabel(message.createdAt)}
         </Text>
-      </View>
+      </Pressable>
     );
   }
 
   return (
-    <View
+    <Pressable
       testID={'conversation_message_' + message.id}
       accessibilityLabel={
-        (mine ? 'You' : (peerName ?? 'Them')) + ': ' + (message.body ?? 'Could not be opened')
+        (mine ? 'You' : (peerName ?? 'Them')) +
+        ': ' +
+        (message.deleted ? DELETED_MESSAGE_TEXT : (message.body ?? 'Could not be opened'))
       }
+      // Hold, not tap: a bubble has no tap action, and a tap that opened a destructive menu would
+      // be reachable by a mis-scroll.
+      onLongPress={() => {
+        onLongPress(message);
+      }}
+      delayLongPress={350}
       style={[
         styles.bubble,
         mine ? styles.mine : styles.theirs,
@@ -659,7 +721,16 @@ function Bubble({
         lastOfGroup ? (mine ? styles.mineTail : styles.theirsTail) : null,
       ]}
     >
-      {message.body === null ? (
+      {message.deleted ? (
+        // Distinct from "could not be opened": that one means this device lacks the key and the
+        // message still exists, this one means there is nothing left anywhere to read.
+        <Text
+          style={[styles.deleted, mine ? styles.mineText : null]}
+          testID={'conversation_deleted_' + message.id}
+        >
+          {DELETED_MESSAGE_TEXT}
+        </Text>
+      ) : message.body === null ? (
         <Text
           style={[styles.unreadable, mine ? styles.mineText : null]}
           testID={'conversation_sealed_' + message.id}
@@ -674,7 +745,7 @@ function Bubble({
           {clockLabel(message.createdAt)}
         </Text>
       ) : null}
-    </View>
+    </Pressable>
   );
 }
 
@@ -754,6 +825,13 @@ function createStyles(palette: Palette) {
     body: { ...typography.body, color: palette.text, lineHeight: 21 },
     mineText: { color: palette.accentText },
     unreadable: {
+      ...typography.body,
+      color: palette.textMuted,
+      fontStyle: 'italic',
+      lineHeight: 21,
+    },
+    /** Same italic muted treatment as an unopenable message: both say "there is nothing here". */
+    deleted: {
       ...typography.body,
       color: palette.textMuted,
       fontStyle: 'italic',

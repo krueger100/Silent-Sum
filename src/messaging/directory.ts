@@ -8,6 +8,14 @@
  */
 export type DirectoryErrorCode =
   | 'unauthenticated'
+  /**
+   * The server refused because this build could not prove it is genuine -- App Check got no
+   * token. Indistinguishable from `unauthenticated` on the wire, because neither case sends one;
+   * the client separates them by whether it holds a signed-in user. Kept apart because telling a
+   * signed-in user to sign in is both wrong and unactionable, and the real remedy (update Play
+   * Store, or install from the store) is something they can actually do.
+   */
+  | 'attestation'
   | 'pro-required'
   | 'rate-limited'
   | 'invalid-email'
@@ -26,6 +34,11 @@ export function describeDirectoryError(code: DirectoryErrorCode): string {
   switch (code) {
     case 'unauthenticated':
       return 'Sign in to your backup account first.';
+    case 'attestation':
+      return (
+        'This device could not prove to the server that the app is genuine. Update Google Play ' +
+        'Store, or install SilentSum from the store, and try again.'
+      );
     case 'pro-required':
       return 'Messaging is a Pro feature.';
     case 'rate-limited':

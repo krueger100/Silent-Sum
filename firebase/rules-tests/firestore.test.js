@@ -469,6 +469,106 @@ describe('messages', () => {
   });
 });
 
+describe('withdrawing a message for everyone', () => {
+  const messagePath = (id) => `conversations/${CONVERSATION}/messages/${id}`;
+
+  /** The only shape the rules accept in place of a message. */
+  function tombstone(from, createdAt, overrides = {}) {
+    return { v: 1, from, createdAt, deletedAt: Date.now(), ...overrides };
+  }
+
+  async function serverWritesMessage(id, from, extra = {}) {
+    let createdAt;
+    await env.withSecurityRulesDisabled(async (context) => {
+      const record = { ...message(from), ...extra };
+      createdAt = record.createdAt;
+      await setDoc(doc(context.firestore(), messagePath(id)), record);
+    });
+    return createdAt;
+  }
+
+  it('lets the sender replace their own message with a tombstone', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(ALICE, true);
+    const createdAt = await serverWritesMessage('d1', ALICE);
+    await assertSucceeds(setDoc(doc(asAlice(), messagePath('d1')), tombstone(ALICE, createdAt)));
+  });
+
+  // The requirement this feature exists to satisfy: the permission check is the server's, and it
+  // reads the STORED sender, so nothing the caller sends can talk its way past it.
+  it('does not let the other member withdraw a message they did not send', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(BOB, true);
+    const createdAt = await serverWritesMessage('d2', ALICE);
+    await assertFails(setDoc(doc(asBob(), messagePath('d2')), tombstone(ALICE, createdAt)));
+    // Nor by claiming the message as their own on the way past.
+    await assertFails(setDoc(doc(asBob(), messagePath('d2')), tombstone(BOB, createdAt)));
+  });
+
+  it('is refused for a stranger and for nobody at all', async () => {
+    await serverCreatesConversation();
+    const createdAt = await serverWritesMessage('d3', ALICE);
+    await assertFails(setDoc(doc(asCarol(), messagePath('d3')), tombstone(ALICE, createdAt)));
+    await assertFails(
+      setDoc(doc(env.unauthenticatedContext().firestore(), messagePath('d3')), tombstone(ALICE, createdAt)),
+    );
+  });
+
+  // The point of the whole design: a "deletion" that leaves the ciphertext in the document would
+  // be a flag, not a deletion. The rules refuse to call that a tombstone.
+  it('refuses a tombstone that keeps the ciphertext or any media pointer', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(ALICE, true);
+    const createdAt = await serverWritesMessage('d4', ALICE);
+    for (const leftover of [
+      { box: 'Y2lwaGVydGV4dA==' },
+      { nonce: 'MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0' },
+      { kind: 'photo' },
+      { object: `messages/${CONVERSATION}/photo/d4` },
+      { thumbObject: `messages/${CONVERSATION}/thumb/d4` },
+      { bytes: 10 },
+    ]) {
+      await assertFails(
+        setDoc(doc(asAlice(), messagePath('d4')), tombstone(ALICE, createdAt, leftover)),
+      );
+    }
+  });
+
+  it('cannot rewrite who sent the message or when', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(ALICE, true);
+    const createdAt = await serverWritesMessage('d5', ALICE);
+    await assertFails(setDoc(doc(asAlice(), messagePath('d5')), tombstone(BOB, createdAt)));
+    await assertFails(setDoc(doc(asAlice(), messagePath('d5')), tombstone(ALICE, createdAt - 60_000)));
+  });
+
+  // Final, so this path can never be used to put content back where a tombstone stands.
+  it('cannot be written over a message already withdrawn', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(ALICE, true);
+    const createdAt = await serverWritesMessage('d6', ALICE);
+    await assertSucceeds(setDoc(doc(asAlice(), messagePath('d6')), tombstone(ALICE, createdAt)));
+    await assertFails(setDoc(doc(asAlice(), messagePath('d6')), tombstone(ALICE, createdAt)));
+    await assertFails(setDoc(doc(asAlice(), messagePath('d6')), message(ALICE)));
+  });
+
+  // Pro buys sending. Taking back something already sent must survive a lapsed subscription.
+  it('still works for a sender whose Pro has lapsed', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(ALICE, false);
+    const createdAt = await serverWritesMessage('d7', ALICE);
+    await assertSucceeds(setDoc(doc(asAlice(), messagePath('d7')), tombstone(ALICE, createdAt)));
+  });
+
+  it('still refuses a hard delete, so the placeholder cannot be skipped', async () => {
+    await serverCreatesConversation();
+    await serverWritesPro(ALICE, true);
+    await serverWritesMessage('d8', ALICE);
+    await assertFails(deleteDoc(doc(asAlice(), messagePath('d8'))));
+    await assertFails(deleteDoc(doc(asBob(), messagePath('d8'))));
+  });
+});
+
 describe('media messages', () => {
   const messagePath = (id) => `conversations/${CONVERSATION}/messages/${id}`;
 

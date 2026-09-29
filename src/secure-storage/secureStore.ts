@@ -39,6 +39,11 @@ export const SECURE_STORE_KEYS = {
   /** Fingerprints of recovery codes already spent, so single use survives a restart. */
   spentRecoveryCodes: 'silentsum.recovery.spent.v1',
   /**
+   * Messages hidden on this device only ("delete for me"). Never uploaded: see
+   * `@/messaging/hiddenMessages` for why this is not a server record.
+   */
+  hiddenMessages: 'silentsum.messaging.hidden.v1',
+  /**
    * A mirror of the account's entitlement document (`users/<uid>/billing/entitlements`), so Pro
    * features keep working with no network. Never a source of truth: the server never reads it
    * and the rules never trust it. Erased with the vault; signing in again restores it.
