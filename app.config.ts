@@ -261,6 +261,9 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // `keystore.properties` in the project root, or the environment, at BUILD time -- never from
     // here, and never from anything committed. See docs/building.md.
     './plugins/withReleaseSigning',
+    // Stops a release App Bundle being built with the debug App Check provider. Version 3 shipped
+    // that way and every callable was refused on every real device.
+    './plugins/withAppCheckEnvGuard',
     // Undoes Play's assumption that requesting CAMERA means the app needs one. Without it the
     // listing is filtered off every device without a rear autofocus camera.
     './plugins/withOptionalCamera',

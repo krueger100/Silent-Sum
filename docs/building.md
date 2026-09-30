@@ -74,6 +74,18 @@ After the first install, `npm run start:dev-client` is enough for JavaScript cha
 nothing about the local vault. Copy `.env.example` to `.env` to set it and the optional Firebase
 paths; every variable has a working default and none is required.
 
+It also picks the **App Check provider**, which is the part that bites. `firebaseGateway.ts` reads
+it and configures `playIntegrity` for `prod` and `debug` for anything else — and the default when
+the variable is unset is `dev`. A debug-provider build on a real device mints an App Check token
+nobody has registered, so every callable is refused: messaging, the directory and billing all fail
+for every user, while Firestore reads keep working and make it look like an app bug rather than a
+build one. Version 3 shipped to closed testing exactly this way.
+
+Nothing warns you at build time, at upload time, or on first launch. So `plugins/withAppCheckEnvGuard.js`
+makes `:app:bundleRelease` **fail** unless `SILENTSUM_ENV=prod`. `assembleRelease` is deliberately
+left alone: a dev-environment release APK is how this project tests on an emulator, where Play
+Integrity cannot attest at all.
+
 `SUPPORT_ENDPOINT`, `SUPPORT_FROM` and `SUPPORT_TO` turn on the customer service screen; with any of
 them empty the screen says support is not set up in this build.
 
@@ -97,8 +109,23 @@ npx expo run:android --variant release
 or, from `android/`, `./gradlew assembleRelease`. Release builds are R8-minified with resource
 shrinking, configured through the `expo-build-properties` plugin.
 
-For Play, build an app bundle instead: `./gradlew bundleRelease`, which writes
-`android/app/build/outputs/bundle/release/app-release.aab`.
+For Play, build an app bundle instead — **with `SILENTSUM_ENV=prod`**, or the build is refused:
+
+```bash
+SILENTSUM_ENV=prod ./gradlew bundleRelease
+```
+
+which writes `android/app/build/outputs/bundle/release/app-release.aab`. The variable is not
+optional here and the plain `./gradlew bundleRelease` this file used to give is what put a
+debug-App-Check build on Play as version 3; see **Environments** above for why, and
+`plugins/withAppCheckEnvGuard.js` for the guard that now stops it.
+
+Gradle does not treat `SILENTSUM_ENV` as a task input, so a tree whose last build was the other
+environment can hand you a **stale JS bundle** that ignores the variable entirely. Before an upload
+build, delete `android/app/build/generated/assets/react/release` and
+`android/app/build/intermediates/assets/release/mergeReleaseAssets`, then check the artifact really
+carries what you asked for — `base/assets/app.config` inside the `.aab` is plain JSON and states
+`silentsumEnv` outright.
 
 ### Signing
 
