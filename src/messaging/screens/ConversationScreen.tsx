@@ -15,7 +15,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
-  KeyboardAvoidingView,
   Pressable,
   StyleSheet,
   Text,
@@ -26,7 +25,7 @@ import {
 import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, typography, useStyles, useTheme, type Palette } from '@/app/theme';
 import { Button } from '@/components/Button';
-import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
+import { KeyboardAvoider } from '@/components/keyboardAvoidance';
 import { Screen } from '@/components/Screen';
 import {
   DELETED_MESSAGE_TEXT,
@@ -358,11 +357,7 @@ export function ConversationScreen({
         state === null ? null : <Avatar seed={state.peerUid} name={title} size={32} />
       }
     >
-      <KeyboardAvoidingView
-        testID="conversation_keyboard_avoider"
-        style={styles.flex}
-        behavior={KEYBOARD_BEHAVIOR}
-      >
+      <KeyboardAvoider testID="conversation_keyboard_avoider" style={styles.flex}>
         {state === null || state.problem === null ? null : (
           <View style={styles.banner} testID="conversation_problem">
             <Text style={styles.bannerText}>{describeMessagingError(state.problem)}</Text>
@@ -533,7 +528,7 @@ export function ConversationScreen({
             ) : null}
           </View>
         )}
-      </KeyboardAvoidingView>
+      </KeyboardAvoider>
       <MediaViewer item={viewing} onClose={closeViewer} />
       <CameraSheet
         visible={capturing}

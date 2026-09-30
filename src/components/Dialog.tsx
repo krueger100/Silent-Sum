@@ -6,7 +6,6 @@
  */
 import React, { useState, type ReactNode } from 'react';
 import {
-  KeyboardAvoidingView,
   Modal,
   StyleSheet,
   Text,
@@ -16,7 +15,7 @@ import {
 
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
 import { Button } from '@/components/Button';
-import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
+import { KeyboardAvoider } from '@/components/keyboardAvoidance';
 
 export interface ConfirmDialogProps {
   visible: boolean;
@@ -54,7 +53,7 @@ export function ConfirmDialog({
   const styles = useStyles(makeStyles);
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
-      <KeyboardAvoidingView style={styles.backdrop} behavior={KEYBOARD_BEHAVIOR}>
+      <KeyboardAvoider style={styles.backdrop}>
         <View style={styles.card} testID={testID}>
           <Text style={styles.title}>{title}</Text>
           <Text style={styles.message}>{message}</Text>
@@ -79,7 +78,7 @@ export function ConfirmDialog({
             />
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </KeyboardAvoider>
     </Modal>
   );
 }

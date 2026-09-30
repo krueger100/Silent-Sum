@@ -15,7 +15,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   FlatList,
-  KeyboardAvoidingView,
   Modal,
   Pressable,
   StyleSheet,
@@ -29,7 +28,7 @@ import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, typography, useStyles, useTheme, type Palette } from '@/app/theme';
 import { Button } from '@/components/Button';
 import { ConfirmDialog } from '@/components/Dialog';
-import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
+import { KeyboardAvoider } from '@/components/keyboardAvoidance';
 import { Paragraph, Screen } from '@/components/Screen';
 import { looksLikeEmail } from '@/messaging/messaging';
 import {
@@ -367,11 +366,7 @@ function NewConversationSheet({
           directly over the thing being typed into. The backdrop above it is the flexing child, so
           the padding this adds is surrendered by the backdrop and the sheet rises by exactly the
           keyboard's height. */}
-      <KeyboardAvoidingView
-        testID="messages_sheet_keyboard_avoider"
-        style={styles.avoider}
-        behavior={KEYBOARD_BEHAVIOR}
-      >
+      <KeyboardAvoider testID="messages_sheet_keyboard_avoider" style={styles.avoider}>
         <Pressable style={styles.backdrop} accessibilityLabel="Close" onPress={close} />
         <View style={[styles.sheet, { paddingBottom: insets.bottom + spacing.lg }]}>
           <View style={styles.grabber} />
@@ -412,7 +407,7 @@ function NewConversationSheet({
           />
           <Button testID="messages_cancel" label="Cancel" variant="ghost" onPress={close} />
         </View>
-      </KeyboardAvoidingView>
+      </KeyboardAvoider>
     </Modal>
   );
 }

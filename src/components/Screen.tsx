@@ -1,10 +1,10 @@
 /** Page chrome: safe area, background, an optional title row with a back affordance. */
 import React, { type ReactNode } from 'react';
-import { KeyboardAvoidingView, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { spacing, type Palette, typography, useStyles } from '@/app/theme';
-import { KEYBOARD_BEHAVIOR } from '@/components/keyboardAvoidance';
+import { KeyboardAvoider } from '@/components/keyboardAvoidance';
 
 export interface ScreenProps {
   title?: string;
@@ -41,11 +41,7 @@ export function Screen({
    * reflow the whole page.
    */
   const body = scroll ? (
-    <KeyboardAvoidingView
-      testID="screen-keyboard-avoider"
-      behavior={KEYBOARD_BEHAVIOR}
-      style={styles.flex}
-    >
+    <KeyboardAvoider testID="screen-keyboard-avoider" style={styles.flex}>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
@@ -53,7 +49,7 @@ export function Screen({
       >
         {children}
       </ScrollView>
-    </KeyboardAvoidingView>
+    </KeyboardAvoider>
   ) : (
     <View style={styles.flex}>{children}</View>
   );
