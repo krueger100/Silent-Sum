@@ -26,6 +26,8 @@ module.exports = {
     '^react-native-libsodium$': '<rootDir>/test/shims/react-native-libsodium.ts',
     // expo-video touches its native view at import time, so importing it at all fails under Jest.
     '^expo-video$': '<rootDir>/test/shims/expo-video.tsx',
+    // Same story: expo-media-library subclasses native classes at import time.
+    '^expo-media-library$': '<rootDir>/test/shims/expo-media-library.ts',
   },
   transformIgnorePatterns,
   collectCoverageFrom: ['src/**/*.{ts,tsx}', '!src/**/*.d.ts', '!src/**/index.ts'],

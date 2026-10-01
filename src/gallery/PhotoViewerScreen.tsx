@@ -44,10 +44,36 @@ import {
   formatSource,
   formatTaken,
 } from '@/gallery/photoDetails';
+import {
+  exportToGallery,
+  type GalleryExportOutcome,
+} from '@/gallery/galleryExport';
 import { openRepository } from '@/gallery/vaultAccess';
 import { VideoSurface } from '@/gallery/VideoSurface';
 import { formatDuration, isVideo } from '@/vault/mediaKind';
 import type { PhotoEntry, VaultRepository } from '@/vault/types';
+
+/**
+ * An export is the one action here that makes a copy nobody can take back, so each outcome says
+ * plainly what happened to the plaintext. "Nothing left the vault" is the part that matters on the
+ * two unhappy paths: a failed export must never read as a silent success.
+ */
+const SAVE_RESULT: Record<GalleryExportOutcome, { title: string; message: string }> = {
+  saved: {
+    title: 'Saved to gallery',
+    message:
+      'A decrypted copy is now in your gallery, where other apps can see it. The vault still holds its own encrypted copy.',
+  },
+  denied: {
+    title: 'Permission needed',
+    message:
+      'SilentSum was not allowed to add to your gallery. Nothing left the vault.',
+  },
+  failed: {
+    title: 'Could not save',
+    message: 'The item could not be written to your gallery. Nothing left the vault.',
+  },
+};
 
 export interface PhotoViewerScreenProps {
   /** Preferred: survives the list shifting under the viewer. */
@@ -85,6 +111,9 @@ export function PhotoViewerScreen({
   );
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingSave, setConfirmingSave] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveOutcome, setSaveOutcome] = useState<GalleryExportOutcome | null>(null);
 
   const mounted = useRef(true);
   useEffect(() => {
@@ -107,6 +136,26 @@ export function PhotoViewerScreen({
     },
     [count, width],
   );
+
+  const confirmSave = useCallback(() => {
+    const target = openRepository(services);
+    if (current === undefined || target === null) return;
+    setSaving(true);
+    void (async () => {
+      const outcome = await exportToGallery(current, {
+        repository: target,
+        scratch: services.playbackScratch,
+        fs: services.fs,
+        writer: services.galleryWriter,
+      });
+      // The viewer can be closed while the OS prompt is up; `exportToGallery` has already
+      // released the plaintext by now either way, so there is nothing to clean up here.
+      if (!mounted.current) return;
+      setSaving(false);
+      setConfirmingSave(false);
+      setSaveOutcome(outcome);
+    })();
+  }, [current, services]);
 
   const confirmDelete = useCallback(() => {
     setConfirmingDelete(false);
@@ -145,6 +194,18 @@ export function PhotoViewerScreen({
       {...(onClose ? { onBack: onClose } : {})}
       actions={
         <>
+          <Pressable
+            testID="viewer-save"
+            accessibilityRole="button"
+            accessibilityLabel="Save to gallery"
+            onPress={() => {
+              setConfirmingSave(true);
+            }}
+            hitSlop={10}
+            style={styles.headerAction}
+          >
+            <Text style={styles.headerActionLabel}>Save</Text>
+          </Pressable>
           <Pressable
             testID="viewer-details"
             accessibilityRole="button"
@@ -203,6 +264,37 @@ export function PhotoViewerScreen({
           }}
         />
       ) : null}
+
+      <ConfirmDialog
+        testID="viewer-save-confirm"
+        visible={confirmingSave}
+        title={currentIsVideo ? 'Save video to gallery?' : 'Save photo to gallery?'}
+        message={
+          (currentIsVideo ? 'A decrypted copy of this video' : 'A decrypted copy of this photo') +
+          " is added to your phone's gallery, where other apps can see it. It is no longer protected by your PIN."
+        }
+        confirmLabel="Save"
+        busy={saving}
+        onConfirm={confirmSave}
+        onCancel={() => {
+          setConfirmingSave(false);
+        }}
+      />
+
+      <ConfirmDialog
+        testID="viewer-save-result"
+        visible={saveOutcome !== null}
+        title={SAVE_RESULT[saveOutcome ?? 'failed'].title}
+        message={SAVE_RESULT[saveOutcome ?? 'failed'].message}
+        confirmLabel="OK"
+        hideCancel
+        onConfirm={() => {
+          setSaveOutcome(null);
+        }}
+        onCancel={() => {
+          setSaveOutcome(null);
+        }}
+      />
 
       <ConfirmDialog
         testID="viewer-delete-confirm"

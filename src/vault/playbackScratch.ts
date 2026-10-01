@@ -53,10 +53,41 @@ export class PlaybackScratch {
     return uri;
   }
 
+  /**
+   * A fresh path whose FILE NAME is exactly `fileName`.
+   *
+   * For the one case where the name outlives the file: a gallery export takes its display name
+   * from the file handed to MediaStore, so a random name here would put a 32-character hex string
+   * in the user's gallery. Uniqueness comes from a random DIRECTORY instead, which keeps the
+   * guarantee `allocate` makes -- two exports never collide -- without choosing the name.
+   *
+   * The directory listing does reveal this name, where `allocate` reveals nothing. That is the
+   * deliberate trade: the same name is about to be written to the gallery, where it is permanent
+   * and visible to every app, so hiding it in app-private cache for the few hundred milliseconds
+   * in between would protect nothing.
+   */
+  async allocateNamed(fileName: string): Promise<string> {
+    const directory = joinUri(this.directory, this.random.hexId());
+    await this.fs.makeDirectory(directory);
+    const uri = joinUri(directory, fileName);
+    this.live.add(uri);
+    return uri;
+  }
+
   /** Playback finished, the page unmounted, or the decrypt failed. Idempotent. */
   async release(uri: string): Promise<void> {
     this.live.delete(uri);
     await this.secureDelete.file(uri);
+    // `allocateNamed` puts its file in a directory of its own; drop that too, so the scratch
+    // directory does not fill with empty husks between purges.
+    const parent = uri.slice(0, Math.max(0, uri.lastIndexOf('/')));
+    if (parent !== '' && parent !== this.directory && parent.startsWith(`${this.directory}/`)) {
+      try {
+        await this.fs.deleteDirectory(parent);
+      } catch {
+        // Not ours to insist on; `purge()` wipes the whole tree anyway.
+      }
+    }
   }
 
   /** Everything in the directory, including files a previous process never got to release. */

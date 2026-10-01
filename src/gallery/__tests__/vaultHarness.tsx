@@ -88,8 +88,9 @@ export function buildServices(
 export async function unlockedVault(
   thumbnails: ThumbnailGenerator = new MarkedThumbnailGenerator(),
   captureInspector: CaptureInspector = new AcceptingCaptureInspector(),
+  overrides: ServiceOverrides = {},
 ): Promise<VaultHarness> {
-  const { services, fs } = buildServices(thumbnails, captureInspector);
+  const { services, fs } = buildServices(thumbnails, captureInspector, overrides);
   const keys = await services.auth.setupPin('1234');
   services.session.adopt(keys);
   const repository = await services.vault.open(keys);

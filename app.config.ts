@@ -140,8 +140,15 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     predictiveBackGestureEnabled: false,
     blockedPermissions: [
       'android.permission.RECORD_AUDIO',
+      // The READ side of the media library stays blocked. Saving an item to the gallery adds
+      // one file and never reads the library back, so the app has no business holding the
+      // permissions that would let it enumerate the user's photos.
+      //
+      // `WRITE_EXTERNAL_STORAGE` is deliberately NOT in this list -- it is the one permission
+      // gallery export needs, expo-media-library's own manifest caps it at
+      // `maxSdkVersion="32"`, and on Android 13+ the export needs no permission at all
+      // because MediaStore does not ask for one. See `plugins/withMediaLibraryWriteOnly.js`.
       'android.permission.READ_EXTERNAL_STORAGE',
-      'android.permission.WRITE_EXTERNAL_STORAGE',
       'android.permission.READ_MEDIA_IMAGES',
       'android.permission.READ_MEDIA_VIDEO',
       'android.permission.READ_MEDIA_VISUAL_USER_SELECTED',
@@ -264,6 +271,9 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // Stops a release App Bundle being built with the debug App Check provider. Version 3 shipped
     // that way and every callable was refused on every real device.
     './plugins/withAppCheckEnvGuard',
+    // Gallery export, without expo-media-library's own plugin and the read-the-whole-library
+    // permission set that comes with it.
+    './plugins/withMediaLibraryWriteOnly',
     // Undoes Play's assumption that requesting CAMERA means the app needs one. Without it the
     // listing is filtered off every device without a rear autofocus camera.
     './plugins/withOptionalCamera',

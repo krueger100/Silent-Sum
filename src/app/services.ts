@@ -46,6 +46,8 @@ import { FileSettingsStore } from '@/settings/fileSettingsStore';
 import { ExpoFileSystem } from '@/storage/expoFileSystem';
 import type { FileSystem } from '@/storage/fileSystem';
 import { SecureDelete } from '@/storage/secureDelete';
+import type { GalleryWriter } from '@/gallery/galleryExport';
+import { deviceGalleryWriter } from '@/gallery/mediaLibrary';
 import { PlaybackScratch } from '@/vault/playbackScratch';
 import { ExpoThumbnailGenerator } from '@/vault/thumbnailGenerator';
 import { ExpoVideoThumbnailGenerator } from '@/vault/videoThumbnailGenerator';
@@ -71,6 +73,11 @@ export interface Services {
   readonly videoThumbnails: VideoThumbnailGenerator;
   /** The only place a decrypted video is allowed to exist, and the thing that cleans it up. */
   readonly playbackScratch: PlaybackScratch;
+  /**
+   * The device gallery. Only ever written to, never read -- `mediaLibrary.ts` explains why that
+   * distinction is what keeps the shipped permission set down to one capped permission.
+   */
+  readonly galleryWriter: GalleryWriter;
   readonly captureInspector: CaptureInspector;
   readonly screenProtection: ScreenProtection;
   readonly autoLockSuspension: AutoLockSuspension;
@@ -144,6 +151,7 @@ export interface ServiceOverrides {
   /** Pass null for a build that sells nothing; defaults to whatever Firebase offers. */
   billing?: BillingService | null;
   recovery?: RecoveryAccess;
+  galleryWriter?: GalleryWriter;
   /** Argon2id cost override. Tests use a deliberately weak preset; production never sets it. */
   kdfParams?: KdfParams;
 }
@@ -187,6 +195,7 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
     recovery.clear();
   });
   const playbackScratch = new PlaybackScratch({ fs, secureDelete, random });
+  const galleryWriter = overrides.galleryWriter ?? deviceGalleryWriter;
 
   // Gates are enforced only where Pro can actually be bought AND its document can be read: a
   // build with billing but no cloud backend could sell and never learn that it had.
@@ -304,6 +313,7 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
     thumbnails,
     videoThumbnails,
     playbackScratch,
+    galleryWriter,
     captureInspector,
     screenProtection,
     autoLockSuspension,
