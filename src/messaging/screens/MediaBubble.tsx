@@ -45,6 +45,15 @@ export interface MediaBubbleProps {
   readonly onOpen: () => void;
   readonly onRetry: () => void;
   readonly onSaveToVault?: () => void;
+  /**
+   * Opens the message actions sheet, the same one a text bubble opens.
+   *
+   * It has to be handed to every pressable in here rather than left to the row outside. React
+   * Native gives the gesture to the innermost pressable, so a bubble state that takes a tap and
+   * does not also take a hold swallows it, and the only way left to delete a photo is to hold the
+   * sliver of margin beside it.
+   */
+  readonly onLongPress?: (() => void) | undefined;
 }
 
 function label(kind: MediaBubbleProps['kind']): string {
@@ -60,6 +69,7 @@ export function MediaBubble({
   onOpen,
   onRetry,
   onSaveToVault,
+  onLongPress,
 }: MediaBubbleProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
 
@@ -90,6 +100,7 @@ export function MediaBubble({
         testID={`conversation_media_failed_${messageId}`}
         accessibilityRole="button"
         onPress={onRetry}
+        onLongPress={onLongPress}
       >
         <Text style={styles.note}>{`Could not load this ${label(kind)}.`}</Text>
         <Text style={styles.sub}>Tap to try again.</Text>
@@ -121,6 +132,7 @@ export function MediaBubble({
         accessibilityState={{ busy: !failed }}
         disabled={!failed}
         onPress={onRetry}
+        onLongPress={onLongPress}
         style={styles.frame}
       >
         {preview === null ? (
@@ -156,6 +168,7 @@ export function MediaBubble({
         accessibilityRole="imagebutton"
         accessibilityLabel={`Open ${label(kind)}`}
         onPress={onOpen}
+        onLongPress={onLongPress}
         style={({ pressed }) => [styles.frame, pressed ? styles.pressed : null]}
       >
         {preview === null ? (
@@ -180,6 +193,7 @@ export function MediaBubble({
           accessibilityRole="button"
           accessibilityLabel="Save to vault"
           onPress={onSaveToVault}
+          onLongPress={onLongPress}
           style={({ pressed }) => [styles.save, pressed ? styles.pressed : null]}
         >
           <Text style={styles.saveLabel}>Save to vault</Text>

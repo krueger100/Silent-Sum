@@ -687,6 +687,12 @@ function Bubble({
           onSaveToVault={() => {
             onSaveToVault(message);
           }}
+          // The row around this is a Pressable with the same handler, but React Native hands the
+          // gesture to the innermost pressable -- so without this, holding the picture does
+          // nothing and only the margin beside it opens the sheet.
+          onLongPress={() => {
+            onLongPress(message);
+          }}
         />
         <Text style={[styles.time, mine ? styles.mineTime : null]}>
           {clockLabel(message.createdAt)}
