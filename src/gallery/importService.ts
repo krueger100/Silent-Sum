@@ -14,7 +14,9 @@
  *
  * The user's originals in the OS library are never touched.
  */
-import * as ImagePicker from 'expo-image-picker';
+import type * as ImagePicker from 'expo-image-picker';
+
+import type { PickedMedia, PickMediaOptions } from '../../modules/vault-media';
 
 import { MAX_ITEM_BYTES } from '@/billing/entitlements';
 import type { AutoLockSuspension } from '@/privacy/autoLockSuspension';
@@ -28,11 +30,40 @@ export interface ImportReport {
   readonly failed: number;
   /** Assets the picker reported as larger than `MAX_ITEM_BYTES`, skipped without being read. */
   readonly oversized: number;
+  /**
+   * Originals permanently deleted from the device gallery after their vault copy was committed.
+   * Lower than `imported` when an item carried no gallery id, or the user refused the system
+   * confirmation -- the caller is expected to say so rather than imply the originals are gone.
+   */
+  readonly removed: number;
+  /** Picked but never read: the free tier had no room left for them. */
+  readonly overLimit: number;
 }
 
+/**
+ * Deletes gallery originals by id, after their vault copies exist. Resolves true when the whole
+ * batch went; Android always asks the user first, so false is an ordinary answer, not an error.
+ *
+ * Note that on current Android this is reached only for assets the picker gave an id for, which
+ * in practice is none: the system photo picker returns a URI that cannot be resolved to a
+ * MediaStore id, and `legacy: true` does not change that, because Android substitutes the photo
+ * picker for `ACTION_GET_CONTENT` anyway. Verified on Android 16 -- the import reported
+ * "Originals are still in your gallery". The wiring is kept because it is correct and tested; what
+ * is missing is a deletable handle, which needs `DocumentsContract` through `ACTION_OPEN_DOCUMENT`
+ * and a native module of our own.
+ */
+export type RemoveFromGallery = (documentUris: readonly string[]) => Promise<number>;
+
+/**
+ * The OS picker as the messaging composer still uses it. The vault import no longer does -- see
+ * `PickMedia` -- because `expo-image-picker` cannot return a handle the app may delete with.
+ */
 export type LaunchImageLibrary = (
   options: ImagePicker.ImagePickerOptions,
 ) => Promise<ImagePicker.ImagePickerResult>;
+
+/** The import picker: hands back a cache copy AND the handle that identifies the original. */
+export type PickMedia = (options: PickMediaOptions) => Promise<readonly PickedMedia[]>;
 
 /**
  * Structural slices of the composition root, so tests can pass plain objects and production can
@@ -42,21 +73,18 @@ export interface ImportServiceDependencies {
   readonly fs: Pick<FileSystem, 'readBytes'>;
   readonly secureDelete: Pick<SecureDelete, 'file'>;
   readonly autoLockSuspension: Pick<AutoLockSuspension, 'suspend' | 'resume'>;
-  /** Overridable for tests; defaults to expo-image-picker. */
-  readonly launchImageLibrary?: LaunchImageLibrary;
+  /** Absent means the picker never opens, which is what a spec that omits it asserts. */
+  readonly pickMedia?: PickMedia;
+  /** Absent means originals are left in the gallery, which is what every spec that omits it asserts. */
+  readonly removeFromGallery?: RemoveFromGallery;
 }
 
-const IMPORT_PICKER_OPTIONS: ImagePicker.ImagePickerOptions = {
-  mediaTypes: ['images'],
-  allowsMultipleSelection: true,
-  // The image bytes are read from the file; a base64 copy would be a second plaintext of every
-  // picked image sitting in a JS string that cannot be zeroed.
-  base64: false,
-  // Never ask for EXIF: it carries GPS coordinates and device identifiers we have no use for and
-  // must not end up in the vault index.
-  exif: false,
-  allowsEditing: false,
-};
+/**
+ * What the picker will offer. Nothing asks for EXIF or a base64 copy: the module returns a file
+ * and a handle, and nothing else, so there is no second plaintext in a JS string that cannot be
+ * zeroed and no GPS coordinate to keep out of the vault index.
+ */
+const IMPORT_MIME_TYPES: readonly string[] = ['image/*', 'video/*'];
 
 export class ImportService {
   constructor(private readonly deps: ImportServiceDependencies) {}
@@ -78,34 +106,55 @@ export class ImportService {
     options: { readonly selectionLimit?: number } = {},
   ): Promise<ImportReport> {
     if (options.selectionLimit !== undefined && options.selectionLimit <= 0) {
-      return { imported: 0, failed: 0, oversized: 0 };
+      return { imported: 0, failed: 0, oversized: 0, removed: 0, overLimit: 0 };
     }
-    const assets = await this.pick(options.selectionLimit);
+    const picked = await this.pick(options.selectionLimit);
+    // The limit is still passed to the picker, which honours it, but it is no longer trusted to:
+    // a cap on what the free tier may store is not something to leave to a UI hint, and
+    // `ACTION_GET_CONTENT` -- which Android substitutes for the photo picker in some
+    // configurations -- ignores it outright. Truncating here keeps the promise either way:
+    // nothing beyond the limit is read, let alone encrypted.
+    const assets =
+      options.selectionLimit === undefined ? picked : picked.slice(0, options.selectionLimit);
+    const overLimit = picked.length - assets.length;
+    /** Ids of originals whose vault copy is committed, and only those. */
+    const removable: string[] = [];
     let imported = 0;
     let failed = 0;
     let oversized = 0;
 
     try {
-      for (const asset of assets) {
+      for (const item of assets) {
         // Checked from the picker's own metadata, before `readBytes` pulls the file into memory:
-        // refusing a 500 MB video must not cost 500 MB of heap first. A provider that omits
-        // `fileSize` is trusted -- an unknown size is not evidence of a large one.
-        if (asset.fileSize !== undefined && asset.fileSize > MAX_ITEM_BYTES) {
+        // refusing a 500 MB video must not cost 500 MB of heap first. A provider that omits the
+        // size is trusted -- an unknown size is not evidence of a large one.
+        if (item.fileSize !== null && item.fileSize > MAX_ITEM_BYTES) {
           oversized += 1;
           continue;
         }
+        const mimeType = item.mimeType ?? 'image/jpeg';
         let bytes: Bytes | null = null;
         try {
-          bytes = await this.deps.fs.readBytes(asset.uri);
-          await repository.addPhoto(
-            { bytes, uri: asset.uri },
-            {
-              source: 'import',
-              originalName: asset.fileName ?? null,
-              mimeType: asset.mimeType ?? 'image/jpeg',
-            },
-          );
+          if (mimeType.startsWith('video/')) {
+            // A recording is read from the file straight into the cipher a chunk at a time; its
+            // bytes are never a `Uint8Array` here. Duration is the recorder's to measure and the
+            // picker does not report it.
+            await repository.addVideo(
+              { uri: item.uri, durationMs: null, mimeType },
+              { source: 'import', originalName: item.fileName },
+            );
+          } else {
+            bytes = await this.deps.fs.readBytes(item.uri);
+            await repository.addPhoto(
+              { bytes, uri: item.uri },
+              { source: 'import', originalName: item.fileName, mimeType },
+            );
+          }
           imported += 1;
+          // Recorded only after the vault returned: an original becomes deletable because its
+          // encrypted copy exists, never merely because it was picked. A provider that serves the
+          // item read-only says so up front, and is not asked.
+          if (item.deletable && item.documentUri !== '') removable.push(item.documentUri);
         } catch (error) {
           if (!(error instanceof ImageDecodeError)) throw error;
           failed += 1;
@@ -116,23 +165,56 @@ export class ImportService {
     } finally {
       // Every picked asset, always: an abort halfway through must not leave the untouched
       // selection's plaintext copies behind.
-      for (const asset of assets) await this.wipeTempCopy(asset.uri);
+      for (const item of assets) await this.wipeTempCopy(item.uri);
     }
 
-    return { imported, failed, oversized };
+    // Deliberately outside the `try`: an import that threw part-way deletes nothing at all, even
+    // the originals of items that did commit. The cost of that is a duplicate in the vault when
+    // the user retries, which they can delete; the cost of the other order is an original they
+    // cannot get back.
+    const removed = await this.removeOriginals(removable);
+    return { imported, failed, oversized, removed, overLimit };
+  }
+
+  /**
+   * Permanently deletes the gallery originals of items that are now in the vault.
+   *
+   * Android will not let an app silently delete media it does not own, so this raises a system
+   * confirmation. The whole batch goes in one request to make that one dialog rather than one per
+   * photo, and auto-lock is suspended across it for the same reason the picker suspends it: the
+   * dialog is another activity on top of ours.
+   *
+   * Never throws. By the time it runs the vault copies are committed, so a refusal or a failure
+   * means the user kept their originals -- not that the import failed. `removed` is how that
+   * reaches the caller.
+   */
+  private async removeOriginals(assetIds: readonly string[]): Promise<number> {
+    const remove = this.deps.removeFromGallery;
+    if (remove === undefined || assetIds.length === 0) return 0;
+    this.deps.autoLockSuspension.suspend();
+    try {
+      // Clamped: a native count larger than what was asked for would misreport the shortfall the
+      // caller shows the user, and the user is entitled to an honest number here above all.
+      const removed = await remove(assetIds);
+      return Math.max(0, Math.min(removed, assetIds.length));
+    } catch {
+      return 0;
+    } finally {
+      this.deps.autoLockSuspension.resume();
+    }
   }
 
   /** Suspends auto-lock for exactly the picker round trip. Cancel yields an empty selection. */
-  private async pick(selectionLimit?: number): Promise<readonly ImagePicker.ImagePickerAsset[]> {
-    const launch = this.deps.launchImageLibrary ?? ImagePicker.launchImageLibraryAsync;
+  private async pick(selectionLimit?: number): Promise<readonly PickedMedia[]> {
+    const pickMedia = this.deps.pickMedia;
+    if (pickMedia === undefined) return [];
     this.deps.autoLockSuspension.suspend();
     try {
-      const result = await launch(
-        selectionLimit === undefined
-          ? IMPORT_PICKER_OPTIONS
-          : { ...IMPORT_PICKER_OPTIONS, selectionLimit },
-      );
-      return result.canceled ? [] : result.assets;
+      return await pickMedia({
+        mimeTypes: IMPORT_MIME_TYPES,
+        // The OS cap is a convenience; `importFromLibrary` enforces the real one either way.
+        allowsMultipleSelection: selectionLimit === undefined || selectionLimit > 1,
+      });
     } finally {
       this.deps.autoLockSuspension.resume();
     }

@@ -24,7 +24,7 @@ import { Button } from '@/components/Button';
 import { ConfirmDialog, TypedConfirmDialog } from '@/components/Dialog';
 import { Paragraph, Screen } from '@/components/Screen';
 import { gridColumns } from '@/gallery/gridColumns';
-import { ImportService } from '@/gallery/importService';
+import { ImportService, type ImportReport } from '@/gallery/importService';
 import { PhotoTile } from '@/gallery/PhotoTile';
 import { openRepository } from '@/gallery/vaultAccess';
 import { CameraSheet } from '@/camera/CameraSheet';
@@ -41,6 +41,23 @@ export interface GalleryScreenProps {
   onOpenSettings?: () => void;
   /** Where the Pro dialog's "See plans" goes. Without it the dialog only informs. */
   onOpenPlans?: () => void;
+}
+
+/**
+ * What became of the originals, said plainly.
+ *
+ * Deleting a gallery original is permanent and there is no system bin to recover it from, so an
+ * import that removed nothing must never read like one that did. The shortfall is real: an item
+ * the picker could not give a gallery id for cannot be deleted, and the user is entitled to know
+ * which of their photos are still out there before they go looking for one that is not.
+ */
+function describeOriginals(report: ImportReport): string {
+  if (report.imported === 0) return '';
+  if (report.removed === 0) return ' Originals are still in your gallery.';
+  if (report.removed === report.imported) return ' Originals removed from your gallery.';
+  const kept = report.imported - report.removed;
+  const removedPlural = report.removed === 1 ? '' : 's';
+  return ` ${String(report.removed)} original${removedPlural} removed, ${String(kept)} still in your gallery.`;
 }
 
 export function GalleryScreen({
@@ -133,7 +150,7 @@ export function GalleryScreen({
           room === undefined ? {} : { selectionLimit: room },
         );
         if (!mounted.current) return;
-        if (report.imported + report.failed + report.oversized > 0) {
+        if (report.imported + report.failed + report.oversized + report.overLimit > 0) {
           const plural = report.imported === 1 ? '' : 's';
           // Oversized is reported beside failed rather than folded into it: "could not be read"
           // is a broken file, "too large" is a fine file the vault will not take, and a user who
@@ -144,8 +161,13 @@ export function GalleryScreen({
             const mb = String(MAX_ITEM_BYTES / (1024 * 1024));
             parts.push(`${String(report.oversized)} over ${mb} MB`);
           }
+          if (report.overLimit > 0) {
+            parts.push(`${String(report.overLimit)} over the free limit`);
+          }
           const tail = parts.length > 0 ? `, ${parts.join(' and ')}` : '';
-          setNotice(`Imported ${String(report.imported)} photo${plural}${tail}.`);
+          setNotice(
+            `Imported ${String(report.imported)} photo${plural}${tail}.${describeOriginals(report)}`,
+          );
         }
       } catch {
         // The reason is deliberately not surfaced or logged: it can carry a file path.

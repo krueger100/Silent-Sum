@@ -22,8 +22,9 @@ import { InMemoryCloudBackend } from '@/firebase/cloudBackend';
 import { NoopAnalyticsService, NoopCrashReporter } from '@/firebase/types';
 import { FakeClock } from '@/utils/clock';
 import type { VaultRepository } from '@/vault/types';
+import type { PickedMedia, PickMediaOptions } from '../../../modules/vault-media';
 
-jest.mock('expo-image-picker', () => ({ launchImageLibraryAsync: jest.fn() }));
+const pickMedia = jest.fn<Promise<readonly PickedMedia[]>, [PickMediaOptions]>();
 
 jest.mock('expo-image', () => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -35,7 +36,7 @@ jest.mock('expo-image', () => {
   };
 });
 
-const picker = jest.requireMock('expo-image-picker') as { launchImageLibraryAsync: jest.Mock };
+
 
 interface SellingVault {
   services: Services;
@@ -54,6 +55,7 @@ async function sellingVault(): Promise<SellingVault> {
     new AcceptingCaptureInspector(),
     {
       clock,
+      pickMedia,
       firebase: {
         available: true,
         crash: new NoopCrashReporter(),
@@ -86,12 +88,12 @@ async function pressImport(view: RenderResult): Promise<void> {
 }
 
 beforeEach(() => {
-  picker.launchImageLibraryAsync.mockReset();
-  picker.launchImageLibraryAsync.mockResolvedValue({ canceled: true, assets: null });
+  pickMedia.mockReset();
+  pickMedia.mockResolvedValue([]);
 });
 
 describe('GalleryScreen import gate', () => {
-  it('lets the free tier import while there is room, capping the picker at what is left', async () => {
+  it('lets the free tier open the picker while there is room', async () => {
     const { services, repository, stop } = await sellingVault();
     await fill(repository, FREE_TIER.maxItems - 2);
     const view = await renderInVault(services, <GalleryScreen />);
@@ -99,9 +101,9 @@ describe('GalleryScreen import gate', () => {
     await pressImport(view);
 
     await waitFor(() => {
-      expect(picker.launchImageLibraryAsync).toHaveBeenCalledTimes(1);
+      expect(pickMedia).toHaveBeenCalledTimes(1);
     });
-    expect(picker.launchImageLibraryAsync.mock.calls[0]?.[0]).toMatchObject({ selectionLimit: 2 });
+    expect(pickMedia.mock.calls[0]?.[0]).toMatchObject({ allowsMultipleSelection: true });
     expect(view.queryByTestId('vault_upsell')).toBeNull();
     stop();
   });
@@ -114,7 +116,7 @@ describe('GalleryScreen import gate', () => {
 
     await pressImport(view);
 
-    expect(picker.launchImageLibraryAsync).not.toHaveBeenCalled();
+    expect(pickMedia).not.toHaveBeenCalled();
     expect(view.getByTestId('vault_upsell')).toHaveTextContent(
       new RegExp(`free vault holds ${String(FREE_TIER.maxItems)} items`),
     );
@@ -137,7 +139,7 @@ describe('GalleryScreen import gate', () => {
     await fireEvent.press(view.getByTestId('vault_upsell-cancel'));
 
     expect(view.queryByTestId('vault_upsell')).toBeNull();
-    expect(picker.launchImageLibraryAsync).not.toHaveBeenCalled();
+    expect(pickMedia).not.toHaveBeenCalled();
     stop();
   });
 
@@ -151,23 +153,23 @@ describe('GalleryScreen import gate', () => {
     await pressImport(view);
 
     await waitFor(() => {
-      expect(picker.launchImageLibraryAsync).toHaveBeenCalledTimes(1);
+      expect(pickMedia).toHaveBeenCalledTimes(1);
     });
-    expect(picker.launchImageLibraryAsync.mock.calls[0]?.[0]).not.toHaveProperty('selectionLimit');
+    expect(pickMedia.mock.calls[0]?.[0]).toMatchObject({ allowsMultipleSelection: true });
     stop();
   });
 
   it('never gates a build that cannot sell', async () => {
-    const { services, repository } = await unlockedVault();
+    const { services, repository } = await unlockedVault(undefined, undefined, { pickMedia });
     await fill(repository, FREE_TIER.maxItems);
     const view = await renderInVault(services, <GalleryScreen />);
 
     await pressImport(view);
 
     await waitFor(() => {
-      expect(picker.launchImageLibraryAsync).toHaveBeenCalledTimes(1);
+      expect(pickMedia).toHaveBeenCalledTimes(1);
     });
-    expect(picker.launchImageLibraryAsync.mock.calls[0]?.[0]).not.toHaveProperty('selectionLimit');
+    expect(pickMedia.mock.calls[0]?.[0]).toMatchObject({ allowsMultipleSelection: true });
     expect(view.queryByTestId('vault_upsell')).toBeNull();
   });
 });

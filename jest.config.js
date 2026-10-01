@@ -28,6 +28,8 @@ module.exports = {
     '^expo-video$': '<rootDir>/test/shims/expo-video.tsx',
     // Same story: expo-media-library subclasses native classes at import time.
     '^expo-media-library$': '<rootDir>/test/shims/expo-media-library.ts',
+    // The local native module cannot load under Jest; specs inject their own picker.
+    '(\.\./)+modules/vault-media$': '<rootDir>/test/shims/vault-media.ts',
   },
   transformIgnorePatterns,
   collectCoverageFrom: ['src/**/*.{ts,tsx}', '!src/**/*.d.ts', '!src/**/index.ts'],

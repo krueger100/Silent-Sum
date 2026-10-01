@@ -113,8 +113,10 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
       ITSAppUsesNonExemptEncryption: false,
       NSCameraUsageDescription:
         'The camera is used to take photos that are stored encrypted inside the app.',
+      // An import now offers to remove the original, so the old promise that originals are
+      // never modified is no longer one this app can make.
       NSPhotoLibraryUsageDescription:
-        'Photo library access lets you import pictures into the encrypted vault. Originals are never modified.',
+        'Photo library access lets you move pictures into the encrypted vault. You are asked before an original is removed.',
     },
   },
   android: {

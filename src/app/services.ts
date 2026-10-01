@@ -12,7 +12,8 @@ import { BackupService } from '@/backup/backupService';
 import type { BillingService } from '@/billing/billingService';
 import { EntitlementsController } from '@/billing/entitlementsController';
 import { ExpoCaptureInspector, type CaptureInspector } from '@/camera/captureInspector';
-import type { LaunchImageLibrary } from '@/gallery/importService';
+import { pickDeviceMedia, removeFromDeviceGallery } from '@/gallery/deviceMedia';
+import type { LaunchImageLibrary, PickMedia, RemoveFromGallery } from '@/gallery/importService';
 import {
   Argon2idKeyDerivation,
   SodiumKeyWrapping,
@@ -78,6 +79,13 @@ export interface Services {
    * distinction is what keeps the shipped permission set down to one capped permission.
    */
   readonly galleryWriter: GalleryWriter;
+  /**
+   * The import picker. Not `launchImageLibrary`: that one cannot return a handle the app is
+   * allowed to delete the original with, which is the whole point of the import flow.
+   */
+  readonly pickMedia: PickMedia;
+  /** Deletes gallery originals once the vault holds encrypted copies. `ImportService` reads this. */
+  readonly removeFromGallery: RemoveFromGallery;
   readonly captureInspector: CaptureInspector;
   readonly screenProtection: ScreenProtection;
   readonly autoLockSuspension: AutoLockSuspension;
@@ -152,6 +160,8 @@ export interface ServiceOverrides {
   billing?: BillingService | null;
   recovery?: RecoveryAccess;
   galleryWriter?: GalleryWriter;
+  pickMedia?: PickMedia;
+  removeFromGallery?: RemoveFromGallery;
   /** Argon2id cost override. Tests use a deliberately weak preset; production never sets it. */
   kdfParams?: KdfParams;
 }
@@ -196,6 +206,8 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
   });
   const playbackScratch = new PlaybackScratch({ fs, secureDelete, random });
   const galleryWriter = overrides.galleryWriter ?? deviceGalleryWriter;
+  const pickMedia = overrides.pickMedia ?? pickDeviceMedia;
+  const removeFromGallery = overrides.removeFromGallery ?? removeFromDeviceGallery;
 
   // Gates are enforced only where Pro can actually be bought AND its document can be read: a
   // build with billing but no cloud backend could sell and never learn that it had.
@@ -314,6 +326,8 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
     videoThumbnails,
     playbackScratch,
     galleryWriter,
+    pickMedia,
+    removeFromGallery,
     captureInspector,
     screenProtection,
     autoLockSuspension,

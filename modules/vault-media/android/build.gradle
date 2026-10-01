@@ -1,0 +1,23 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+// `expo-module-gradle-plugin` builds a publication for every module it manages, and refuses to
+// configure one without coordinates and a version. These are local-only: the module is never
+// published anywhere, it is autolinked from `modules/` by path.
+group = 'com.kruegerco.silentsum'
+version = '0.1.0'
+
+android {
+  namespace "expo.modules.vaultmedia"
+  defaultConfig {
+    minSdkVersion 26
+    versionCode 1
+    versionName "0.1.0"
+  }
+}
+
+dependencies {
+  implementation 'androidx.activity:activity-ktx:1.11.0'
+}
