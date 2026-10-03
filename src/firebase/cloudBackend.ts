@@ -15,6 +15,7 @@ import {
   type CloudUser,
   type CollectionEntry,
   type CollectionQuery,
+  type TransferProgress,
 } from '@/firebase/types';
 import type { FileSystem } from '@/storage/fileSystem';
 import type { Bytes } from '@/utils/bytes';
@@ -501,10 +502,14 @@ export class InMemoryCloudBackend implements CloudBackend {
     this.blobs.set(path, Uint8Array.from(await this.requireFiles().readBytes(localUri)));
   }
 
-  async getBlob(path: string): Promise<Bytes> {
+  async getBlob(path: string, onProgress?: TransferProgress): Promise<Bytes> {
     this.authorize(path, 'read');
     const blob = this.blobs.get(path);
     if (blob === undefined) throw new CloudError(CLOUD_ERROR_CODES.objectNotFound);
+    // Both ends of a transfer, so a spec can see what the viewer would have shown. There is no
+    // middle to report: this one really does arrive at once.
+    onProgress?.(0, blob.length);
+    onProgress?.(blob.length, blob.length);
     return Uint8Array.from(blob);
   }
 

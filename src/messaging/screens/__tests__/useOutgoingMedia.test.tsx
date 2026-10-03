@@ -8,7 +8,7 @@ import { act, renderHook } from '@testing-library/react-native';
 
 import { ServicesProvider } from '@/app/ServicesProvider';
 import type { Services } from '@/app/services';
-import type { MediaSource } from '@/messaging/messagingService';
+import { MessagingError, type MediaSource } from '@/messaging/messagingService';
 import { useOutgoingMedia } from '@/messaging/screens/useOutgoingMedia';
 import { ALICE, MessagingWorld } from '@/messaging/screens/__tests__/harness';
 
@@ -116,6 +116,35 @@ describe('useOutgoingMedia', () => {
       await retrying;
     });
     expect(result.current.items).toHaveLength(0);
+  });
+
+  it('refuses to re-run a failure that tapping again cannot fix, and says why', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    let calls = 0;
+    const deliver = async (): Promise<void> => {
+      calls += 1;
+      throw new MessagingError('pro-required');
+    };
+    const { result } = await renderHook(() => useOutgoingMedia(deliver), {
+      wrapper: wrapper(alice.services),
+    });
+
+    await act(async () => {
+      await result.current.send(SOURCE);
+    });
+
+    expect(result.current.items[0]?.failed).toBe(true);
+    expect(result.current.items[0]?.retryable).toBe(false);
+    expect(result.current.items[0]?.problem).toMatch(/pro/i);
+
+    // Tapping it would clear the reason, fail again, and put it back -- a render that looks like
+    // nothing happened, which is exactly what "it says tap to retry but it doesn't work" was.
+    await act(async () => {
+      await result.current.retry(result.current.items[0]?.id ?? '');
+    });
+    expect(calls).toBe(1);
+    expect(result.current.items[0]?.problem).toMatch(/pro/i);
   });
 
   it('discards a failed item when asked', async () => {

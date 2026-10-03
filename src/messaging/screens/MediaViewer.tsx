@@ -20,14 +20,17 @@ import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, View } from 'rea
 
 import { spacing, typography, useStyles, type Palette } from '@/app/theme';
 import { VideoSurface } from '@/gallery/VideoSurface';
-import { base64Encode } from '@/utils/base64';
+import { describeTransfer, type TransferState } from '@/messaging/mediaProgress';
+// The native encoder: a full-size photo is megabytes, and `utils/base64` is for keys and nonces.
+import { toBase64 } from '@/crypto/sodium';
 import type { Bytes } from '@/utils/bytes';
 
 /** What the screen is currently showing, or trying to. */
 export type ViewerItem =
   | { readonly kind: 'photo'; readonly bytes: Bytes }
   | { readonly kind: 'video'; readonly uri: string }
-  | { readonly kind: 'loading' }
+  /** Fetching it. Carries whatever the transfer could say about how far along it is. */
+  | ({ readonly kind: 'loading' } & TransferState)
   | { readonly kind: 'failed'; readonly message: string }
   /** Gone for good, after 30 days. Kept apart from 'failed' so it never offers a retry. */
   | { readonly kind: 'expired'; readonly message: string };
@@ -73,7 +76,14 @@ function Body({
 }): React.JSX.Element | null {
   if (item === null) return null;
   if (item.kind === 'loading') {
-    return <ActivityIndicator testID="media_viewer_loading" color="#FFFFFF" />;
+    return (
+      <View style={styles.centred} testID="media_viewer_loading">
+        <ActivityIndicator color="#FFFFFF" />
+        <Text style={styles.message} testID="media_viewer_progress">
+          {describeTransfer(item)}
+        </Text>
+      </View>
+    );
   }
   if (item.kind === 'expired') {
     return (
@@ -104,7 +114,7 @@ function Body({
   return (
     <Image
       testID="media_viewer_image"
-      source={{ uri: `data:image/jpeg;base64,${base64Encode(item.bytes)}` }}
+      source={{ uri: `data:image/jpeg;base64,${toBase64(item.bytes)}` }}
       style={styles.media}
       contentFit="contain"
       cachePolicy="memory"

@@ -14,7 +14,7 @@ import type { Services } from '@/app/services';
 import { InMemoryBillingService } from '@/billing/billingService';
 import { FREE_TIER, MAX_ITEM_BYTES } from '@/billing/entitlements';
 import { AcceptingCaptureInspector } from '@/camera/captureInspector';
-import { CameraSheet } from '@/camera/CameraSheet';
+import { CameraSheet, type CameraCapture } from '@/camera/CameraSheet';
 import {
   MarkedThumbnailGenerator,
   buildServices,
@@ -106,6 +106,27 @@ async function sellingVault(): Promise<SellingVault> {
 
 async function openSheet(services: Services): Promise<RenderResult> {
   const view = await renderInVault(services, <CameraSheet visible onClose={() => undefined} />);
+  await waitFor(() => {
+    expect(view.getByTestId('camera-shutter')).toBeTruthy();
+  });
+  return view;
+}
+
+/** The same sheet as a conversation mounts it: with somewhere for the capture to go. */
+async function openChatSheet(
+  services: Services,
+  captures: CameraCapture[],
+): Promise<RenderResult> {
+  const view = await renderInVault(
+    services,
+    <CameraSheet
+      visible
+      onClose={() => undefined}
+      onCapture={(capture) => {
+        captures.push(capture);
+      }}
+    />,
+  );
   await waitFor(() => {
     expect(view.getByTestId('camera-shutter')).toBeTruthy();
   });
@@ -219,5 +240,92 @@ describe('CameraSheet free-tier gates', () => {
     });
     expect(view.queryByTestId('camera-notice')).toBeNull();
     expect(view.getByTestId('camera-mode-video')).not.toHaveTextContent(/Cloud/);
+  });
+});
+
+/**
+ * The same caps, from the other side of the destination branch.
+ *
+ * Every gate above is the vault answering "will I hold one more item?". A capture on its way to a
+ * conversation never becomes a vault item, so none of them has standing over it -- and a free
+ * account whose vault is full must still be able to send a photo in a chat it is paying Pro for.
+ * The chat's own gate is Pro, enforced by the security rules, and its own ceilings are applied by
+ * the send; neither is this sheet's business.
+ *
+ * These use the account that the specs above prove IS gated, so a wrongly-shared gate fails here
+ * rather than passing by accident on a build that cannot sell anything.
+ */
+describe('CameraSheet gates do not reach a chat capture', () => {
+  it('takes a photo for a chat with the free vault already full', async () => {
+    const { services, repository, stop } = await sellingVault();
+    for (let i = 0; i < FREE_TIER.maxItems; i++) {
+      await repository.addPhoto({ bytes: imageBytes(0x10 + (i % 200)) }, { source: 'camera' });
+    }
+    const uri = 'file:///memory/cache/Camera/for-chat.jpg';
+    await services.fs.writeBytes(uri, imageBytes(0x4a));
+    cameraMock.__state.takePicture.mockResolvedValue({ uri, width: 800, height: 600, format: 'jpg' });
+    const captures: CameraCapture[] = [];
+    const view = await openChatSheet(services, captures);
+
+    await fireEvent.press(view.getByTestId('camera-shutter'));
+    await waitFor(() => {
+      expect(view.getByTestId('camera-review-image')).toBeTruthy();
+    });
+    await fireEvent.press(view.getByTestId('camera-keep'));
+
+    await waitFor(() => {
+      expect(captures).toHaveLength(1);
+    });
+    // No upsell, and the shutter fired -- the two things the vault path refuses outright here.
+    expect(view.queryByTestId('camera-notice')).toBeNull();
+    expect(cameraMock.__state.takePicture).toHaveBeenCalled();
+    // And the full vault is exactly as full as it was: nothing was added, nothing was refused.
+    expect(repository.photos).toHaveLength(FREE_TIER.maxItems);
+    stop();
+  });
+
+  it('switches to video for a chat with the free vault already full', async () => {
+    const { services, repository, stop } = await sellingVault();
+    for (let i = 0; i < FREE_TIER.maxItems; i++) {
+      await repository.addPhoto({ bytes: imageBytes(0x10 + (i % 200)) }, { source: 'camera' });
+    }
+    const view = await openChatSheet(services, []);
+
+    await fireEvent.press(view.getByTestId('camera-mode-video'));
+
+    await waitFor(() => {
+      expect(view.getByTestId('camera-record')).toBeTruthy();
+    });
+    expect(view.queryByTestId('camera-notice')).toBeNull();
+    stop();
+  });
+
+  /**
+   * The vault's 100 MB per-item cap is the one gate that runs at Keep, and it is the one most
+   * likely to be left in place by accident, because it sits in the same method as the handover.
+   * A chat video is bounded by the chat's own ceiling instead, which the send applies from the
+   * file's size before it reads a byte of it.
+   */
+  it('hands over a recording the vault would refuse for its size', async () => {
+    const { services, repository, stop } = await sellingVault();
+    const uri = 'file:///memory/cache/Camera/big-for-chat.mp4';
+    await services.fs.writeBytes(uri, videoBytes());
+    jest.spyOn(services.fs, 'size').mockResolvedValue(MAX_ITEM_BYTES + 1);
+    cameraMock.__state.record.mockResolvedValue({ uri });
+    const captures: CameraCapture[] = [];
+    const view = await openChatSheet(services, captures);
+
+    await fireEvent.press(view.getByTestId('camera-mode-video'));
+    await fireEvent.press(await view.findByTestId('camera-record'));
+    await fireEvent.press(await view.findByTestId('camera-keep'));
+
+    await waitFor(() => {
+      expect(captures).toHaveLength(1);
+    });
+    expect(view.queryByTestId('camera-notice')).toBeNull();
+    expect(repository.photos).toHaveLength(0);
+    // Still there for the send that was given it, rather than deleted by a refusal.
+    expect(await services.fs.exists(uri)).toBe(true);
+    stop();
   });
 });

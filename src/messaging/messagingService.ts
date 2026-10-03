@@ -26,6 +26,7 @@ import type { SecureRandom } from '@/crypto/types';
 import { increment, type CloudBackend } from '@/firebase/types';
 import { DirectoryError, type Directory } from '@/messaging/directory';
 import { ConversationAdminError, type ConversationAdmin } from '@/messaging/conversationAdmin';
+import type { TransferState } from '@/messaging/mediaProgress';
 import type { HiddenMessages } from '@/messaging/hiddenMessages';
 import type { MessagingIdentity } from '@/messaging/identity';
 import {
@@ -52,17 +53,19 @@ import {
 } from '@/messaging/messaging';
 import { openMessage, sealMessage } from '@/messaging/messageCipher';
 import {
-  capFor,
   openMedia,
   openThumb,
+  plaintextBudget,
   sealMedia,
   sealThumb,
   packSealed,
   unpackSealed,
   THUMB_MAX_EDGE,
+  THUMB_PLAINTEXT_BUDGET,
   type MediaBinding,
   type MediaKind,
 } from '@/messaging/media';
+import { encodeUnderCap, fitPhotoForSending, THUMB_SEND_EDGES } from '@/messaging/mediaFit';
 import type { FileSystem } from '@/storage/fileSystem';
 import type { SecureDelete } from '@/storage/secureDelete';
 import type { PlaybackScratch } from '@/vault/playbackScratch';
@@ -835,9 +838,23 @@ export class MessagingService {
     const peerUid = peerOf(conversationId, uid);
     if (peerUid === null) throw new MessagingError('unavailable');
 
+    // A video is read whole into memory, so its size is taken from the file system BEFORE the read:
+    // picking a 500 MB clip would otherwise allocate 500 MB in order to refuse it. Two deliberate
+    // exemptions -- a photo, because being over the budget is not a refusal for one (it is
+    // re-encoded below), and a source that already carries its bytes, which has no file to ask
+    // about and no second copy to avoid.
+    if (source.kind === 'video' && source.bytes === undefined) {
+      const onDisk = await media.fs.size(source.uri);
+      if (onDisk > plaintextBudget('video')) {
+        throw new MessagingError('rejected', 'video-too-large');
+      }
+    }
     const plain = await this.readSource(media, source);
     if (plain.length === 0) throw new MessagingError('rejected', 'empty');
-    if (plain.length > capFor(source.kind)) throw new MessagingError('rejected', 'too-long');
+    // What will actually be sent: the original bytes when they fit, a smaller re-encode when they
+    // do not. Everything below works on `sendable`, so the preview, the cipher, the uploaded
+    // object and the `bytes` field in the document all describe the same image.
+    const sendable = await this.fitForSending(media, source.kind, plain);
 
     const key = await this.conversationKey(conversationId, peerUid);
     const createdAt = this.deps.clock.now();
@@ -848,7 +865,7 @@ export class MessagingService {
 
     // The preview is regenerated at the chat size even when the source already has one: the
     // vault's own thumbnails are 512px and over the 32 KB cap the Storage rules enforce.
-    const thumbBytes = await this.thumbnailFor(media, source, plain);
+    const thumbBytes = await this.thumbnailFor(media, source, sendable);
     let thumbObject: string | null = null;
     if (thumbBytes !== null) {
       const sealedThumb = sealThumb(thumbBytes, key, binding, this.deps.random);
@@ -856,7 +873,7 @@ export class MessagingService {
       thumbObject = thumbPath;
     }
 
-    const sealed = sealMedia(plain, key, binding, this.deps.random);
+    const sealed = sealMedia(sendable, key, binding, this.deps.random);
     const packed = packSealed(sealed);
     await cloud.putBlob(objectPath, packed);
 
@@ -902,9 +919,13 @@ export class MessagingService {
    * Throws `expired` when the object is gone, which after 30 days is the ordinary fate of every
    * media message -- the screen needs to tell that apart from a failure it could retry.
    */
-  async fetchMedia(conversationId: string, message: DecryptedMessage): Promise<string> {
+  async fetchMedia(
+    conversationId: string,
+    message: DecryptedMessage,
+    onProgress?: (state: TransferState) => void,
+  ): Promise<string> {
     const media = this.requireMedia();
-    const plain = await this.fetchMediaBytes(conversationId, message);
+    const plain = await this.fetchMediaBytes(conversationId, message, onProgress);
     const uri = await media.scratch.allocate(message.kind === 'video' ? 'mp4' : 'jpg');
     await media.fs.writeBytes(uri, plain);
     return uri;
@@ -922,7 +943,11 @@ export class MessagingService {
    * Throws `expired` when the object is gone, which after 30 days is the ordinary fate of every
    * media message rather than a fault.
    */
-  async fetchMediaBytes(conversationId: string, message: DecryptedMessage): Promise<Bytes> {
+  async fetchMediaBytes(
+    conversationId: string,
+    message: DecryptedMessage,
+    onProgress?: (state: TransferState) => void,
+  ): Promise<Bytes> {
     const cloud = this.requireCloud();
     const uid = this.requireUid();
     if (message.object === null || message.kind === null) {
@@ -931,7 +956,12 @@ export class MessagingService {
     const peerUid = peerOf(conversationId, uid);
     if (peerUid === null) throw new MessagingError('unavailable');
     const key = await this.conversationKey(conversationId, peerUid);
-    const sealed = unpackSealed(await this.fetchBlob(cloud, message.object));
+    const blob = await this.fetchBlob(cloud, message.object, onProgress);
+    // Everything past this point is one atomic open of a sealed box, which has no fraction to
+    // report. Saying so is the difference between a wait and an apparent hang: on a real video
+    // this phase alone ran for forty seconds behind an unchanging spinner.
+    onProgress?.({ opening: true });
+    const sealed = unpackSealed(blob);
     if (sealed === null) throw new MessagingError('unavailable');
     const plain = openMedia(sealed, key, {
       conversationId,
@@ -1030,14 +1060,43 @@ export class MessagingService {
     return media;
   }
 
-  private async fetchBlob(cloud: CloudBackend, path: string): Promise<Bytes> {
+  private async fetchBlob(
+    cloud: CloudBackend,
+    path: string,
+    onProgress?: (state: TransferState) => void,
+  ): Promise<Bytes> {
     try {
-      return await cloud.getBlob(path);
+      return await cloud.getBlob(path, (transferred, total) => {
+        onProgress?.({ transferred, total });
+      });
     } catch {
       // Any failure to read the object reads as expiry: after 30 days that is what it is, and a
       // transient network error looks identical from here. The screen offers a retry either way.
       throw new MessagingError('expired');
     }
+  }
+
+  /**
+   * The bytes that will be sent, which are not always the bytes that were picked.
+   *
+   * A photo over its budget is re-encoded smaller rather than refused. The picker is opened with
+   * `quality: 1`, so a photo arrives at whatever size the camera wrote -- routinely 6-8 MB against
+   * an 8 MB ceiling -- and "choose a smaller photo" is not an instruction a camera roll can obey.
+   * Only when even the smallest edge will not fit is the send refused, and then the reason says so
+   * instead of offering a retry that would re-run the identical work.
+   *
+   * A VIDEO is different and stays refused: this app has no transcoder, so nothing here could make
+   * one smaller, and pretending otherwise would just move the failure later.
+   */
+  private async fitForSending(media: MediaDeps, kind: MediaKind, plain: Bytes): Promise<Bytes> {
+    const budget = plaintextBudget(kind);
+    if (kind === 'video') {
+      if (plain.length > budget) throw new MessagingError('rejected', 'video-too-large');
+      return plain;
+    }
+    const fit = await fitPhotoForSending(plain, budget, media.thumbnails);
+    if (fit.kind === 'too-large') throw new MessagingError('rejected', 'photo-too-large');
+    return fit.bytes;
   }
 
   private async readSource(media: MediaDeps, source: MediaSource): Promise<Bytes> {
@@ -1053,10 +1112,28 @@ export class MessagingService {
     try {
       if (source.kind === 'video') {
         const poster = await media.videoThumbnails.generate(source.uri, THUMB_MAX_EDGE);
-        return poster.jpegBytes;
+        if (poster.jpegBytes.length <= THUMB_PLAINTEXT_BUDGET) return poster.jpegBytes;
+        // A poster is produced at the chat size but under no byte ceiling, so one that does not
+        // fit is re-encoded from itself rather than abandoned.
+        const shrunk = await encodeUnderCap(
+          { bytes: poster.jpegBytes },
+          THUMB_PLAINTEXT_BUDGET,
+          THUMB_SEND_EDGES,
+          media.thumbnails,
+        );
+        return shrunk === null ? null : shrunk.bytes;
       }
-      const thumb = await media.thumbnails.generate({ bytes: plain }, THUMB_MAX_EDGE);
-      return thumb.jpegBytes;
+      // The ladder starts at THUMB_MAX_EDGE, so an ordinary preview still costs exactly one
+      // generation and only an unusually incompressible one costs more. Enforcing the ceiling here
+      // is what keeps an oversized preview from failing the WHOLE send: `putBlob` has no try/catch
+      // around it, so a refused thumbnail upload takes the photo with it.
+      const fitted = await encodeUnderCap(
+        { bytes: plain },
+        THUMB_PLAINTEXT_BUDGET,
+        THUMB_SEND_EDGES,
+        media.thumbnails,
+      );
+      return fitted === null ? null : fitted.bytes;
     } catch {
       // A message with no preview is still a message. Refusing the send because a thumbnail
       // could not be made would lose the user's photo over a cosmetic failure.

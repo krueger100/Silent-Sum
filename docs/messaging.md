@@ -155,6 +155,21 @@ each conversation shows a one-time explanation before it happens — per convers
 per send, because a dialog seen on every send is one people learn to dismiss unread, and per
 conversation rather than once per install, because *who* the copy goes to is the part that matters.
 
+Sending from the **camera** does not involve the vault at all. The same sheet serves both
+destinations and one callback decides which: mounted from the gallery it encrypts the capture into
+the vault, mounted from a conversation it hands the capture to the chat's pipeline instead. So none
+of the vault's rules apply to it — not the 50-item free cap, not the 100 MB per-item cap, not the
+import — because the capture never becomes a vault item. The chat's own gate is Pro, and its own
+ceilings are the ones below.
+
+A camera photo is handed over as bytes, and `expo-camera`'s plaintext JPEG is overwritten and
+unlinked during the capture, so nothing is left on disk. A **recording** cannot work that way: it is
+a plaintext file that CameraX writes as it records, and the duty to delete it travels with it. It is
+overwritten and unlinked once the send attempt settles, succeeded or failed — which is the right way
+round, but it has a visible cost. Retrying afterwards reports *"That item is no longer on this
+device. Choose it again."* rather than silently re-reading nothing. A send that could be retried for
+ever is not worth a plaintext recording that survives for ever.
+
 Media received in a conversation can be **saved into the vault**, where it becomes an ordinary
 vault item under the ordinary limits: the 50-item free cap and the 100 MB per-item cap. That is
 what makes the expiry below tidy rather than lossy.

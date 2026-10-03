@@ -20,6 +20,7 @@
 import { useCallback, useState } from 'react';
 
 import { useServices } from '@/app/ServicesProvider';
+import { describeSendFailure } from '@/messaging/sendFailure';
 import { THUMB_MAX_EDGE } from '@/messaging/media';
 import type { MediaSource } from '@/messaging/messagingService';
 import type { Bytes } from '@/utils/bytes';
@@ -32,6 +33,14 @@ export interface OutgoingMedia {
   /** Kept so a retry needs no second trip to the picker. */
   readonly source: MediaSource;
   readonly failed: boolean;
+  /** Why the last attempt failed, in the words the user is shown. Null until one does. */
+  readonly problem: string | null;
+  /**
+   * False when nothing about tapping again could change the outcome -- not Pro, a rules refusal,
+   * a source file that is gone. The bubble withdraws its retry rather than offering one that is
+   * certain to fail the same way.
+   */
+  readonly retryable: boolean;
 }
 
 export interface OutgoingMediaController {
@@ -67,14 +76,25 @@ export function useOutgoingMedia(
 
   const run = useCallback(
     async (id: string, source: MediaSource): Promise<void> => {
-      setItems((prev) => prev.map((it) => (it.id === id ? { ...it, failed: false } : it)));
+      setItems((prev) =>
+        prev.map((it) => (it.id === id ? { ...it, failed: false, problem: null } : it)),
+      );
       try {
         await deliver(source);
         // The real message is on its way through the listener; this placeholder has done its job.
         setItems((prev) => prev.filter((it) => it.id !== id));
-      } catch {
-        // Held, not dropped: the source is still here and a retry costs one tap.
-        setItems((prev) => prev.map((it) => (it.id === id ? { ...it, failed: true } : it)));
+      } catch (caught) {
+        // Held, not dropped -- and the reason is held with it. Discarding the error is what made
+        // a retry indistinguishable from a dead button: the bubble came back saying the same
+        // thing whether the cause was a dropped connection or a server that will never accept it.
+        const failure = describeSendFailure(caught);
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === id
+              ? { ...it, failed: true, problem: failure.message, retryable: failure.retryable }
+              : it,
+          ),
+        );
       }
     },
     [deliver],
@@ -84,7 +104,10 @@ export function useOutgoingMedia(
     async (source: MediaSource): Promise<void> => {
       const id = `out_${String(Date.now())}_${String(Math.round(Math.random() * 1e6))}`;
       const preview = await previewFor(source);
-      setItems((prev) => [...prev, { id, kind: source.kind, preview, source, failed: false }]);
+      setItems((prev) => [
+        ...prev,
+        { id, kind: source.kind, preview, source, failed: false, problem: null, retryable: true },
+      ]);
       await run(id, source);
     },
     [previewFor, run],
@@ -93,7 +116,10 @@ export function useOutgoingMedia(
   const retry = useCallback(
     async (id: string): Promise<void> => {
       const item = items.find((it) => it.id === id);
-      if (item === undefined) return;
+      // A hopeless item is not re-run even if something asks: re-running it would clear the
+      // reason off the bubble, fail again, and put it back, which is the flicker-free nothing
+      // that got reported as a broken button.
+      if (item === undefined || !item.retryable) return;
       await run(id, item.source);
     },
     [items, run],

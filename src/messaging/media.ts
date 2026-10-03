@@ -16,10 +16,25 @@
  *     ciphertext under the same key, so without separate domains a 32 KB preview could be served
  *     in place of the 8 MB original, or the reverse. The domains make each refuse to open as the
  *     other.
+ *
+ * EVERYTHING HERE IS BYTES. Text messages carry their ciphertext in a Firestore field, so
+ * `messageCipher` base64-encodes it and must. Media does not: it goes to Storage as raw bytes, and
+ * the nonce travels with it. Encoding on the way out only to decode again before the upload cost a
+ * pure-JS pass over the whole payload in each direction, plus a UTF-16 string twice its size --
+ * 11 million characters for an 8 MB photo, and `utils/base64` says in its own first line that it is
+ * for keys and nonces, not images. On a 39 MB video that intermediate was the forty seconds of
+ * "Decrypting..." a tester reported as a hang.
+ *
+ * The bytes on the wire are unchanged by that: `nonce || ciphertext`, exactly as before, so
+ * everything already in Storage still opens.
  */
-import { SODIUM_AEAD_NONCE_BYTES, aeadDecrypt, aeadEncrypt } from '@/crypto/sodium';
+import {
+  SODIUM_AEAD_NONCE_BYTES,
+  SODIUM_AEAD_TAG_BYTES,
+  aeadDecrypt,
+  aeadEncrypt,
+} from '@/crypto/sodium';
 import type { SecureRandom } from '@/crypto/types';
-import { base64Decode, base64Encode } from '@/utils/base64';
 import type { Bytes } from '@/utils/bytes';
 
 /**
@@ -43,10 +58,15 @@ export const THUMB_MAX_EDGE = 256;
 
 export type MediaKind = 'photo' | 'video';
 
-/** The encrypted object as it is stored: the bytes go to Storage, the nonce to Firestore. */
+/**
+ * The encrypted object, in the two parts `packSealed` joins.
+ *
+ * Both are raw bytes. Nothing between here and Storage needs them as text, and making them text
+ * was the whole cost this module used to carry.
+ */
 export interface SealedMedia {
-  readonly box: string;
-  readonly nonce: string;
+  readonly box: Bytes;
+  readonly nonce: Bytes;
 }
 
 export interface MediaBinding {
@@ -83,14 +103,16 @@ export function thumbAad(binding: MediaBinding): string {
 
 function seal(plain: Bytes, key: Bytes, aad: string, random: SecureRandom): SealedMedia {
   const nonce = random.bytes(SODIUM_AEAD_NONCE_BYTES);
-  return { box: base64Encode(aeadEncrypt(plain, aad, nonce, key)), nonce: base64Encode(nonce) };
+  return { box: aeadEncrypt(plain, aad, nonce, key), nonce };
 }
 
 function open(sealed: SealedMedia, key: Bytes, aad: string): Bytes | null {
   try {
-    const nonce = base64Decode(sealed.nonce);
-    if (nonce.length !== SODIUM_AEAD_NONCE_BYTES) return null;
-    return aeadDecrypt(base64Decode(sealed.box), aad, nonce, key);
+    if (sealed.nonce.length !== SODIUM_AEAD_NONCE_BYTES) return null;
+    // Shorter than a tag is not ciphertext at all. An empty plaintext seals to exactly one tag,
+    // so the comparison has to admit that length rather than reject it.
+    if (sealed.box.length < SODIUM_AEAD_TAG_BYTES) return null;
+    return aeadDecrypt(sealed.box, aad, sealed.nonce, key);
   } catch {
     return null;
   }
@@ -129,6 +151,23 @@ export function capFor(kind: MediaKind): number {
 }
 
 /**
+ * What `packSealed` adds to a plaintext: the nonce it prefixes, and the tag the AEAD appends.
+ *
+ * Every local budget has to leave room for it, because the Storage rules measure the OBJECT. A
+ * photo of a few bytes under 8 MB otherwise passes every check on the device and is refused by the
+ * server -- the one kind of failure a retry can never get past.
+ */
+export const SEALED_OVERHEAD_BYTES = SODIUM_AEAD_NONCE_BYTES + SODIUM_AEAD_TAG_BYTES;
+
+/** The largest plaintext of this kind whose sealed object still fits the Storage ceiling. */
+export function plaintextBudget(kind: MediaKind): number {
+  return capFor(kind) - SEALED_OVERHEAD_BYTES;
+}
+
+/** The same, for a chat preview. */
+export const THUMB_PLAINTEXT_BUDGET = MAX_THUMB_BYTES - SEALED_OVERHEAD_BYTES;
+
+/**
  * The stored object is `nonce || ciphertext`, as raw bytes.
  *
  * The nonce travels with the object rather than in the message document, and that is the only
@@ -141,11 +180,9 @@ export function capFor(kind: MediaKind): number {
  * prefixing it costs 24 bytes and reveals nothing.
  */
 export function packSealed(sealed: SealedMedia): Bytes {
-  const nonce = base64Decode(sealed.nonce);
-  const box = base64Decode(sealed.box);
-  const packed = new Uint8Array(nonce.length + box.length);
-  packed.set(nonce, 0);
-  packed.set(box, nonce.length);
+  const packed = new Uint8Array(sealed.nonce.length + sealed.box.length);
+  packed.set(sealed.nonce, 0);
+  packed.set(sealed.box, sealed.nonce.length);
   return packed;
 }
 
@@ -153,7 +190,7 @@ export function packSealed(sealed: SealedMedia): Bytes {
 export function unpackSealed(packed: Bytes): SealedMedia | null {
   if (packed.length <= SODIUM_AEAD_NONCE_BYTES) return null;
   return {
-    nonce: base64Encode(packed.slice(0, SODIUM_AEAD_NONCE_BYTES)),
-    box: base64Encode(packed.slice(SODIUM_AEAD_NONCE_BYTES)),
+    nonce: packed.slice(0, SODIUM_AEAD_NONCE_BYTES),
+    box: packed.slice(SODIUM_AEAD_NONCE_BYTES),
   };
 }

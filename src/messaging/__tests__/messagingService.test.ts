@@ -18,6 +18,8 @@ import { InMemoryCloudBackend, InMemoryCloudStore } from '@/firebase/cloudBacken
 import { InMemorySecureStore } from '@/secure-storage/secureStore';
 import { InMemoryConversationAdmin } from '@/messaging/conversationAdmin';
 import { InMemoryDirectory } from '@/messaging/directory';
+import { MAX_PHOTO_BYTES, MAX_THUMB_BYTES } from '@/messaging/media';
+import type { TransferState } from '@/messaging/mediaProgress';
 import { HiddenMessages } from '@/messaging/hiddenMessages';
 import { deriveMessagingIdentity, type MessagingIdentity } from '@/messaging/identity';
 import {
@@ -632,6 +634,32 @@ describe('media messages', () => {
     expect(await bob.fs.readBytes(uri)).toEqual(PHOTO);
   });
 
+  it('reports the download, and then the phase that has no percentage to give', async () => {
+    const { alice, bob, conversationId } = await pair();
+    await alice.messaging.sendMedia(conversationId, { uri: 'file:///photo.jpg', kind: 'photo' });
+    await flush();
+
+    const thread = collect<ConversationState>((on) =>
+      bob.messaging.watchConversation(conversationId, on),
+    );
+    await flush();
+    const received = thread.last().messages[0];
+    if (received === undefined) throw new Error('expected the message');
+
+    const states: TransferState[] = [];
+    await bob.messaging.fetchMedia(conversationId, received, (state) => {
+      states.push(state);
+    });
+
+    // The transfer says how big the object is, which is what lets the viewer show a percentage
+    // instead of the featureless spinner that made a two-minute fetch look like a hang.
+    expect(states.some((state) => (state.total ?? 0) > 0)).toBe(true);
+    // And the LAST thing it says is that the bytes are in and the open has begun. That phase is
+    // one atomic AEAD open with no fraction to report, and on a real video it ran for forty
+    // seconds -- announcing it is the only thing that distinguishes it from a stall.
+    expect(states.at(-1)).toEqual({ opening: true });
+  });
+
   it('gives the other side a preview without downloading the media', async () => {
     const { alice, bob, conversationId } = await pair();
     await alice.messaging.sendMedia(conversationId, { uri: 'file:///photo.jpg', kind: 'photo' });
@@ -663,6 +691,202 @@ describe('media messages', () => {
     const thumb = alice.cloud.blobs.get(`messages/${conversationId}/thumb/${sent.id}`);
     expect(thumb).toBeDefined();
     expect(thumb?.length ?? 0).toBeLessThan(32 * 1024);
+  });
+
+  /**
+   * The photo nobody could send.
+   *
+   * The picker is opened with `quality: 1`, so a photo arrives at whatever size the camera wrote --
+   * on a recent phone routinely 6-8 MB against an 8 MB ceiling. The old behaviour refused anything
+   * over it, the tray discarded the reason, and the bubble offered a retry that re-ran the identical
+   * check. These pin the replacement: make it fit, and when it cannot, say so.
+   */
+  describe('a photo over its budget', () => {
+    /** Over the 8 MB ceiling, which is what the camera hands over on a modern phone. */
+    function oversizedPhoto(): Uint8Array {
+      const bytes = new Uint8Array(9 * 1024 * 1024);
+      for (let i = 0; i < bytes.length; i += 4096) bytes[i] = i & 0xff;
+      return bytes;
+    }
+
+    it('is re-encoded smaller and sent, rather than refused', async () => {
+      const { alice, bob, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///big.jpg', oversizedPhoto());
+      // Weighs 1 MB at the top rung, so the first re-encode already fits.
+      alice.thumbnails.sizeForEdge = (edge) => 1024 * 1024 * (edge / 2048) ** 2;
+
+      const sent = await alice.messaging.sendMedia(conversationId, {
+        uri: 'file:///big.jpg',
+        kind: 'photo',
+      });
+      await flush();
+
+      // It reached Storage, and the object is inside the ceiling the rules enforce.
+      const object = alice.cloud.blobs.get(sent.object ?? '');
+      expect(object).toBeDefined();
+      expect(object?.length ?? 0).toBeLessThan(MAX_PHOTO_BYTES);
+      // The first rung of the ladder was tried, and the preview came after it.
+      expect(alice.thumbnails.edges).toEqual([2048, 256]);
+
+      // And the other side can open what arrived.
+      const thread = collect<ConversationState>((on) =>
+        bob.messaging.watchConversation(conversationId, on),
+      );
+      await flush();
+      const received = thread.last().messages[0];
+      if (received === undefined) throw new Error('expected the message');
+      expect((await bob.messaging.fetchMediaBytes(conversationId, received)).length).toBeGreaterThan(
+        0,
+      );
+    });
+
+    it('leaves a photo already inside its budget untouched', async () => {
+      const { alice, conversationId } = await pair();
+      alice.thumbnails.sizeForEdge = (edge) => 1024 * (edge / 2048) ** 2;
+
+      await alice.messaging.sendMedia(conversationId, {
+        uri: 'file:///photo.jpg',
+        kind: 'photo',
+      });
+
+      // One generation, for the preview. Nothing re-encoded the photo itself.
+      expect(alice.thumbnails.edges).toEqual([256]);
+    });
+
+    it('refuses one that will not shrink, with a reason no retry could fix', async () => {
+      const { world, alice, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///big.jpg', oversizedPhoto());
+      // Incompressible at every rung.
+      alice.thumbnails.sizeForEdge = () => 9 * 1024 * 1024;
+
+      await expect(
+        alice.messaging.sendMedia(conversationId, { uri: 'file:///big.jpg', kind: 'photo' }),
+      ).rejects.toMatchObject({ code: 'rejected', problem: 'photo-too-large' });
+
+      // Nothing was uploaded and nothing was written: the refusal happens before the network.
+      expect([...alice.cloud.blobs.keys()]).toEqual([]);
+      expect(
+        [...world.store.documents.keys()].filter((key) =>
+          key.startsWith(MESSAGING_PATHS.messages(conversationId)),
+        ),
+      ).toEqual([]);
+    });
+
+    /**
+     * A video is read whole into memory, so the order of these two steps is the difference between
+     * refusing a 500 MB pick and allocating 500 MB first. There is no transcoder here, so the size
+     * the file system reports is the whole answer.
+     */
+    it('refuses an oversized video from its file size, without reading it', async () => {
+      const { alice, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///huge.mp4', new Uint8Array(101 * 1024 * 1024));
+      const read = jest.spyOn(alice.fs, 'readBytes');
+
+      await expect(
+        alice.messaging.sendMedia(conversationId, { uri: 'file:///huge.mp4', kind: 'video' }),
+      ).rejects.toMatchObject({ code: 'rejected', problem: 'video-too-large' });
+
+      expect(read).not.toHaveBeenCalled();
+      expect(alice.cloud.blobWrites).toEqual([]);
+      read.mockRestore();
+    });
+
+    it('reads a video that fits, exactly once', async () => {
+      const { alice, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///clip.mp4', new Uint8Array(1024));
+      const read = jest.spyOn(alice.fs, 'readBytes');
+
+      const sent = await alice.messaging.sendMedia(conversationId, {
+        uri: 'file:///clip.mp4',
+        kind: 'video',
+      });
+
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(alice.cloud.blobs.get(sent.object ?? '')).toBeDefined();
+      read.mockRestore();
+    });
+
+    /**
+     * A vault photo arrives as bytes under a `vault://` pseudo-URI, which names no file. The
+     * preflight must not try to stat it: there is nothing there, and the bytes are already in hand.
+     */
+    it('consults no file for a source that carries its own bytes', async () => {
+      const { alice, conversationId } = await pair();
+      const size = jest.spyOn(alice.fs, 'size');
+      const read = jest.spyOn(alice.fs, 'readBytes');
+
+      await alice.messaging.sendMedia(conversationId, {
+        uri: 'vault://entry-1',
+        kind: 'photo',
+        bytes: new Uint8Array([0xff, 0xd8, 0xff, 1, 2, 3]),
+      });
+
+      expect(size).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+      size.mockRestore();
+      read.mockRestore();
+    });
+
+    it('refuses an oversized VIDEO outright, because nothing here can transcode one', async () => {
+      const { alice, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///big.mp4', new Uint8Array(101 * 1024 * 1024));
+
+      await expect(
+        alice.messaging.sendMedia(conversationId, { uri: 'file:///big.mp4', kind: 'video' }),
+      ).rejects.toMatchObject({ code: 'rejected', problem: 'video-too-large' });
+      expect(alice.thumbnails.calls).toBe(0);
+    });
+
+    it('writes no plaintext of its own to disk', async () => {
+      const { alice, conversationId } = await pair();
+      await alice.fs.writeBytes('file:///big.jpg', oversizedPhoto());
+      alice.thumbnails.sizeForEdge = (edge) => 1024 * 1024 * (edge / 2048) ** 2;
+      const before = [...alice.fs.allFiles.keys()].sort();
+
+      await alice.messaging.sendMedia(conversationId, { uri: 'file:///big.jpg', kind: 'photo' });
+
+      // The source is still there for a retry, and the reduction left nothing behind: it works on
+      // bytes in memory, and the real generator securely deletes its own cache file before it
+      // returns. (`ExpoThumbnailGenerator` does that in a `finally`.)
+      expect([...alice.fs.allFiles.keys()].sort()).toEqual(before);
+      expect(await alice.fs.exists('file:///big.jpg')).toBe(true);
+    });
+  });
+
+  /**
+   * The preview has its own ceiling, 32 KB, and it is enforced by the Storage rules on the object.
+   * Nothing enforced it locally, so a preview that compressed badly took the WHOLE send down with
+   * it: `putBlob` has no try/catch around it, and the photo upload never happened.
+   */
+  it('shrinks a preview that would not fit instead of failing the send', async () => {
+    const { alice, conversationId } = await pair();
+    // Over the ceiling at the chat size, under it two rungs down.
+    alice.thumbnails.sizeForEdge = (edge) => (edge >= 192 ? 40 * 1024 : 20 * 1024);
+
+    const sent = await alice.messaging.sendMedia(conversationId, {
+      uri: 'file:///photo.jpg',
+      kind: 'photo',
+    });
+
+    expect(alice.thumbnails.edges).toEqual([256, 192, 160]);
+    const thumb = alice.cloud.blobs.get(sent.thumbObject ?? '');
+    expect(thumb).toBeDefined();
+    expect(thumb?.length ?? 0).toBeLessThan(MAX_THUMB_BYTES);
+    // The photo still went, which is the point: a preview is a nicety, the photo is the message.
+    expect(alice.cloud.blobs.get(sent.object ?? '')).toBeDefined();
+  });
+
+  it('sends with no preview at all rather than refusing, when none can be made to fit', async () => {
+    const { alice, conversationId } = await pair();
+    alice.thumbnails.sizeForEdge = () => 40 * 1024;
+
+    const sent = await alice.messaging.sendMedia(conversationId, {
+      uri: 'file:///photo.jpg',
+      kind: 'photo',
+    });
+
+    expect(sent.thumbObject).toBeNull();
+    expect(alice.cloud.blobs.get(sent.object ?? '')).toBeDefined();
   });
 
   // A bubble pointing at an object that is not there can never be fixed; an orphaned object is
@@ -700,15 +924,35 @@ describe('media messages', () => {
     expect(free.cloud.blobWrites).toEqual([]);
   });
 
-  it('refuses an oversized item before uploading anything', async () => {
+  /**
+   * An oversized photo is no longer refused -- it is re-encoded smaller first, and only a photo
+   * that will not shrink is refused. What has not changed, and is what this always guarded, is that
+   * a refusal uploads nothing: the check runs before the first byte leaves the device.
+   */
+  it('uploads nothing when an item cannot be sent at all', async () => {
     const { alice, conversationId } = await pair();
     const huge = new Uint8Array(9 * 1024 * 1024);
     await alice.fs.writeBytes('file:///huge.jpg', huge);
+    // Incompressible: every rung of the ladder comes back over the ceiling.
+    alice.thumbnails.sizeForEdge = () => 9 * 1024 * 1024;
 
     await expect(
       alice.messaging.sendMedia(conversationId, { uri: 'file:///huge.jpg', kind: 'photo' }),
-    ).rejects.toMatchObject({ code: 'rejected' });
+    ).rejects.toMatchObject({ code: 'rejected', problem: 'photo-too-large' });
     expect(alice.cloud.blobWrites).toEqual([]);
+  });
+
+  it('re-encodes an oversized photo instead of refusing it', async () => {
+    const { alice, conversationId } = await pair();
+    await alice.fs.writeBytes('file:///huge.jpg', new Uint8Array(9 * 1024 * 1024));
+
+    const sent = await alice.messaging.sendMedia(conversationId, {
+      uri: 'file:///huge.jpg',
+      kind: 'photo',
+    });
+
+    expect(alice.cloud.blobWrites.length).toBeGreaterThan(0);
+    expect(alice.cloud.blobs.get(sent.object ?? '')?.length ?? 0).toBeLessThan(MAX_PHOTO_BYTES);
   });
 
   // What a 30-day-old photo does: the bubble stays, the imagery is gone, preview included.

@@ -369,7 +369,17 @@ export interface DecryptedMessage {
 // What may be sent
 // ---------------------------------------------------------------------------------------------
 
-export type MessageProblem = 'empty' | 'too-long' | SensitiveReason;
+/**
+ * `photo-too-large` and `video-too-large` are media, not text: they are raised by `sendMedia`
+ * after it has tried to make the item fit, so they mean "this cannot be sent at all", never
+ * "shorten it". `too-long` stays what it always was, a text length.
+ */
+export type MessageProblem =
+  | 'empty'
+  | 'too-long'
+  | 'photo-too-large'
+  | 'video-too-large'
+  | SensitiveReason;
 
 export type MessageCheck =
   | { readonly ok: true; readonly body: string }
@@ -390,6 +400,10 @@ export function describeMessageProblem(problem: MessageProblem): string {
       return 'Type a message first.';
     case 'too-long':
       return `Keep it under ${String(MAX_MESSAGE_LENGTH)} characters.`;
+    case 'photo-too-large':
+      return 'This photo is too large to send. Please choose a smaller photo.';
+    case 'video-too-large':
+      return 'This video is too large to send. Please choose a shorter one.';
     case 'vault-data':
       return 'That looks like vault data. It cannot be sent, even encrypted.';
     case 'pin':

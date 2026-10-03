@@ -121,20 +121,38 @@ export class FakeThumbnailGenerator implements ThumbnailGenerator {
    */
   lastMaxDimension: number | null = null;
 
+  /** Every long edge asked for, in order, so a spec can assert which ladder steps were tried. */
+  readonly edges: number[] = [];
+
+  /**
+   * How many bytes the output should weigh, given the long edge asked for. Null keeps the fixed
+   * 64-byte stand-in every other spec expects; a function is how the size ceilings are exercised,
+   * since a real JPEG's weight is what the ladder reacts to and nothing else about it matters.
+   */
+  sizeForEdge: ((maxDimension: number) => number) | null = null;
+
   async generate(
     image: ImageInput,
     maxDimension: number = THUMBNAIL.defaultMaxDimension,
   ): Promise<ThumbnailResult> {
     this.calls += 1;
     this.lastMaxDimension = maxDimension;
+    this.edges.push(maxDimension);
     if (this.failOnNextCall) {
       this.failOnNextCall = false;
       throw new ImageDecodeError('fake decode failure');
     }
     const scale = Math.min(1, maxDimension / Math.max(this.sourceWidth, this.sourceHeight));
-    const jpegBytes = new Uint8Array(64);
+    // Four bytes is the floor: the magic number below has to fit.
+    const length =
+      this.sizeForEdge === null ? 64 : Math.max(4, Math.round(this.sizeForEdge(maxDimension)));
+    const jpegBytes = new Uint8Array(length);
     jpegBytes.set([0xff, 0xd8, 0xff, 0xe0], 0);
-    for (let i = 4; i < jpegBytes.length; i++) {
+    // Only the head carries the pattern. A spec that asks for a multi-megabyte output is
+    // exercising a size ceiling, and patterning every byte of one through `at()` costs seconds per
+    // call; the bytes past here are never inspected.
+    const patterned = Math.min(jpegBytes.length, 4096);
+    for (let i = 4; i < patterned; i++) {
       jpegBytes[i] = (image.bytes.at(i % Math.max(image.bytes.length, 1)) ?? 0) ^ 0x5a;
     }
     return {

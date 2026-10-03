@@ -43,6 +43,20 @@
  * the manifest entirely (it is in `blockedPermissions` in app.config.ts): a calculator that asks
  * for the microphone is a calculator nobody installs. Enabling audio later means unblocking that
  * permission and dropping `mute`, and nothing else.
+ *
+ * A KEPT CAPTURE HAS TWO POSSIBLE DESTINATIONS, and exactly one prop decides which. Mounted
+ * without {@link CameraSheetProps.onCapture} -- how the gallery mounts it -- "Keep" encrypts the
+ * capture into the vault, under the vault's own entitlement gate, as it always has. Mounted WITH
+ * it -- how a conversation mounts it -- "Keep" hands the capture over and the vault is not
+ * involved at all: no repository, no 50-item cap, no 100 MB per-item cap, no import. Those rules
+ * are about what the VAULT holds, and a photo on its way to a chat never becomes a vault item;
+ * the chat has its own Pro gate, its own size ceilings and its own encryption, and the capture
+ * joins them at the same place an item picked from the photo library does.
+ *
+ * Everything above about plaintext still holds in both modes. What changes is who owns it: a
+ * handed-over photo is a COPY, because this sheet zeroes its own buffer the moment the decision
+ * is made, and a handed-over recording is a file this sheet stops tracking, so the duty to delete
+ * it travels with the URI.
  */
 import {
   CameraView,
@@ -139,16 +153,44 @@ async function takePicture(camera: CameraView): Promise<CameraCapturedPicture | 
   return camera.takePictureAsync({ quality: 1, base64: false, exif: false, skipProcessing: false });
 }
 
+/**
+ * A kept capture, handed to a caller instead of being encrypted into the vault.
+ *
+ * A photo is bytes, which is the form it is already in: `expo-camera`'s plaintext cache file was
+ * overwritten and unlinked back in the capture, so there is no file left to own. A video is a URI,
+ * because a recording is only ever a file -- CameraX writes it as it records and there is no
+ * in-memory form to hand over instead.
+ */
+export type CameraCapture =
+  | { readonly kind: 'photo'; readonly bytes: Bytes }
+  | { readonly kind: 'video'; readonly uri: string; readonly durationMs: number };
+
 export interface CameraSheetProps {
   visible: boolean;
   onClose: () => void;
+  /**
+   * Where a kept capture goes INSTEAD of the vault. Absent, and the vault behaviour is exactly
+   * what it was; present, and no part of this sheet opens the vault or consults its caps.
+   *
+   * THE RECEIVER OWNS WHAT IT IS GIVEN. For a video that is the plaintext recording: this sheet
+   * drops it from its own tracking the moment it is handed over, so whoever takes it must delete
+   * it once the send no longer needs it -- nobody else will. For a photo it is a buffer to zero
+   * when finished with; the copy handed over is not the one this sheet wipes.
+   */
+  onCapture?: (capture: CameraCapture) => void;
 }
 
-export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.Element | null {
+export function CameraSheet({
+  visible,
+  onClose,
+  onCapture,
+}: CameraSheetProps): React.JSX.Element | null {
   const colors = useTheme();
   const styles = useStyles(makeStyles);
   const services = useServices();
   const [permission, requestPermission] = useCameraPermissions();
+  /** Whether this sheet is feeding a conversation rather than the vault. */
+  const toChat = onCapture !== undefined;
 
   const [facing, setFacing] = useState<CameraType>('back');
   const [flash, setFlash] = useState<FlashMode>('off');
@@ -290,20 +332,35 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
     ask();
   }, [ask, permission, visible]);
 
+  /**
+   * Null when the vault would accept one more item, otherwise the notice to show instead of
+   * capturing anything. Asked BEFORE the camera runs: a frame that could not be kept is a
+   * plaintext file that never needed to exist.
+   *
+   * Always null in chat mode. A capture bound for a conversation never becomes a vault item, so
+   * the vault's 50-item free cap has nothing to say about it -- the chat's own gate is Pro, and
+   * it is enforced by the security rules rather than here.
+   */
+  const vaultRefusal = useCallback((): string | null => {
+    if (toChat) return null;
+    const gate = services.entitlements.gate(openRepository(services)?.photos.length ?? 0, 0);
+    return gate.allowed ? null : upsellMessage(gate.reason);
+  }, [services, toChat]);
+
   const capture = useCallback(() => {
     if (captureInFlight.current) return;
     const camera = cameraRef.current;
     if (camera === null) return;
-    const target = openRepository(services);
-    if (target === null) {
+    // The vault is the destination only when no conversation is waiting for this capture, so
+    // only then is its lock a precondition of the shutter. Whether messaging itself can run is the
+    // send's own business: it reports `locked` through the tray, in the right words.
+    if (!toChat && openRepository(services) === null) {
       setNotice('The vault is locked.');
       return;
     }
-    // The free tier's cap, checked before the shutter fires: a frame that could not be kept is
-    // a plaintext file that never needed to exist.
-    const gate = services.entitlements.gate(target.photos.length, 0);
-    if (!gate.allowed) {
-      setNotice(upsellMessage(gate.reason));
+    const refusal = vaultRefusal();
+    if (refusal !== null) {
+      setNotice(refusal);
       return;
     }
     const inspector: CaptureInspector = services.captureInspector;
@@ -376,7 +433,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
         }
       }
     })();
-  }, [services]);
+  }, [services, toChat, vaultRefusal]);
 
   /**
    * `recordAsync` does not resolve until `stopRecording` is called (or the cap is reached), so the
@@ -388,7 +445,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
     if (captureInFlight.current) return;
     const camera = cameraRef.current;
     if (camera === null) return;
-    if (openRepository(services) === null) {
+    if (!toChat && openRepository(services) === null) {
       setNotice('The vault is locked.');
       return;
     }
@@ -436,7 +493,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
       setPendingVideo({ uri, durationMs });
       setRecording(false);
     })();
-  }, [services]);
+  }, [services, toChat]);
 
   const stopRecording = useCallback(() => {
     cameraRef.current?.stopRecording();
@@ -446,6 +503,26 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
     const bytes = pending.current;
     const video = pendingVideo;
     if (bytes === null && video === null) return;
+
+    // Handed to the conversation, and this sheet is done. Nothing below this branch runs: no
+    // repository is opened, no entitlement is gated, nothing is encrypted here. The chat pipeline
+    // does all three, under its own rules, exactly as it does for a picked item.
+    if (onCapture !== undefined) {
+      if (video !== null) {
+        // Ownership of the plaintext recording travels with the URI. Dropped from the ref FIRST,
+        // because `close` securely deletes whatever is still in it -- which would otherwise wipe
+        // the file out from under a send that has not read it yet.
+        pendingVideoUri.current = null;
+        onCapture({ kind: 'video', uri: video.uri, durationMs: video.durationMs });
+      } else if (bytes !== null) {
+        // A copy. `close` zeroes ours, and handing over the same array would deliver a photo of
+        // nothing but zeroes.
+        onCapture({ kind: 'photo', bytes: bytes.slice() });
+      }
+      close();
+      return;
+    }
+
     const repository = openRepository(services);
     if (repository === null) {
       setNotice('The vault is locked.');
@@ -488,7 +565,7 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
         if (mounted.current) setSaving(false);
       }
     })();
-  }, [dropPending, pendingVideo, services]);
+  }, [close, dropPending, onCapture, pendingVideo, services]);
 
   const discard = useCallback(() => {
     const wasVideo = pendingVideo !== null;
@@ -627,13 +704,12 @@ export function CameraSheet({ visible, onClose }: CameraSheetProps): React.JSX.E
                   // A video is one vault item like any other, so a full free vault refuses it.
                   // Refused HERE, before the camera is rebound for video, so no recording can
                   // ever be started that could not be kept. The size is unknown until the file
-                  // exists, so `bytes` is 0 and the size check happens after recording.
-                  const gate = services.entitlements.gate(
-                    openRepository(services)?.photos.length ?? 0,
-                    0,
-                  );
-                  if (!gate.allowed) {
-                    setNotice(upsellMessage(gate.reason));
+                  // exists, so only the item count is asked about; the size is checked once the
+                  // recording exists. In chat mode there is nothing to refuse: see
+                  // `vaultRefusal`, and the chat's own ceiling is applied by the send.
+                  const refusal = vaultRefusal();
+                  if (refusal !== null) {
+                    setNotice(refusal);
                     return;
                   }
                 }

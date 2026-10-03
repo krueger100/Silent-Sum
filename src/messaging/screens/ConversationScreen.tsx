@@ -30,10 +30,9 @@ import { Screen } from '@/components/Screen';
 import {
   DELETED_MESSAGE_TEXT,
   MAX_MESSAGE_LENGTH,
-  describeMessageProblem,
   type DecryptedMessage,
-  type MessageProblem,
 } from '@/messaging/messaging';
+import { describeSendFailure } from '@/messaging/sendFailure';
 import { MessageActionsSheet } from '@/messaging/screens/MessageActionsSheet';
 import {
   MessagingError,
@@ -48,7 +47,7 @@ import { MediaBubble } from '@/messaging/screens/MediaBubble';
 import { MediaViewer, type ViewerItem } from '@/messaging/screens/MediaViewer';
 import { VaultPickerSheet } from '@/messaging/screens/VaultPickerSheet';
 import { VaultSendNotice } from '@/messaging/vaultSendNotice';
-import { CameraSheet } from '@/camera/CameraSheet';
+import { CameraSheet, type CameraCapture } from '@/camera/CameraSheet';
 import { openRepository } from '@/gallery/vaultAccess';
 import { isVideo } from '@/vault/mediaKind';
 import type { PhotoEntry } from '@/vault/types';
@@ -68,27 +67,13 @@ export interface ConversationScreenProps {
 }
 
 function describeSendError(error: unknown): string {
-  if (error instanceof MessagingError) {
-    // `rejected` carries a MessageProblem; `vault-refused` carries a GateReason, which the
-    // upsell dialog explains rather than this line, so it falls through to the generic copy.
-    if (error.code === 'rejected' && isMessageProblem(error.problem)) {
-      return describeMessageProblem(error.problem);
-    }
-    return describeMessagingError(error.code);
-  }
-  return 'That message could not be sent. Try again.';
+  return describeSendFailure(error).message;
 }
 
 /** Its own describer: the send fallback says "could not be sent", which is untrue of a deletion. */
 function describeDeleteError(error: unknown): string {
   if (error instanceof MessagingError) return describeMessagingError(error.code);
   return 'That message could not be deleted. Try again.';
-}
-
-function isMessageProblem(problem: unknown): problem is MessageProblem {
-  return (
-    typeof problem === 'string' && problem !== 'itemLimit' && problem !== 'fileSize'
-  );
 }
 
 export function ConversationScreen({
@@ -226,6 +211,50 @@ export function ConversationScreen({
   );
 
   /**
+   * A capture from the in-chat camera, handed to the same tray the picker and the vault feed.
+   * Nothing about the send differs by source past this line: one `MediaSource`, one `sendMedia`,
+   * one cipher, one upload, one message.
+   *
+   * What does differ is who owns the plaintext, and for a video that matters. The recording is a
+   * plaintext file in the cache, and the duty to delete it arrives with the URI: it is overwritten
+   * and unlinked once the attempt settles, whether the attempt succeeded or failed. That is the
+   * same bargain a vault video's scratch file makes here, and it has the same consequence -- a
+   * retry after the file has gone reports "choose it again" instead of re-reading nothing -- and
+   * it is the right way round: a send that can be retried for ever is not worth a plaintext
+   * recording left on the disk for ever.
+   *
+   * A photo needs none of that. `expo-camera`'s own temp JPEG was securely deleted inside the
+   * capture, so the bytes are all there is, and the tray holds them for a retry exactly as it
+   * holds a vault photo's. The pseudo-URI names the source the way `vault://` does; nothing
+   * dereferences it, because the bytes are already in hand.
+   */
+  const sendCapture = useCallback(
+    (capture: CameraCapture): void => {
+      // Suspended across the whole send, as the picker and the vault are: an upload easily outlasts
+      // the idle timeout, and a lock mid-upload would unmount this screen and lose it. The
+      // suspension is a counter, so nesting inside `deliverMedia`'s own is harmless.
+      const suspension = services.autoLockSuspension;
+      suspension.suspend();
+      void (async () => {
+        try {
+          if (capture.kind === 'photo') {
+            await sendMedia({ uri: 'camera://photo', kind: 'photo', bytes: capture.bytes });
+            return;
+          }
+          try {
+            await sendMedia({ uri: capture.uri, kind: 'video' });
+          } finally {
+            await services.secureDelete.file(capture.uri);
+          }
+        } finally {
+          suspension.resume();
+        }
+      })();
+    },
+    [sendMedia, services],
+  );
+
+  /**
    * Sending anything hands the user to a picker or the camera, and then to an upload that can
    * easily outlast the idle timeout -- so auto-lock is suspended across the whole sequence, not
    * just the picker. Locking mid-upload would unmount this screen and lose the send.
@@ -284,12 +313,22 @@ export function ConversationScreen({
       void (async () => {
         try {
           if (message.kind === 'video') {
-            const uri = await messaging.fetchMedia(conversationId, message);
+            const uri = await messaging.fetchMedia(conversationId, message, (state) => {
+              // Only while it is still the thing being waited on: a progress event that arrives
+              // after the viewer was closed, or after it failed, must not put the spinner back.
+              setViewing((current) =>
+                current !== null && current.kind === 'loading' ? { kind: 'loading', ...state } : current,
+              );
+            });
             viewerScratch.current = uri;
             setViewing({ kind: 'video', uri });
             return;
           }
-          const bytes = await messaging.fetchMediaBytes(conversationId, message);
+          const bytes = await messaging.fetchMediaBytes(conversationId, message, (state) => {
+            setViewing((current) =>
+              current !== null && current.kind === 'loading' ? { kind: 'loading', ...state } : current,
+            );
+          });
           setViewing({ kind: 'photo', bytes });
         } catch (caught) {
           // Shown inside the viewer rather than as a banner behind it: the user is looking at
@@ -422,22 +461,38 @@ export function ConversationScreen({
                   mine
                   state={item.failed ? 'retry' : 'uploading'}
                   preview={item.preview}
+                  retryable={item.retryable}
                   onOpen={() => undefined}
                   onRetry={() => {
                     void outgoing.retry(item.id);
                   }}
                 />
                 {item.failed ? (
-                  <Pressable
-                    testID={`conversation_outgoing_discard_${item.id}`}
-                    accessibilityRole="button"
-                    accessibilityLabel="Discard"
-                    onPress={() => {
-                      outgoing.dismiss(item.id);
-                    }}
-                  >
-                    <Text style={styles.discard}>Discard</Text>
-                  </Pressable>
+                  <>
+                    {/*
+                      Why it failed, in the one place with room for a sentence. Without this the
+                      bubble said "Tap to retry" whatever the cause, so a send the server will
+                      never accept looked exactly like a dropped connection.
+                    */}
+                    {item.problem === null ? null : (
+                      <Text
+                        testID={`conversation_outgoing_problem_${item.id}`}
+                        style={styles.outgoingProblem}
+                      >
+                        {item.problem}
+                      </Text>
+                    )}
+                    <Pressable
+                      testID={`conversation_outgoing_discard_${item.id}`}
+                      accessibilityRole="button"
+                      accessibilityLabel="Discard"
+                      onPress={() => {
+                        outgoing.dismiss(item.id);
+                      }}
+                    >
+                      <Text style={styles.discard}>Discard</Text>
+                    </Pressable>
+                  </>
                 ) : null}
               </View>
             ))}
@@ -530,11 +585,13 @@ export function ConversationScreen({
         )}
       </KeyboardAvoider>
       <MediaViewer item={viewing} onClose={closeViewer} />
+      {/* The capture callback is what makes this the CHAT camera rather than the vault one. */}
       <CameraSheet
         visible={capturing}
         onClose={() => {
           setCapturing(false);
         }}
+        onCapture={sendCapture}
       />
       <VaultPickerSheet
         visible={pickingVault}
@@ -770,6 +827,9 @@ function createStyles(palette: Palette) {
       gap: 4,
     },
     outgoingItem: { alignItems: 'flex-end', gap: 2 },
+    // Capped at the bubble's own width so a sentence wraps above the Discard row rather than
+    // stretching the tray across the thread.
+    outgoingProblem: { fontSize: 12, color: palette.textMuted, maxWidth: 220, textAlign: 'right' },
     discard: { fontSize: 12, fontWeight: '400', color: palette.textMuted },
     // Media sits in its own row rather than a text bubble: it is sized by the image, and the
     // group tails that make a run of texts read as one are wrong for a photo.

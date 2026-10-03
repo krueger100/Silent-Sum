@@ -17,6 +17,7 @@ import {
   type CloudUser,
   type CollectionEntry,
   type CollectionQuery,
+  type TransferProgress,
 } from '@/firebase/types';
 import { uriDirname, type FileSystem } from '@/storage/fileSystem';
 import type { Bytes } from '@/utils/bytes';
@@ -130,6 +131,15 @@ async function guard<T>(action: () => Promise<T>): Promise<T> {
 /** RNFirebase tasks are thenable but not promises, so they are adapted rather than awaited. */
 interface ThenableTask {
   then(onFulfilled: () => void, onRejected: (error: unknown) => void): unknown;
+  /**
+   * RNFirebase reports transfer progress here. Optional so this stays a minimal structural type
+   * rather than a dependency on the library's own, and so a task that cannot report is simply a
+   * transfer with no percentage rather than a crash.
+   */
+  on?: (
+    event: 'state_changed',
+    observer: (snapshot: { bytesTransferred: number; totalBytes: number }) => void,
+  ) => unknown;
 }
 
 function taskDone(task: ThenableTask): Promise<void> {
@@ -404,7 +414,7 @@ export class FirebaseCloudBackend implements CloudBackend {
    * lands in the app-private cache and is read and deleted immediately. It is ciphertext the whole
    * way: the same bytes that sit in the vault on disk.
    */
-  async getBlob(path: string): Promise<Bytes> {
+  async getBlob(path: string, onProgress?: TransferProgress): Promise<Bytes> {
     const files = this.files;
     if (files === null) {
       throw new CloudError(CLOUD_ERROR_CODES.unknown, 'downloads need app-private storage');
@@ -414,7 +424,13 @@ export class FirebaseCloudBackend implements CloudBackend {
     const target = `${directory}/${path.replace(/[^A-Za-z0-9.]+/g, '_')}`;
     await files.makeDirectory(directory);
     try {
-      await guard(() => taskDone(storage.writeToFile(storage.ref(this.storage, path), target)));
+      const task = storage.writeToFile(storage.ref(this.storage, path), target);
+      if (onProgress !== undefined && typeof task.on === 'function') {
+        task.on('state_changed', (snapshot) => {
+          onProgress(snapshot.bytesTransferred, snapshot.totalBytes);
+        });
+      }
+      await guard(() => taskDone(task));
       return await files.readBytes(target);
     } finally {
       await files.deleteFile(target).catch(() => undefined);

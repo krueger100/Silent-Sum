@@ -44,6 +44,11 @@ export interface MediaBubbleProps {
   readonly preview: Bytes | null;
   readonly onOpen: () => void;
   readonly onRetry: () => void;
+  /**
+   * Whether tapping this one again could change anything. Defaults to true, so a bubble that is
+   * not an outgoing item -- every `failed` incoming preview -- keeps the retry it always had.
+   */
+  readonly retryable?: boolean;
   readonly onSaveToVault?: () => void;
   /**
    * Opens the message actions sheet, the same one a text bubble opens.
@@ -68,6 +73,7 @@ export function MediaBubble({
   preview,
   onOpen,
   onRetry,
+  retryable = true,
   onSaveToVault,
   onLongPress,
 }: MediaBubbleProps): React.JSX.Element {
@@ -124,13 +130,22 @@ export function MediaBubble({
   // a photo -- which is what makes the thread feel like it responded to the tap.
   if (state === 'uploading' || state === 'retry') {
     const failed = state === 'retry';
+    // A failure a retry cannot fix is still shown here -- the preview is local and the user picked
+    // it -- but it is not a button. The reason sits beside the bubble, where there is room for it.
+    const canRetry = failed && retryable;
     return (
       <Pressable
         testID={`conversation_media_${failed ? 'retry' : 'uploading'}_${messageId}`}
-        accessibilityRole={failed ? 'button' : 'image'}
-        accessibilityLabel={failed ? `Retry sending ${label(kind)}` : `Sending ${label(kind)}`}
+        accessibilityRole={canRetry ? 'button' : 'image'}
+        accessibilityLabel={
+          failed
+            ? canRetry
+              ? `Retry sending ${label(kind)}`
+              : `${label(kind)} not sent`
+            : `Sending ${label(kind)}`
+        }
         accessibilityState={{ busy: !failed }}
-        disabled={!failed}
+        disabled={!canRetry}
         onPress={onRetry}
         onLongPress={onLongPress}
         style={styles.frame}
@@ -147,8 +162,8 @@ export function MediaBubble({
         <View style={styles.overlay}>
           {failed ? (
             <>
-              <Text style={styles.overlayGlyph}>↻</Text>
-              <Text style={styles.overlayLabel}>Tap to retry</Text>
+              <Text style={styles.overlayGlyph}>{canRetry ? '↻' : '!'}</Text>
+              <Text style={styles.overlayLabel}>{canRetry ? 'Tap to retry' : 'Not sent'}</Text>
             </>
           ) : (
             <>

@@ -102,6 +102,9 @@ export function isFieldIncrement(value: unknown): value is FieldIncrement {
 }
 
 /** Auth + document store + blob store, owner-scoped under `users/<uid>/...`. */
+/** Bytes moved so far, and the total when the transfer knows it (zero until it does). */
+export type TransferProgress = (transferred: number, total: number) => void;
+
 export interface CloudBackend {
   readonly currentUser: CloudUser | null;
   /** Emits on every auth change; returns unsubscribe. */
@@ -173,7 +176,11 @@ export interface CloudBackend {
    */
   putBlobFromFile(path: string, localUri: string): Promise<void>;
   /** Throws CloudError('object-not-found') when absent. */
-  getBlob(path: string): Promise<Bytes>;
+  /**
+   * `onProgress` exists because a chat video is tens of megabytes over a phone connection, and
+   * the only thing worse than a slow download is one that reports nothing while it runs.
+   */
+  getBlob(path: string, onProgress?: TransferProgress): Promise<Bytes>;
   /** The same download, landing in a local file. Throws CloudError('object-not-found') when absent. */
   getBlobToFile(path: string, localUri: string): Promise<void>;
   /** Missing blob is not an error. */
