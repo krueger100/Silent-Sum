@@ -9,6 +9,7 @@
 import { PinAuthService } from '@/auth/pinAuthService';
 import { VaultSession } from '@/auth/vaultSession';
 import { BackupService } from '@/backup/backupService';
+import { VaultOwnerStore } from '@/backup/vaultOwner';
 import type { BillingService } from '@/billing/billingService';
 import { EntitlementsController } from '@/billing/entitlementsController';
 import { ExpoCaptureInspector, type CaptureInspector } from '@/camera/captureInspector';
@@ -309,6 +310,7 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
           random,
           fs,
           secureDelete,
+          owner: new VaultOwnerStore(secureStore),
         });
 
   return {

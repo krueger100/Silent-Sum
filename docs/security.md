@@ -553,14 +553,55 @@ Off by default and entirely optional.
   playback — and all three scratch files are securely deleted in a `finally`, including on a failed
   import.
 
-  `rebindBackup` then re-points the account at the vault's key: every blob re-uploaded, the index
-  and manifest rewritten, and the envelope rewrapped **last**, so it only ever claims a key the
-  rest of the account is already using. The passphrase does not change. Without this step the next
-  `backupNow` could not read its own index. There is a crash window between the first re-upload and
-  the new envelope where a restore from another device would fail; nothing is lost when it happens,
-  because this device holds every photo, and turning backup off and on rebuilds the account.
+  The restore stops there. `rebindBackup` — which re-points the account at this vault's key so a
+  later `backupNow` can read its own index — is a **separate action behind a typed confirmation**,
+  and it re-uploads only the ids that account's own backup holds. It used to run automatically at
+  the end of every foreign restore, over `repository.photos`, and that was a cross-account leak:
+  the vault is device-scoped while a backup is account-scoped, so "every photo on this device" is
+  not the same set as "every photo in this account". Signing out of one account and into another
+  left both sets in one vault, and the automatic rebind put all of them into the second account —
+  then rewrapped that account's envelope around the device's master key, so its passphrase could
+  unwrap photos that were never its own.
+
+  When it does run: the index and manifest are rewritten and the envelope rewrapped **last**, so it
+  only ever claims a key the rest of the account is already using. The passphrase does not change.
+  There is a crash window between the first re-upload and the new envelope where a restore from
+  another device would fail; nothing is lost when it happens, because this device holds every
+  photo, and turning backup off and on rebuilds the account.
 
   The recovered key is zeroed in a `finally` on every path.
+
+- **One vault, many possible accounts.** The vault belongs to the device and a backup belongs to an
+  account, and nothing used to connect the two. `silentsum.vault.owner.v1` in the secure store now
+  records which account this vault has been backed up to, and every write path consults it:
+  `enable` and `backupNow` refuse with `ForeignVaultError` when the vault is already backed up
+  elsewhere, until the user confirms a named upload to a named account. `enable` is gated as well
+  as `backupNow`, because an envelope hands that account's passphrase the power to unwrap this
+  vault's master key even though no photo moves. The record is erased with the vault, since erasing
+  a vault must forget which account it was backed up to.
+
+  It is a uid, not a vault identity, so it answers the cross-ACCOUNT question on one device.
+
+- **`vaultId` names the vault itself**, across devices. `HKDF-SHA256(masterKey, ∅,
+  "silentsum/vault/id/v1", 16)` — its own HKDF domain, so it is independent of every sub-key and of
+  the messaging identity, one-way, and safe to store in the clear. Deliberately not a `VaultKeyId`:
+  those are bound into the AAD of every blob, so adding one would change the storage format.
+
+  It is written to the envelope (which vault this account's backup belongs to) and to the manifest
+  (which vault wrote the current data set). The second is not redundant — an envelope from one
+  vault beside an index from another is exactly the state that makes a backup unrestorable, and it
+  used to be invisible until someone tried to restore it.
+
+  **A missing `vaultId` means "unknown", never "mismatch".** Every envelope written before the
+  field existed has none, and refusing those would strand the users with the oldest backups. They
+  fall through to the check that has always been there: a cloud index either decrypts under this
+  vault's key or it does not, and `readCloudIndex` runs before a single byte is written. The id
+  only ever lets the refusal arrive earlier and name both vaults.
+
+  Writing it needs the Firestore rules to allow the field, and rules and app builds cannot land at
+  the same instant. So a build whose rules have not caught up tries once, takes `permission-denied`
+  as "not yet", drops the field, retries, and stops trying for the session. A second refusal is a
+  real permission problem and propagates. Nothing breaks in either direction.
 
 - Security rules restrict every path to the token's uid, validate the envelope and manifest shapes,
   and bound object size and content type. App Check is activated.

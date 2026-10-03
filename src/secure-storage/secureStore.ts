@@ -32,6 +32,11 @@ export const SECURE_STORE_KEYS = {
   /** The armed wipe PIN, when the user has set one. Absent otherwise. */
   wipePin: 'silentsum.vault.wipe.v1',
   /**
+   * Which backup account this device's vault has been backed up to, so signing into a second
+   * account cannot silently upload the first account's photos. See `@/backup/vaultOwner`.
+   */
+  vaultOwner: 'silentsum.vault.owner.v1',
+  /**
    * This installation’s random reference, printed on the About page and signed into every
    * recovery code. Not a secret; kept here so that erasing takes it with everything else.
    */
@@ -61,6 +66,7 @@ export const ALL_SECURE_STORE_KEYS: readonly string[] = [
   SECURE_STORE_KEYS.vaultCredentials,
   SECURE_STORE_KEYS.throttleState,
   SECURE_STORE_KEYS.wipePin,
+  SECURE_STORE_KEYS.vaultOwner,
   SECURE_STORE_KEYS.installRef,
   SECURE_STORE_KEYS.spentRecoveryCodes,
   SECURE_STORE_KEYS.entitlements,

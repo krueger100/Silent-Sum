@@ -31,6 +31,8 @@ import {
 } from '@/crypto';
 import { InMemoryFileSystem } from '@/storage/inMemoryFileSystem';
 import { BackupService } from '@/backup/backupService';
+import { VaultOwnerStore } from '@/backup/vaultOwner';
+import { InMemorySecureStore } from '@/secure-storage/secureStore';
 import { BACKUP_PATHS } from '@/backup/types';
 import { KDF_PRESETS, SodiumSecureRandom } from '@/crypto';
 import { InMemoryCloudBackend } from '@/firebase/cloudBackend';
@@ -222,6 +224,7 @@ describe('recovery tool self-check', () => {
       random,
       fs: serviceFs,
       secureDelete: new SecureDelete(serviceFs),
+      owner: new VaultOwnerStore(new InMemorySecureStore()),
       kdfParams: KDF_PRESETS.forTests,
     });
     await service.enable(keys, passphrase);

@@ -1,9 +1,21 @@
 /**
- * The deployed Firestore rules (`firestore.merged.rules`), exercised against the emulator.
+ * The Firestore security rules, exercised against the emulator.
+ *
+ * TWO RULESETS live in this repo and this suite runs against either one:
+ *
+ *   - `firestore.deploy.rules`  what is DEPLOYED. The default, so a plain `npm test` tests
+ *                               production.
+ *   - `firestore.merged.rules`  the same rules PLUS the pending `ssCloudActive` gate on backup
+ *                               envelope and manifest writes. NOT deployed. Run it with
+ *                               `SILENTSUM_RULES_FILE=firestore.merged.rules npm test`.
+ *
+ * A test that holds for only one of them is guarded by the capability flags below and SKIPS on
+ * the other rather than failing, so BOTH runs are green and the skipped names are exactly the
+ * difference between the two rulesets. Nothing here needs editing when the rollout ships.
  *
  * What is proved here and nowhere else:
  *   - no client, owner included, can write its own entitlements;
- *   - backup writes need an active Cloud term, read from the server-written document;
+ *   - who may write the backup documents, and on the pending ruleset that a Cloud term is needed;
  *   - reads and deletes of backup data never need one;
  *   - the server-only billing collections are closed to every client.
  *
@@ -29,9 +41,35 @@ const {
 } = require('firebase/firestore');
 
 const PROJECT_ID = 'demo-silentsum';
-// `SILENTSUM_RULES_FILE` lets the same suite run against a staged ruleset (see firebase.stage1.json).
-const RULES_FILE = process.env.SILENTSUM_RULES_FILE ?? 'firestore.merged.rules';
+// Defaults to the ruleset that is actually DEPLOYED, so a plain `npm test` tests what is live.
+// `SILENTSUM_RULES_FILE` runs the same suite against the pending one instead.
+const DEPLOYED_RULES = 'firestore.deploy.rules';
+const PENDING_RULES = 'firestore.merged.rules';
+const RULES_FILE = process.env.SILENTSUM_RULES_FILE ?? DEPLOYED_RULES;
 const RULES = fs.readFileSync(path.resolve(__dirname, '..', RULES_FILE), 'utf8');
+
+/**
+ * What the loaded ruleset can do, read out of its SOURCE rather than from its filename, so a
+ * file renamed or an env var forgotten cannot make a guarded test quietly vanish into a pass.
+ */
+// The pending rollout: an active Cloud term required to WRITE the envelope and the manifest.
+const RULES_GATE_BACKUP_WRITES =
+  RULES.includes('ssCloudActive(uid) && ssValidEnvelope') &&
+  RULES.includes('ssCloudActive(uid) && ssValidManifest');
+// Phase 1: the optional `vaultId` field allowed on both backup documents.
+const RULES_ALLOW_VAULT_ID = RULES.includes('vaultId');
+
+const describeGatedWrites = RULES_GATE_BACKUP_WRITES ? describe : describe.skip;
+const describeUngatedWrites = RULES_GATE_BACKUP_WRITES ? describe.skip : describe;
+const describeVaultId = RULES_ALLOW_VAULT_ID ? describe : describe.skip;
+
+// Printed once per run, so a green suite can never be mistaken for the other ruleset.
+console.log(
+  `[rules] ${RULES_FILE}` +
+    ` | backup-write Cloud gate: ${RULES_GATE_BACKUP_WRITES ? 'ON (pending)' : 'off (deployed)'}` +
+    ` | vaultId: ${RULES_ALLOW_VAULT_ID ? 'allowed' : 'refused'}` +
+    `${RULES_FILE === PENDING_RULES ? ' | NOT THE DEPLOYED RULESET' : ''}`,
+);
 
 const ALICE = 'alice-uid';
 const BOB = 'bob-uid';
@@ -113,7 +151,33 @@ describe('entitlements document', () => {
   });
 });
 
-describe('backup writes need an active Cloud term', () => {
+// True on BOTH rulesets: who may write these documents at all, and what shape is accepted.
+describe('backup document writes', () => {
+  const envelopePath = `users/${ALICE}/vault/envelope`;
+  const manifestPath = `users/${ALICE}/vault/manifest`;
+
+  it('accepts a valid document from the owner, and refuses a malformed one', async () => {
+    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+    await assertSucceeds(setDoc(doc(asAlice(), envelopePath), ENVELOPE));
+    await assertSucceeds(setDoc(doc(asAlice(), manifestPath), MANIFEST));
+    await assertFails(setDoc(doc(asAlice(), envelopePath), { ...ENVELOPE, extra: 1 }));
+    await assertFails(
+      setDoc(doc(asAlice(), envelopePath), { ...ENVELOPE, kdf: { ...ENVELOPE.kdf, m: 4096 } }),
+    );
+  });
+
+  it("never lets one account write another's backup, term or no term", async () => {
+    await serverWritesEntitlements(BOB, Date.now() + DAY);
+    await assertFails(setDoc(doc(asBob(), envelopePath), ENVELOPE));
+  });
+});
+
+/**
+ * PENDING ROLLOUT ONLY (`firestore.merged.rules`): a free or lapsed account cannot add to its
+ * backup. Skipped against the deployed ruleset, where the same writes pass on ownership and
+ * shape alone -- the block below states that deployed behaviour positively.
+ */
+describeGatedWrites('backup writes need an active Cloud term [pending rollout]', () => {
   const envelopePath = `users/${ALICE}/vault/envelope`;
   const manifestPath = `users/${ALICE}/vault/manifest`;
 
@@ -132,20 +196,86 @@ describe('backup writes need an active Cloud term', () => {
     await serverWritesEntitlements(ALICE, null);
     await assertFails(setDoc(doc(asAlice(), envelopePath), ENVELOPE));
   });
+});
 
-  it('allows an active term, and still validates the shape', async () => {
-    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+/**
+ * DEPLOYED BEHAVIOUR (`firestore.deploy.rules`), stated as a fact rather than left as a hole:
+ * with no gate, a valid envelope from its owner is accepted whatever the billing state says.
+ * This is what the pending rollout will change, and what the app relies on today -- a device
+ * whose term lapsed mid-backup can still finish writing a consistent account.
+ */
+describeUngatedWrites('backup writes do not yet need a Cloud term [deployed]', () => {
+  const envelopePath = `users/${ALICE}/vault/envelope`;
+  const manifestPath = `users/${ALICE}/vault/manifest`;
+
+  it('accepts a free account with a valid document', async () => {
     await assertSucceeds(setDoc(doc(asAlice(), envelopePath), ENVELOPE));
     await assertSucceeds(setDoc(doc(asAlice(), manifestPath), MANIFEST));
+  });
+
+  it('accepts a lapsed term, and still refuses a malformed document', async () => {
+    await serverWritesEntitlements(ALICE, Date.now() - 1000);
+    await assertSucceeds(setDoc(doc(asAlice(), envelopePath), ENVELOPE));
     await assertFails(setDoc(doc(asAlice(), envelopePath), { ...ENVELOPE, extra: 1 }));
+  });
+});
+
+/**
+ * `vaultId` names the vault an account's backup belongs to. Optional by design: every envelope and
+ * manifest written before the field existed has none, and refusing those would strand exactly the
+ * users with the oldest backups.
+ *
+ * Skipped when the ruleset under test has not been given the field yet, so this file can be run
+ * against either without editing it.
+ */
+describeVaultId('vaultId on the backup documents', () => {
+  const VAULT_ID = 'a'.repeat(32);
+
+  beforeEach(async () => {
+    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+  });
+
+  it('is accepted on the envelope, and so is its absence', async () => {
+    const path = `users/${ALICE}/vault/envelope`;
+    await assertSucceeds(setDoc(doc(asAlice(), path), { ...ENVELOPE, vaultId: VAULT_ID }));
+    await assertSucceeds(setDoc(doc(asAlice(), path), ENVELOPE));
+  });
+
+  it('is accepted on the manifest, and so is its absence', async () => {
+    const path = `users/${ALICE}/vault/manifest`;
+    await assertSucceeds(setDoc(doc(asAlice(), path), { ...MANIFEST, vaultId: VAULT_ID }));
+    await assertSucceeds(setDoc(doc(asAlice(), path), MANIFEST));
+  });
+
+  it('refuses one that is not a plausible identifier', async () => {
+    const path = `users/${ALICE}/vault/envelope`;
+    await assertFails(setDoc(doc(asAlice(), path), { ...ENVELOPE, vaultId: 12345 }));
+    await assertFails(setDoc(doc(asAlice(), path), { ...ENVELOPE, vaultId: 'abc' }));
+    await assertFails(setDoc(doc(asAlice(), path), { ...ENVELOPE, vaultId: 'a'.repeat(200) }));
+  });
+
+  // Widening `hasOnly` is precisely the edit that can stop refusing everything else.
+  it('still refuses every other unknown field', async () => {
     await assertFails(
-      setDoc(doc(asAlice(), envelopePath), { ...ENVELOPE, kdf: { ...ENVELOPE.kdf, m: 4096 } }),
+      setDoc(doc(asAlice(), `users/${ALICE}/vault/envelope`), {
+        ...ENVELOPE,
+        vaultId: VAULT_ID,
+        extra: 1,
+      }),
+    );
+    await assertFails(
+      setDoc(doc(asAlice(), `users/${ALICE}/vault/manifest`), {
+        ...MANIFEST,
+        vaultId: VAULT_ID,
+        extra: 1,
+      }),
     );
   });
 
-  it("never lets one account write another's backup, term or no term", async () => {
-    await serverWritesEntitlements(BOB, Date.now() + DAY);
-    await assertFails(setDoc(doc(asBob(), envelopePath), ENVELOPE));
+  it('does not let one account stamp an id into another\'s backup', async () => {
+    await assertFails(
+      setDoc(doc(asBob(), `users/${ALICE}/vault/envelope`), { ...ENVELOPE, vaultId: VAULT_ID }),
+    );
   });
 });
 

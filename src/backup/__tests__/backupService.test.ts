@@ -1,10 +1,12 @@
 import { BackupService } from '@/backup/backupService';
+import { VaultOwnerStore } from '@/backup/vaultOwner';
+import { InMemorySecureStore } from '@/secure-storage/secureStore';
 import { envelopeFromJson } from '@/backup/backupEnvelope';
 import {
   AccountDataRemainsError,
   BACKUP_PATHS,
   BackupNotEnabledError,
-  ForeignBackupError,
+  VaultIdMismatchError,
   InvalidPassphraseError,
   WrongPassphraseError,
 } from '@/backup/types';
@@ -74,6 +76,7 @@ function makeService(backend: InMemoryCloudBackend, fs: FileSystem = new InMemor
     random,
     fs,
     secureDelete: new SecureDelete(fs),
+    owner: new VaultOwnerStore(new InMemorySecureStore()),
     kdfParams: KDF_PRESETS.forTests,
   });
 }
@@ -209,7 +212,7 @@ describe('BackupService uploading', () => {
 
     // The index was merged rather than replaced, so the kept blob is still reachable. Without the
     // merge it would be an orphan: present, paid for, and invisible to every restore.
-    expect(await service.restoreInto(repository, keys)).toEqual({ restored: 1, skipped: 1 });
+    expect(await service.restoreInto(repository, keys)).toMatchObject({ restored: 1, skipped: 1 });
     expect(new Set(repository.photos.map((p) => p.id))).toEqual(new Set([kept.id, gone.id]));
   });
 
@@ -231,8 +234,10 @@ describe('BackupService uploading', () => {
     const second = await makeVault(random.bytes(32));
     await second.repository.addPhoto({ bytes: makeImage('mine') }, { source: 'camera' });
 
+    // Refused from the vault id the envelope states, which arrives before the index is even
+    // fetched. The decrypt-based refusal below still covers backups too old to carry one.
     await expect(service.backupNow(second.repository, second.keys)).rejects.toThrow(
-      ForeignBackupError,
+      VaultIdMismatchError,
     );
     // The other vault's index is untouched, which is the entire reason for refusing.
     const uid = backend.currentUser?.uid ?? '';
@@ -270,7 +275,7 @@ describe('BackupService uploading', () => {
 
     expect(report).toEqual({ uploaded: 1, cloudOnly: 1, total: 2 });
     const target = await makeVault(master);
-    expect(await service.restoreInto(target.repository, target.keys)).toEqual({
+    expect(await service.restoreInto(target.repository, target.keys)).toMatchObject({
       restored: 2,
       skipped: 0,
     });
@@ -323,7 +328,7 @@ describe('BackupService recovery', () => {
     const target = await makeVault(recovered);
     const report = await service.restoreInto(target.repository, target.keys);
 
-    expect(report).toEqual({ restored: 2, skipped: 0 });
+    expect(report).toMatchObject({ restored: 2, skipped: 0 });
     expect(new Set(target.repository.photos.map((p) => p.id))).toEqual(
       new Set([first.id, second.id]),
     );
@@ -339,7 +344,7 @@ describe('BackupService recovery', () => {
     await service.backupNow(source.repository, source.keys);
 
     // Restoring into the same vault finds everything already there.
-    expect(await service.restoreInto(source.repository, source.keys)).toEqual({
+    expect(await service.restoreInto(source.repository, source.keys)).toMatchObject({
       restored: 0,
       skipped: 1,
     });
@@ -351,7 +356,7 @@ describe('BackupService recovery', () => {
     const service = makeService(await signedInBackend());
     await service.enable(keys, PASSPHRASE);
 
-    expect(await service.restoreInto(repository, keys)).toEqual({ restored: 0, skipped: 0 });
+    expect(await service.restoreInto(repository, keys)).toMatchObject({ restored: 0, skipped: 0 });
   });
 
   it('skips an object that disappeared from the cloud rather than failing the whole restore', async () => {
@@ -371,7 +376,7 @@ describe('BackupService recovery', () => {
     const target = await makeVault(master);
     const report = await service.restoreInto(target.repository, target.keys);
 
-    expect(report).toEqual({ restored: 1, skipped: 1 });
+    expect(report).toMatchObject({ restored: 1, skipped: 1 });
     expect(target.repository.photos.map((p) => p.id)).toEqual([kept.id]);
   });
 });
@@ -581,7 +586,7 @@ describe('BackupService index fallback', () => {
       target.repository,
       target.keys,
     );
-    expect(report).toEqual({ restored: 0, skipped: 0 });
+    expect(report).toMatchObject({ restored: 0, skipped: 0 });
   });
 
   it('refuses to call a corrupt fallback an empty account', async () => {

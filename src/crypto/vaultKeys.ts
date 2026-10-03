@@ -30,10 +30,14 @@ import {
   VaultKeyId,
   type VaultKeys,
 } from '@/crypto/types';
-import { utf8Encode, zeroBytes, type Bytes } from '@/utils/bytes';
+import { toHex, utf8Encode, zeroBytes, type Bytes } from '@/utils/bytes';
 
 const EMPTY_SALT = new Uint8Array(0);
 const SUBKEY_LENGTH = 32;
+/** Its own HKDF domain, so the id is independent of every sub-key and of the messaging identity. */
+const VAULT_ID_INFO = 'silentsum/vault/id/v1';
+/** 16 bytes -> 32 hex characters, which is the same shape as a photo id. */
+const VAULT_ID_LENGTH = 16;
 
 class SessionVaultKeys implements VaultKeys {
   private disposed = false;
@@ -93,6 +97,31 @@ function subKey(master: Bytes, id: VaultKeyId): Bytes {
  * Derives the session keys. The master key is COPIED, because callers zero their own buffer as
  * soon as this returns.
  */
+/**
+ * A non-secret name for the vault a master key belongs to.
+ *
+ * HKDF under its own info string, so it is domain-separated from every sub-key `deriveVaultKeys`
+ * produces and from the messaging identity: publishing it says nothing about the key it names, and
+ * nothing that uses it can be confused with something that encrypts. It is deliberately NOT a
+ * `VaultKeyId` -- those are bound into the AAD of every blob, so adding one would change the
+ * storage format.
+ *
+ * Deterministic, so a vault keeps its name across a restore, a new phone and a re-wrap under a new
+ * PIN. That is exactly the property the cloud needs: "is this backup mine?" has to survive the
+ * events that make the question worth asking.
+ */
+export function deriveVaultId(masterKey: Bytes): string {
+  if (masterKey.length !== MASTER_KEY_LENGTH) {
+    throw new RangeError(`master key must be ${MASTER_KEY_LENGTH} bytes`);
+  }
+  const id = hkdf(sha256, masterKey, EMPTY_SALT, utf8Encode(VAULT_ID_INFO), VAULT_ID_LENGTH);
+  try {
+    return toHex(id);
+  } finally {
+    zeroBytes(id);
+  }
+}
+
 export function deriveVaultKeys(masterKey: Bytes): VaultKeys {
   if (masterKey.length !== MASTER_KEY_LENGTH) {
     throw new RangeError(`master key must be ${MASTER_KEY_LENGTH} bytes`);

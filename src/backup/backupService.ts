@@ -23,7 +23,10 @@ import {
   BACKUP_PATHS,
   BackupNotEnabledError,
   ForeignBackupError,
+  ForeignVaultError,
+  VaultIdMismatchError,
   WrongPassphraseError,
+  type CrossAccountOptions,
   type BackupReport,
   type BackupService as BackupServiceContract,
   type RestoreReport,
@@ -42,13 +45,14 @@ import {
   type StreamCipher,
   type VaultKeys,
 } from '@/crypto/types';
-import { deriveVaultKeys } from '@/crypto/vaultKeys';
+import { deriveVaultId, deriveVaultKeys } from '@/crypto/vaultKeys';
 import { CloudError, type CloudBackend, type CloudUser } from '@/firebase/types';
 import { joinUri, type FileSystem } from '@/storage/fileSystem';
 import type { SecureDelete } from '@/storage/secureDelete';
 import { isVideo, payloadKeyId } from '@/vault/mediaKind';
 import { decodeIndex, encodeIndex, sortedNewestFirst } from '@/vault/vaultIndex';
 import type { PhotoEntry, VaultRepository } from '@/vault/types';
+import { ownershipFor, type Ownership, type VaultOwnerStore } from '@/backup/vaultOwner';
 import { base64Decode, base64Encode, Base64Error } from '@/utils/base64';
 import { utf8Decode, utf8Encode, zeroBytes, type Bytes } from '@/utils/bytes';
 import type { Clock } from '@/utils/clock';
@@ -79,6 +83,8 @@ export interface BackupServiceOptions {
   /** App-private storage, for payloads that are transferred as files rather than buffers. */
   fs: FileSystem;
   secureDelete: SecureDelete;
+  /** Which account this device's vault is backed up to. Not optional: it is a safety gate. */
+  owner: VaultOwnerStore;
   kdfParams?: KdfParams;
 }
 
@@ -90,6 +96,15 @@ export class BackupService implements BackupServiceContract {
   private readonly streamCipher: StreamCipher;
   private readonly clock: Clock;
   private readonly random: SecureRandom;
+
+  private readonly owner: VaultOwnerStore;
+
+  /**
+   * Whether this account's Firestore rules have been seen to accept `vaultId`. Starts optimistic
+   * and is cleared for the session by the first refusal; a new launch tries again, which costs one
+   * extra write only on a project whose rules are still behind.
+   */
+  private vaultIdWritesAccepted = true;
   private readonly fs: FileSystem;
   private readonly secureDelete: SecureDelete;
   private readonly kdfParams: KdfParams;
@@ -105,6 +120,89 @@ export class BackupService implements BackupServiceContract {
     this.fs = options.fs;
     this.secureDelete = options.secureDelete;
     this.kdfParams = options.kdfParams ?? KDF_PRESETS.backup;
+    this.owner = options.owner;
+  }
+
+  /**
+   * Refuses an operation that would move this device's photos, or the power to unwrap its master
+   * key, into an account that has never held them.
+   *
+   * Three outcomes, and the middle one is the whole point: a vault nobody has backed up yet is
+   * free to be backed up (there is no other account to disturb), a vault this account already owns
+   * carries on silently, and a vault owned by someone else stops and asks. The caller re-runs with
+   * `confirmedCrossAccount` once the user has said yes.
+   */
+  private async assertMayWrite(uid: string, options?: CrossAccountOptions): Promise<void> {
+    if (options?.confirmedCrossAccount === true) return;
+    const ownership = ownershipFor(await this.owner.read(), uid);
+    if (ownership.kind === 'other-account') throw new ForeignVaultError(ownership.ownerUid);
+  }
+
+  /**
+   * Writes a document that may carry `vaultId`, falling back to the same document without it.
+   *
+   * The live rules validate both of these documents with `hasOnly(...)`, so until
+   * `firebase/firestore.deploy.rules` has been deployed a document carrying the field is refused
+   * outright. An app that simply wrote it would break every backup on every device the moment it
+   * shipped, and an app that waited for a flag would need someone to remember to flip it.
+   *
+   * So it tries, and on a refusal drops the field, retries once, and stops trying for the rest of
+   * the session. If the retry fails too the error propagates untouched -- that is a real
+   * permission problem, not a schema one. Once the rules are deployed the first attempt simply
+   * succeeds and nothing here ever runs again.
+   */
+  private async putWithVaultId(
+    path: string,
+    document: Record<string, unknown>,
+    vaultId: string,
+  ): Promise<void> {
+    if (!this.vaultIdWritesAccepted) {
+      await this.backend.putDocument(path, document);
+      return;
+    }
+    try {
+      await this.backend.putDocument(path, { ...document, vaultId });
+      return;
+    } catch (cause) {
+      if (!(cause instanceof CloudError) || cause.code !== 'permission-denied') throw cause;
+    }
+    // One retry, without the field. A second refusal is the caller's problem to report.
+    await this.backend.putDocument(path, document);
+    this.vaultIdWritesAccepted = false;
+  }
+
+  /**
+   * Refuses when this ACCOUNT's backup belongs to a different VAULT.
+   *
+   * A different question from {@link assertMayWrite}, which asks whether these photos belong in
+   * this account. This one asks whether this device can coherently add to what the account already
+   * holds, and the two fail for different reasons: one is a question for the user, this one is a
+   * fact about the data.
+   *
+   * An envelope with no `vaultId` is not a mismatch. Every envelope written before the field
+   * existed is in that state, and refusing them would strand exactly the users with the oldest
+   * backups; they fall through to `readCloudIndex`, whose decrypt has always been the real proof.
+   * The id only ever lets the refusal come EARLIER and say more.
+   */
+  private async assertVaultOwnsAccount(uid: string, keys: VaultKeys): Promise<void> {
+    let envelope;
+    try {
+      const document = await this.backend.getDocument(BACKUP_PATHS.envelope(uid));
+      if (document === null) return;
+      envelope = envelopeFromJson(document);
+    } catch {
+      // Unreadable or malformed: say nothing here and let the paths that need it fail honestly.
+      return;
+    }
+    if (envelope.vaultId === null) return;
+    const mine = deriveVaultId(keys.masterKey);
+    if (envelope.vaultId !== mine) throw new VaultIdMismatchError(envelope.vaultId, mine);
+  }
+
+  async ownership(): Promise<Ownership> {
+    const user = this.backend.currentUser;
+    if (user === null) return { kind: 'unbound' };
+    return ownershipFor(await this.owner.read(), user.uid);
   }
 
   async hasEnvelope(): Promise<boolean> {
@@ -112,10 +210,17 @@ export class BackupService implements BackupServiceContract {
     return (await this.backend.getDocument(BACKUP_PATHS.envelope(user.uid))) !== null;
   }
 
-  async enable(keys: VaultKeys, passphrase: string): Promise<void> {
+  async enable(
+    keys: VaultKeys,
+    passphrase: string,
+    options?: CrossAccountOptions,
+  ): Promise<void> {
     // Validate before touching the network so a weak passphrase never reaches a server log.
     assertValidPassphrase(passphrase);
     const user = this.requireUser();
+    // Before the network too: an envelope hands this account's passphrase the power to unwrap this
+    // vault's master key, which is a transfer of reach even though no photo moves.
+    await this.assertMayWrite(user.uid, options);
     const salt = this.random.bytes(SALT_LENGTH);
     const kek = await this.deriveKek(passphrase, salt, this.kdfParams);
     try {
@@ -124,7 +229,8 @@ export class BackupService implements BackupServiceContract {
         kek,
         AAD.backupEnvelope,
       );
-      await this.backend.putDocument(
+      const vaultId = deriveVaultId(keys.masterKey);
+      await this.putWithVaultId(
         BACKUP_PATHS.envelope(user.uid),
         envelopeToJson({
           version: 1,
@@ -132,8 +238,13 @@ export class BackupService implements BackupServiceContract {
           kdf: this.kdfParams,
           wrappedMasterKey,
           createdAt: this.clock.now(),
+          // Carried separately by `putWithVaultId` so the fallback can drop it; the codec would
+          // otherwise bake it into the document shape before the rules have been asked.
+          vaultId: null,
         }),
+        vaultId,
       );
+      await this.owner.bind(user.uid, this.clock.now());
     } finally {
       zeroBytes(kek);
     }
@@ -158,10 +269,21 @@ export class BackupService implements BackupServiceContract {
    * the union of what is on this device and what the cloud already had. That is why this needs the
    * keys: merging means decrypting the cloud's copy first.
    */
-  async backupNow(repository: VaultRepository, keys: VaultKeys): Promise<BackupReport> {
+  async backupNow(
+    repository: VaultRepository,
+    keys: VaultKeys,
+    options?: CrossAccountOptions,
+  ): Promise<BackupReport> {
     const user = this.requireUser();
     if (!(await this.hasEnvelope())) throw new BackupNotEnabledError();
     const uid = user.uid;
+    // Asked before the cloud index is even read. The index check below proves whether this vault
+    // can OPEN this account's backup; this one answers the different question of whether these
+    // photos belong in this account, which no key comparison can settle.
+    await this.assertMayWrite(uid, options);
+    // Cheaper and more specific than the index decrypt below, and it works even when the index is
+    // missing: one document read, and the refusal names both vaults.
+    await this.assertVaultOwnsAccount(uid, keys);
 
     // Read the cloud's index FIRST, before a single byte is written.
     //
@@ -181,11 +303,12 @@ export class BackupService implements BackupServiceContract {
 
     const manifest = await this.backend.getDocument(BACKUP_PATHS.manifest(uid));
     const skip = new Set<string>(readPhotoIds(manifest));
-    const uploaded = await this.uploadPhotos(repository, uid, skip);
+    const uploaded = await this.uploadPhotos(repository, repository.photos, uid, skip);
 
     const merged = sortedNewestFirst([...repository.photos, ...carried]);
 
     await this.writeIndexAndManifest(uid, keys, merged);
+    await this.owner.bind(uid, this.clock.now());
     return { uploaded, cloudOnly: carried.length, total: merged.length };
   }
 
@@ -210,23 +333,39 @@ export class BackupService implements BackupServiceContract {
     repository: VaultRepository,
     keys: VaultKeys,
     passphrase: string,
+    ids: readonly string[],
   ): Promise<void> {
     const uid = this.requireUser().uid;
-    // Nothing is skipped: every blob is rewritten, because the old ones are under the old key.
-    await this.uploadPhotos(repository, uid, new Set());
-    await this.writeIndexAndManifest(uid, keys, sortedNewestFirst([...repository.photos]));
-    // Last, so the envelope only ever claims a key the rest of the account is already using.
-    await this.enable(keys, passphrase);
+    // ONLY this account's own photos. `ids` comes from the cloud index that was just restored, so
+    // the account is rewritten with exactly what it already had, under the new key. It used to be
+    // `repository.photos` -- the whole device vault -- which quietly uploaded every other
+    // account's photos into this one and then handed this account's passphrase the key to them.
+    const wanted = new Set(ids);
+    const entries = repository.photos.filter((photo) => wanted.has(photo.id));
+    // Nothing is skipped within that set: every blob is rewritten, because the old ones are under
+    // the old key.
+    await this.uploadPhotos(repository, entries, uid, new Set());
+    await this.writeIndexAndManifest(uid, keys, sortedNewestFirst([...entries]));
+    // Last, so the envelope only ever claims a key the rest of the account is already using. The
+    // user reached here through an explicit confirmation, so the cross-account gate is satisfied.
+    await this.enable(keys, passphrase, { confirmedCrossAccount: true });
   }
 
-  /** Uploads every photo whose id is not in `skip`, adding the ones it uploads to it. */
+  /**
+   * Uploads every entry whose id is not in `skip`, adding the ones it uploads to it.
+   *
+   * The entries are passed in rather than read from the repository, so each caller has to say
+   * which photos it means. That is the difference between "back up this device" and "rewrite this
+   * account", and reading `repository.photos` here made them the same thing.
+   */
   private async uploadPhotos(
     repository: VaultRepository,
+    entries: readonly PhotoEntry[],
     uid: string,
     skip: Set<string>,
   ): Promise<number> {
     let uploaded = 0;
-    for (const entry of repository.photos) {
+    for (const entry of entries) {
       const id = entry.id;
       if (skip.has(id)) continue;
       if (isVideo(entry)) {
@@ -288,12 +427,17 @@ export class BackupService implements BackupServiceContract {
       photoCount: ids.length,
       updatedAt: new Date(this.clock.now()).toISOString(),
     };
+    // On the manifest the id names whoever wrote the CURRENT data set, which is a different fact
+    // from the envelope's and the one that catches the two drifting apart: an envelope from one
+    // vault beside an index from another is exactly the state that makes a backup unrestorable,
+    // and it used to be invisible until someone tried to restore it.
+    const vaultId = deriveVaultId(keys.masterKey);
     if (encoded.length > MANIFEST_INDEX_BUDGET) {
-      await this.backend.putDocument(BACKUP_PATHS.manifest(uid), manifest);
+      await this.putWithVaultId(BACKUP_PATHS.manifest(uid), manifest, vaultId);
       return;
     }
     try {
-      await this.backend.putDocument(BACKUP_PATHS.manifest(uid), { ...manifest, index: encoded });
+      await this.putWithVaultId(BACKUP_PATHS.manifest(uid), { ...manifest, index: encoded }, vaultId);
     } catch (cause) {
       // Deployed rules validate the manifest with `hasOnly`, so a ruleset that predates this field
       // rejects the entire document -- and a backup that fails because its safety net is too new
@@ -303,7 +447,10 @@ export class BackupService implements BackupServiceContract {
       // This cannot mask a real authorisation problem: that one denies the retry too, and it
       // surfaces exactly as it did before.
       if (!(cause instanceof CloudError && cause.code === 'permission-denied')) throw cause;
-      await this.backend.putDocument(BACKUP_PATHS.manifest(uid), manifest);
+      // Through the helper, not around it: reaching here means a document the helper had ALREADY
+      // stripped of `vaultId` was still refused, so the field was never what this ruleset objected
+      // to -- `index` was. Dropping the id as well would lose it for no reason.
+      await this.putWithVaultId(BACKUP_PATHS.manifest(uid), manifest, vaultId);
     }
   }
 
@@ -408,6 +555,9 @@ export class BackupService implements BackupServiceContract {
     try {
       const entries = await this.readCloudIndex(uid, source);
       const existing = new Set(repository.photos.map((p) => p.id));
+      // Everything this account's backup holds, whether it was imported now or was already here.
+      // A rebind may re-upload exactly these and nothing else.
+      const cloudIds = entries.map((entry) => entry.id);
       let restored = 0;
       let skipped = 0;
 
@@ -445,7 +595,7 @@ export class BackupService implements BackupServiceContract {
           throw cause;
         }
       }
-      return { restored, skipped };
+      return { restored, skipped, cloudIds };
     } finally {
       source.dispose();
     }
@@ -522,7 +672,7 @@ export class BackupService implements BackupServiceContract {
     const uid = user.uid;
 
     const indexBlob = await this.fetchIndexBlob(uid);
-    if (indexBlob === null) return { restored: 0, skipped: 0 };
+    if (indexBlob === null) return { restored: 0, skipped: 0, cloudIds: [] };
 
     const json = await this.cipher.decrypt(
       indexBlob,
@@ -564,7 +714,7 @@ export class BackupService implements BackupServiceContract {
         throw cause;
       }
     }
-    return { restored, skipped };
+    return { restored, skipped, cloudIds: index.photos.map((entry) => entry.id) };
   }
 
   /**
@@ -592,6 +742,11 @@ export class BackupService implements BackupServiceContract {
 
   async disable(): Promise<void> {
     await this.deleteAccountData(this.requireUser().uid);
+    // This account holds nothing of this vault's any more, so the vault is unowned again and a
+    // different account may back it up without being asked about photos that no longer exist
+    // anywhere but here. Last, so a failed deletion leaves the binding -- and its protection --
+    // standing.
+    await this.owner.clear();
   }
 
   /**

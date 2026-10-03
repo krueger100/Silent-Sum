@@ -9,7 +9,9 @@ import {
   AccountDataRemainsError,
   BackupNotEnabledError,
   ForeignBackupError,
+  ForeignVaultError,
   InvalidPassphraseError,
+  VaultIdMismatchError,
   WrongPassphraseError,
 } from '@/backup/types';
 import { CloudError } from '@/firebase/types';
@@ -74,9 +76,26 @@ export function describeCloudError(error: unknown): string {
   // this, and "Something went wrong" made a normal situation look like a broken app.
   if (error instanceof ForeignBackupError) {
     return (
-      'This account\'s backup was made by an earlier vault, so this device cannot add to it yet. ' +
-      'Use "Restore from backup" below first: that brings those photos in and moves the backup ' +
-      'onto this device. Nothing was changed.'
+      'This account\'s backup was made by a different vault, so this device cannot add to it. ' +
+      'Use "Restore from backup" below to bring those photos in -- nothing here is changed or ' +
+      'deleted. Nothing was uploaded.'
+    );
+  }
+  // The same situation `ForeignBackupError` describes, caught earlier and stated more plainly:
+  // the account's backup says outright which vault it belongs to, and it is not this one.
+  if (error instanceof VaultIdMismatchError) {
+    return (
+      'This account\'s backup belongs to a different vault, so this device cannot add to it. ' +
+      'Use "Restore from backup" to bring those photos in -- nothing here is changed or deleted. ' +
+      'Nothing was uploaded.'
+    );
+  }
+  // A question rather than a failure: the photos on this device belong to another account's
+  // backup, and the user has not yet said they want a copy in this one.
+  if (error instanceof ForeignVaultError) {
+    return (
+      'The photos on this device are backed up to a different account. Nothing was uploaded. ' +
+      'Confirm the upload if you want a copy of them in this account as well.'
     );
   }
   // Our own validation message; it describes the rule, never the passphrase.

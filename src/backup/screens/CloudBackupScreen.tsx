@@ -16,6 +16,12 @@
  * vault that is gone and has to re-wrap the recovered key under a PIN chosen there. See
  * `RestoreFlowScreen`, and `restoreNow` below for why the two cannot be collapsed into one.
  *
+ * ONE VAULT, MANY POSSIBLE ACCOUNTS. The vault belongs to the device; a backup belongs to an
+ * account. Signing out of one account and into another leaves the same photos sitting here, which
+ * is why this screen tracks which account they are backed up to and says so. Anything that would
+ * put them into a second account, or let a second account's passphrase unwrap this vault's key,
+ * asks first -- see `@/backup/vaultOwner` for why that cannot be left to the screen alone.
+ *
  * Nothing here is required for the vault to work. When the build has no cloud backend the screen
  * explains that and stops; it never crashes and never implies something is broken.
  */
@@ -35,7 +41,8 @@ import { cloudActive } from '@/billing/entitlements';
 import { CloudRequiredCard } from '@/billing/screens/CloudRequiredCard';
 import { requestPasswordReset, RESET_REASSURANCE } from '@/backup/screens/passwordReset';
 import { validatePassphrase } from '@/backup/passphrasePolicy';
-import type { BackupService } from '@/backup/types';
+import { ForeignVaultError, type BackupService } from '@/backup/types';
+import type { Ownership } from '@/backup/vaultOwner';
 import { Button } from '@/components/Button';
 import { Field } from '@/components/Field';
 import { ConfirmDialog, TypedConfirmDialog } from '@/components/Dialog';
@@ -139,6 +146,22 @@ function CloudBackupBody({
   const [restorePassphrase, setRestorePassphrase] = useState('');
   /** Set to the sentence explaining why "Back up now" had nothing to do; null hides the alert. */
   const [nothingToUpload, setNothingToUpload] = useState<string | null>(null);
+  /**
+   * Which account this device's vault is backed up to, as far as the device knows. Drives the
+   * banner and the confirmation; the service checks it again for itself, so this is never the
+   * thing that enforces anything.
+   */
+  const [ownership, setOwnership] = useState<Ownership>({ kind: 'unbound' });
+  /** A cross-account write the user has been asked about but has not yet answered. */
+  const [confirmingCrossAccount, setConfirmingCrossAccount] = useState<null | 'enable' | 'backup'>(
+    null,
+  );
+  /**
+   * The ids this account's own backup holds, captured by the last foreign restore. Non-null is
+   * what offers "make this device the owner", and it is exactly what that would re-upload.
+   */
+  const [rebindableIds, setRebindableIds] = useState<readonly string[] | null>(null);
+  const [confirmingRebind, setConfirmingRebind] = useState(false);
   const [confirmingDisable, setConfirmingDisable] = useState(false);
   const [confirmingDeleteAccount, setConfirmingDeleteAccount] = useState(false);
   /** Whether the account-password field for deletion is showing, and what has been typed into it. */
@@ -152,6 +175,22 @@ function CloudBackupBody({
   const [hasEnvelope, setHasEnvelope] = useState<boolean | null>(null);
 
   useEffect(() => cloud.onAuthStateChanged(setUser), [cloud]);
+
+  // Re-read on every account change: switching accounts is exactly when this answer changes.
+  useEffect(() => {
+    let cancelled = false;
+    void backup.ownership().then(
+      (next) => {
+        if (!cancelled) setOwnership(next);
+      },
+      () => {
+        // Unknown is reported as unbound; the service refuses for itself regardless.
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [backup, user]);
 
   /** Whether this account has a key envelope, or null when that is not knowable right now. */
   const readEnvelope = useCallback(async (): Promise<boolean | null> => {
@@ -242,7 +281,7 @@ function CloudBackupBody({
     });
   };
 
-  const enableBackup = (): void => {
+  const enableBackup = (confirmedCrossAccount = false): void => {
     const problem = validatePassphrase(passphrase);
     if (problem !== null) {
       // Refused here, before any network call: a weak passphrase never reaches a server log.
@@ -259,7 +298,17 @@ function CloudBackupBody({
     }
     void run(async () => {
       const chosen = passphrase;
-      await backup.enable(services.session.requireKeys(), chosen);
+      try {
+        await backup.enable(services.session.requireKeys(), chosen, { confirmedCrossAccount });
+      } catch (cause) {
+        if (cause instanceof ForeignVaultError) {
+          // Held, not failed: the passphrase fields keep their contents so answering the question
+          // does not cost the user their typing.
+          setConfirmingCrossAccount('enable');
+          return;
+        }
+        throw cause;
+      }
       setPassphrase('');
       setPassphraseConfirm('');
       setPrompting(false);
@@ -278,14 +327,25 @@ function CloudBackupBody({
    * button is indistinguishable from a button that did not work, and the whole reason someone
    * presses this twice is that they were not sure the first press counted.
    */
-  const backupNow = (): void => {
+  const backupNow = (confirmedCrossAccount = false): void => {
     const repository = services.vault.current;
     if (repository === null) {
       setError('Open the vault first: there is nothing to read while it is locked.');
       return;
     }
     void run(async () => {
-      const report = await backup.backupNow(repository, services.session.requireKeys());
+      let report;
+      try {
+        report = await backup.backupNow(repository, services.session.requireKeys(), {
+          confirmedCrossAccount,
+        });
+      } catch (cause) {
+        if (cause instanceof ForeignVaultError) {
+          setConfirmingCrossAccount('backup');
+          return;
+        }
+        throw cause;
+      }
       await services.settings.update({ backupEnabled: true, lastBackupAt: services.clock.now() });
       logEventSafely(services.firebase.analytics, ANALYTICS_EVENTS.backupCompleted, {
         count: report.total,
@@ -330,9 +390,15 @@ function CloudBackupBody({
    * photos back.
    *
    * So the mismatch is handled rather than reported: each item is decrypted with the backup's key
-   * and re-encrypted with this vault's on the way in, and the account is then re-pointed at this
-   * vault's key so the next "Back up now" is coherent. The vault keeps its own key and its own
+   * and re-encrypted with this vault's on the way in. The vault keeps its own key and its own
    * photos throughout; nothing local is replaced.
+   *
+   * It stops there. Re-pointing the account at this vault's key used to follow automatically, and
+   * that was the leak: it re-uploaded the WHOLE device vault into this account -- every other
+   * account's photos with it -- and rewrapped this account's envelope around the device's master
+   * key, so this account's passphrase could then unwrap photos that were never its own. Taking
+   * ownership is now {@link rebindNow}: a separate, typed confirmation, scoped to the ids this
+   * account's own backup holds.
    *
    * The recovered key is a raw buffer this function owns; it is zeroed in a `finally` whatever
    * happens.
@@ -356,34 +422,68 @@ function CloudBackupBody({
         const report = foreign
           ? await backup.restoreForeignInto(repository, keys, recovered)
           : await backup.restoreInto(repository, keys);
-        if (foreign) {
-          // The photos are now here under this vault's key, so the account is moved onto it too.
-          // Skipping this would leave the next "Back up now" unable to read its own index.
-          await backup.rebindBackup(repository, keys, restorePassphrase);
-        }
         // A restore proves this device has a backup, whatever the local flag said beforehand -- it
-        // reads false on a device that was erased, or that restored without ever backing up. The
-        // rebind re-uploaded everything, so for that path a backup genuinely did just run.
-        await services.settings.update({
-          backupEnabled: true,
-          ...(foreign ? { lastBackupAt: services.clock.now() } : {}),
-        });
-        setRestorePassphrase('');
+        // reads false on a device that was erased, or that restored without ever backing up.
+        await services.settings.update({ backupEnabled: true });
         setRestoring(false);
         logEventSafely(services.firebase.analytics, ANALYTICS_EVENTS.restoreCompleted);
+        // The rebind USED to run here, automatically. It re-uploaded the whole device vault into
+        // this account and rewrapped the account's envelope around this vault's master key -- an
+        // ownership change nobody had asked for, carrying every other account's photos with it.
+        // It is now offered instead, and only for the ids this account's own backup holds.
+        //
+        // The passphrase is held while that offer stands, because rewrapping the envelope needs
+        // it and asking for the same words twice in a row teaches people to retype secrets on
+        // demand. It is dropped the moment the offer is taken or declined, and on every path
+        // where no offer is made.
+        if (foreign) setRebindableIds(report.cloudIds);
+        else setRestorePassphrase('');
         setStatus(
           report.restored === 0 && report.skipped === 0
             ? 'There was nothing in the backup to restore.'
             : `Restored ${plural(report.restored, 'photo')}. ` +
                 `${plural(report.skipped, 'photo')} already on this device, left untouched.` +
                 (foreign
-                  ? ' That backup was made by an earlier vault, so its photos were re-encrypted for ' +
-                    'this one and the backup now follows this device.'
+                  ? ' That backup was made by a different vault, so its photos were re-encrypted ' +
+                    'for this one. The backup itself is unchanged and still belongs to that vault.'
                   : ''),
         );
       } finally {
         zeroBytes(recovered);
       }
+    });
+  };
+
+  /**
+   * Re-uploads this account's own photos under this vault's key and rewraps its envelope, so the
+   * account follows this device from now on.
+   *
+   * Only the ids the restore just reported: the rest of the vault may belong to another account,
+   * and this is not the operation that moves those. It is reached only through a typed
+   * confirmation, because afterwards THIS account's recovery passphrase unwraps THIS vault's
+   * master key -- reach that did not exist a moment earlier.
+   */
+  const rebindNow = (): void => {
+    const repository = services.vault.current;
+    const ids = rebindableIds;
+    setConfirmingRebind(false);
+    if (repository === null || ids === null) return;
+    if (restorePassphrase === '') {
+      setError('Enter the recovery passphrase again to move the backup onto this device.');
+      return;
+    }
+    void run(async () => {
+      const keys = services.session.requireKeys();
+      await backup.rebindBackup(repository, keys, restorePassphrase, ids);
+      await services.settings.update({ backupEnabled: true, lastBackupAt: services.clock.now() });
+      setRebindableIds(null);
+      setRestorePassphrase('');
+      setOwnership(await backup.ownership());
+      await refreshEnvelope();
+      setStatus(
+        `This device now owns the backup for this account. ${plural(ids.length, 'photo')} were ` +
+          're-uploaded under this vault\'s key. Nothing else on this device was uploaded.',
+      );
     });
   };
 
@@ -496,6 +596,18 @@ function CloudBackupBody({
           {status}
         </Text>
       )}
+      {/*
+        Stays up for as long as the mismatch does, rather than appearing only when something is
+        refused. The vault is device-wide and the backup is per-account, and that is not obvious
+        from a screen that says "Backup is enabled for this account".
+      */}
+      {ownership.kind === 'other-account' ? (
+        <Text testID="backup_other_account" style={styles.error}>
+          The photos on this device are backed up to a different account. This account keeps its own
+          separate backup - photos are not shared between accounts, and nothing here is uploaded
+          without asking.
+        </Text>
+      ) : null}
 
       <SectionLabel>Backup account</SectionLabel>
       {user === null ? (
@@ -589,7 +701,49 @@ function CloudBackupBody({
 
               {hasEnvelope === true ? (
                 <>
-                  <Button testID="backup_now" label="Back up now" busy={busy} onPress={backupNow} />
+                  <Button
+                    testID="backup_now"
+                    label="Back up now"
+                    busy={busy}
+                    onPress={() => {
+                      backupNow();
+                    }}
+                  />
+
+                  {rebindableIds === null ? null : (
+                    <View style={styles.card} testID="backup_rebind_offer">
+                      <Text style={styles.cardTitle}>Move this backup onto this device?</Text>
+                      <Text style={styles.cardLine}>
+                        This account&apos;s backup still belongs to the vault that made it, so
+                        &quot;Back up now&quot; cannot add to it. Moving it re-uploads its own
+                        photos under this vault&apos;s key. Nothing else on this device is uploaded.
+                      </Text>
+                      <Text style={styles.cardLine}>
+                        Afterwards this account&apos;s recovery passphrase will unwrap this
+                        device&apos;s vault key.
+                      </Text>
+                      <Button
+                        testID="backup_rebind"
+                        label="Make this device the owner"
+                        variant="secondary"
+                        disabled={busy}
+                        onPress={() => {
+                          setConfirmingRebind(true);
+                        }}
+                      />
+                      <Button
+                        testID="backup_rebind_dismiss"
+                        label="Not now"
+                        variant="ghost"
+                        disabled={busy}
+                        onPress={() => {
+                          // Declining drops the held passphrase with the offer.
+                          setRebindableIds(null);
+                          setRestorePassphrase('');
+                        }}
+                      />
+                    </View>
+                  )}
 
                   <SectionLabel>Restore</SectionLabel>
                   <Paragraph>
@@ -772,6 +926,61 @@ function CloudBackupBody({
           )}
         </>
       )}
+
+      {/*
+        The one question that stands between another account's photos and this account's storage.
+        Named counts and named accounts: "are you sure?" is not enough to decide this on.
+      */}
+      <ConfirmDialog
+        testID="backup_cross_account_dialog"
+        visible={confirmingCrossAccount !== null}
+        title={
+          confirmingCrossAccount === 'enable'
+            ? 'Turn on backup for this account?'
+            : 'Upload these photos to this account?'
+        }
+        message={
+          confirmingCrossAccount === 'enable'
+            ? 'The photos on this device are backed up to a different account. Turning backup on ' +
+              'here lets this account\'s recovery passphrase unwrap this vault\'s key. The other ' +
+              'account keeps its own backup, unchanged.'
+            : `${plural(services.vault.current?.photos.length ?? 0, 'photo')} on this device are ` +
+              'backed up to a different account. Uploading puts a copy in this account as well. ' +
+              'Nothing is deleted from the other account.'
+        }
+        confirmLabel={confirmingCrossAccount === 'enable' ? 'Turn on backup' : 'Upload'}
+        onConfirm={() => {
+          const which = confirmingCrossAccount;
+          setConfirmingCrossAccount(null);
+          if (which === 'backup') backupNow(true);
+          else if (which === 'enable') enableBackup(true);
+        }}
+        onCancel={() => {
+          setConfirmingCrossAccount(null);
+        }}
+      />
+
+      {/*
+        Typed, because it is the one action here that changes who a backup belongs to, and because
+        what it grants -- this account's passphrase unwrapping this vault's key -- is not visible
+        in its result.
+      */}
+      <TypedConfirmDialog
+        testID="backup_rebind_dialog"
+        visible={confirmingRebind}
+        title="Move the backup onto this device"
+        message={
+          `${plural(rebindableIds?.length ?? 0, 'photo')} from this account's backup will be ` +
+          "re-uploaded under this vault's key, and this account's recovery passphrase will then " +
+          'unwrap this vault. No other photo on this device is uploaded.'
+        }
+        phrase="MOVE"
+        confirmLabel="Move backup"
+        onConfirm={rebindNow}
+        onCancel={() => {
+          setConfirmingRebind(false);
+        }}
+      />
 
       <ConfirmDialog
         testID="backup_nothing_dialog"

@@ -457,7 +457,13 @@ describe('CloudBackupScreen restore', () => {
     for (const id of backedUpIds) await expect(repository.readThumbnail(id)).resolves.toBeDefined();
   });
 
-  it('leaves the account usable afterwards, on the vault that did the restoring', async () => {
+  /**
+   * A foreign restore used to re-point the account at this vault on its own, and that was the
+   * cross-account leak: it re-uploaded the WHOLE device vault -- including photos belonging to
+   * whichever other account had backed them up -- and rewrapped this account's envelope around
+   * this device's master key. It now offers, and changes nothing until asked.
+   */
+  it('offers to move the backup rather than moving it', async () => {
     const cloud = new InMemoryCloudBackend();
     const source = buildCloudHarness(cloud);
     await deviceWithBackup(source, 2);
@@ -467,7 +473,9 @@ describe('CloudBackupScreen restore', () => {
     const other = buildCloudHarness(cloud);
     await openVaultWithPhotos(other, '1357', 1);
     await cloud.signIn(EMAIL, ACCOUNT_PASSWORD);
-    const repository = requireRepository(other);
+    const uid = cloud.currentUser?.uid ?? '';
+    const envelopeBefore = await cloud.getDocument(BACKUP_PATHS.envelope(uid));
+    const blobsBefore = [...cloud.blobs.keys()].sort();
 
     await renderWithServices(other.services, <CloudBackupScreen />);
     await restoreWith(PASSPHRASE);
@@ -475,18 +483,54 @@ describe('CloudBackupScreen restore', () => {
       expect(screen.getByTestId('backup_status')).toHaveTextContent(/Restored 2 photos/);
     });
 
-    // The envelope and every blob now belong to this vault's key, so backing up keeps working
-    // rather than failing on an index it can no longer read.
+    // The photos arrived, and the account is untouched: same envelope, same blobs.
+    expect(screen.getByTestId('backup_rebind_offer')).toBeTruthy();
+    expect(await cloud.getDocument(BACKUP_PATHS.envelope(uid))).toEqual(envelopeBefore);
+    expect([...cloud.blobs.keys()].sort()).toEqual(blobsBefore);
+  });
+
+  it('moves it once the move is typed out, and uploads only the account\'s own photos', async () => {
+    const cloud = new InMemoryCloudBackend();
+    const source = buildCloudHarness(cloud);
+    await deviceWithBackup(source, 2);
+    source.services.session.lock();
+    await cloud.signOut();
+
+    const other = buildCloudHarness(cloud);
+    await openVaultWithPhotos(other, '1357', 1);
+    await cloud.signIn(EMAIL, ACCOUNT_PASSWORD);
+    const uid = cloud.currentUser?.uid ?? '';
+    const repository = requireRepository(other);
+    // The photo this device already had. It belongs to this vault, not to this account.
+    const localOnly = repository.photos.map((photo) => photo.id);
+
+    await renderWithServices(other.services, <CloudBackupScreen />);
+    await restoreWith(PASSPHRASE);
+    await waitFor(() => {
+      expect(screen.getByTestId('backup_rebind_offer')).toBeTruthy();
+    });
+
+    await fireEvent.press(screen.getByTestId('backup_rebind'));
+    await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), 'MOVE');
+    await fireEvent.press(screen.getByTestId('backup_rebind_dialog-confirm'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('backup_status')).toHaveTextContent(/now owns the backup/);
+    });
+
+    // The two photos the account already had were re-uploaded; the one this device brought was
+    // not. That is the whole distinction the old code collapsed.
+    const uploaded = [...cloud.blobs.keys()]
+      .filter((key) => key.startsWith(`users/${uid}/photos/`))
+      .map((key) => key.split('/').pop()?.replace('.enc', '') ?? '');
+    expect(uploaded).toHaveLength(2);
+    for (const id of localOnly) expect(uploaded).not.toContain(id);
+
+    // And the account is usable again on this vault's key, with the same passphrase.
     const backup = requireBackup(other);
     const keys = other.services.session.requireKeys();
-    await expect(backup.backupNow(repository, keys)).resolves.toEqual({
-      uploaded: 0,
-      cloudOnly: 0,
-      total: 3,
-    });
-    // And the same passphrase still opens it: rebinding rewrapped the key, it did not change it.
-    const recovered = await backup.recoverMasterKey(PASSPHRASE);
-    expect(recovered).toEqual(keys.masterKey);
+    await expect(backup.backupNow(repository, keys)).resolves.toBeDefined();
+    expect(await backup.recoverMasterKey(PASSPHRASE)).toEqual(keys.masterKey);
   });
 
   it('will not restore into a vault that is not open', async () => {

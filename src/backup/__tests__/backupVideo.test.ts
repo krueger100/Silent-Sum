@@ -20,6 +20,8 @@ import {
 } from '@/crypto';
 import { Ssv2StreamCipher } from '@/crypto/streamCipher';
 import { BackupService } from '@/backup/backupService';
+import { VaultOwnerStore } from '@/backup/vaultOwner';
+import { InMemorySecureStore } from '@/secure-storage/secureStore';
 import { BACKUP_PATHS } from '@/backup/types';
 import { InMemoryCloudBackend } from '@/firebase/cloudBackend';
 import { InMemoryFileSystem } from '@/storage/inMemoryFileSystem';
@@ -74,6 +76,7 @@ function service(backend: InMemoryCloudBackend, fs: InMemoryFileSystem) {
     random,
     fs,
     secureDelete: new SecureDelete(fs),
+    owner: new VaultOwnerStore(new InMemorySecureStore()),
     kdfParams: KDF_PRESETS.forTests,
   });
 }
@@ -182,7 +185,7 @@ describe('backing a video up to the cloud', () => {
     const target = vault(fresh, recovered);
     await target.repository.open();
     const report = await restore.restoreInto(target.repository, target.keys);
-    expect(report).toEqual({ restored: 2, skipped: 0 });
+    expect(report).toMatchObject({ restored: 2, skipped: 0 });
 
     // The metadata came back...
     const entry = target.repository.photos.find((p) => p.id === video.id);
@@ -260,7 +263,7 @@ describe('backing a video up to the cloud', () => {
     expect(bytesEqual(recovered, target.keys.masterKey)).toBe(false);
 
     const report = await restore.restoreForeignInto(target.repository, target.keys, recovered);
-    expect(report).toEqual({ restored: 2, skipped: 0 });
+    expect(report).toMatchObject({ restored: 2, skipped: 0 });
     recovered.fill(0);
 
     // Both came back with their ids and metadata, readable under THIS vault's keys.

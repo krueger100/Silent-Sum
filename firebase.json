@@ -1,7 +1,7 @@
 {
-  "//": "eevee-mate is shared with other apps. `firestore.rules` here is the MERGED file, which reproduces the deployed stripe_customers block verbatim and adds only users/{uid}/vault/* and users/{uid}/billing/entitlements. The storage entry names SilentSum's own bucket explicitly so a deploy can never touch eevee-mate.appspot.com, which belongs to EVPAL. The functions entry is its own codebase (`silentsum`) so that `firebase deploy --only functions:silentsum` manages ONLY these six functions and never deletes EVPAL's Stripe functions, which live in the default codebase. Rollout order for billing: functions, then the app build, then rules.",
+  "//": "eevee-mate is shared with other apps. The firestore entry names the file that is actually LIVE, `firestore.deploy.rules`, so that a deploy changes only what has been reviewed against it. `firestore.merged.rules` is the SAME file plus the pending `ssCloudActive` gate on backup writes, and it is deliberately NOT wired up here: pointing at it would ship that rollout as a side effect of any unrelated rules change. Switch this entry to the merged file when the billing rollout is actually going out, in the order functions, then the app build, then rules. The storage entry names SilentSum's own bucket explicitly so a deploy can never touch eevee-mate.appspot.com, which belongs to EVPAL. The functions entry is its own codebase (`silentsum`) so that `firebase deploy --only functions:silentsum` manages ONLY these six functions and never deletes EVPAL's Stripe functions, which live in the default codebase.",
   "firestore": {
-    "rules": "firebase/firestore.merged.rules"
+    "rules": "firebase/firestore.deploy.rules"
   },
   "storage": [
     {

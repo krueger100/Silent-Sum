@@ -68,8 +68,15 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(uid)/billing/entitlements).data.cloud.accessUntil > request.time;
     }
 
+    // `vaultId` is optional and opaque: 32 hex characters naming which vault this account's
+    // backup belongs to, derived one-way from the master key and useless without it. It is what
+    // lets a device refuse to add to a backup that is not its own BEFORE it writes anything, and
+    // what makes an envelope and an index from two different vaults visible at a glance. Optional
+    // because every envelope written before it existed has none, and those must keep working.
     function ssValidEnvelope(d) {
-      return d.keys().hasOnly(['v', 'salt', 'kdf', 'wrapped', 'createdAt'])
+      return d.keys().hasOnly(['v', 'salt', 'kdf', 'wrapped', 'createdAt', 'vaultId'])
+        && (!d.keys().hasAny(['vaultId'])
+            || (d.vaultId is string && d.vaultId.size() >= 16 && d.vaultId.size() <= 64))
         && d.v == 1
         && d.salt is string && d.salt.size() <= 64
         && d.kdf is map && d.kdf.keys().hasOnly(['alg', 'm', 't', 'p', 'len'])
@@ -90,7 +97,9 @@ service cloud.firestore {
     // to the server exactly as the Storage copy is, and the client omits it when it would push the
     // document towards Firestore's 1 MiB ceiling.
     function ssValidManifest(d) {
-      return d.keys().hasOnly(['photoIds', 'photoCount', 'updatedAt', 'index'])
+      return d.keys().hasOnly(['photoIds', 'photoCount', 'updatedAt', 'index', 'vaultId'])
+        && (!d.keys().hasAny(['vaultId'])
+            || (d.vaultId is string && d.vaultId.size() >= 16 && d.vaultId.size() <= 64))
         && d.photoIds is list && d.photoIds.size() <= 20000
         && d.photoCount is int && d.photoCount == d.photoIds.size()
         && d.updatedAt is string
