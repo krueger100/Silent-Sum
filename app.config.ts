@@ -15,7 +15,10 @@ import { resolve } from 'path';
  *   SILENTSUM_ENV            dev | prod (default dev)
  *   GOOGLE_SERVICES_JSON     path to google-services.json
  *   GOOGLE_SERVICES_PLIST    path to GoogleService-Info.plist
- *   APP_CHECK_DEBUG_TOKEN    optional App Check debug token for dev builds
+ *   APP_CHECK_DEBUG_TOKEN    App Check debug token for DEV builds, registered in the Firebase
+ *                            console. Omitting it does not disable App Check: the SDK mints a
+ *                            random secret per install that nobody registered, and every request
+ *                            is refused. NEVER published for prod - see below.
  *   APP_ID                   Android applicationId / iOS bundleIdentifier
  *   FIREBASE_STORAGE_BUCKET  SilentSum's OWN Storage bucket (no gs:// prefix); without it
  *                            cloud backup is not offered, on purpose - see
@@ -43,7 +46,36 @@ const pick = (value: string | undefined, fallback: string): string =>
 
 const silentsumEnv = pick(process.env.SILENTSUM_ENV, 'dev') === 'prod' ? 'prod' : 'dev';
 const appId = pick(process.env.APP_ID, 'com.kruegerco.silentsum');
-const appCheckDebugToken = pick(process.env.APP_CHECK_DEBUG_TOKEN, '');
+/**
+ * The App Check debug token, for DEV builds and no other kind.
+ *
+ * Read only when `silentsumEnv` is `dev`, so a prod build cannot publish one even if the variable
+ * is set in the environment. That gate is the security-relevant half of this: everything in
+ * `extra` is plain text inside the APK, and this token -- once registered in the console -- lets
+ * ANY client bypass App Check for the whole Firebase project. A prod build attests with Play
+ * Integrity and needs nothing here.
+ *
+ * Leaving it unset for a dev build does not turn App Check off. It makes the native SDK mint a
+ * random debug secret on each install (Android: `DebugAppCheckProviderFactory`), which the console
+ * has never seen, so every Firestore read and Storage upload is refused. The app reports the
+ * refused read of `messagingKeys/{uid}` as `unavailable`, whose copy is "Messaging is not
+ * available in this build." -- a sentence about the build, for a server refusal. That is the
+ * failure this variable exists to prevent, so a dev build without one says so loudly below.
+ */
+const appCheckDebugToken =
+  silentsumEnv === 'dev' ? pick(process.env.APP_CHECK_DEBUG_TOKEN, '') : '';
+if (silentsumEnv === 'dev' && appCheckDebugToken === '') {
+  console.warn(
+    [
+      '[silentsum] APP_CHECK_DEBUG_TOKEN is not set for this dev build.',
+      '  App Check will mint a random debug secret on this install, which the Firebase console',
+      '  has not registered, so every Firestore read and Storage upload will be REFUSED, and',
+      '  messaging will report "Messaging is not available in this build.".',
+      '  Set APP_CHECK_DEBUG_TOKEN in .env and register the same value in the Firebase console',
+      '  under App Check > Apps > Manage debug tokens. See docs/firebase-setup.md.',
+    ].join('\n'),
+  );
+}
 const firebaseStorageBucket = pick(process.env.FIREBASE_STORAGE_BUCKET, '');
 
 // The support relay: this project's own `silentsumSupportRelay` function, which holds the mail
@@ -125,7 +157,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // whatever this says, so a versionCode edited in `build.gradle` silently returns to 1 and Play
     // refuses the upload as a duplicate. Bump it for every build that is uploaded, independently of
     // `version` above -- Play compares only this number.
-    versionCode: 6,
+    versionCode: 7,
     ...(firebaseAndroid ? { googleServicesFile: googleServicesJson } : {}),
     adaptiveIcon: {
       // `surfaceAlt` from DARK_PALETTE, matching `android-icon-background.png`. A launcher that
@@ -291,6 +323,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     firebaseConfigured,
     firebaseAndroid,
     firebaseIos,
+    // Dev only, by construction: see the constant's own note. A prod bundle must never carry it.
     appCheckDebugToken: appCheckDebugToken === '' ? undefined : appCheckDebugToken,
     firebaseStorageBucket: firebaseStorageBucket === '' ? undefined : firebaseStorageBucket,
     support,

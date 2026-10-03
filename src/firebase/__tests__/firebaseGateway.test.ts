@@ -166,44 +166,136 @@ describe('the unconfigured build', () => {
   });
 });
 
+/** Every native module present and behaving, so the gateway reaches the end of its happy path. */
+const AVAILABLE_MODULES: Readonly<Record<string, () => unknown>> = {
+  '@react-native-firebase/app': () => ({
+    getApps: () => [{ name: '[DEFAULT]' }],
+    getApp: () => ({ name: '[DEFAULT]', options: { projectId: 'demo-project' } }),
+  }),
+  '@react-native-firebase/crashlytics': () => ({
+    getCrashlytics: () => ({}),
+    setCrashlyticsCollectionEnabled: async () => undefined,
+    recordError: () => undefined,
+    log: () => undefined,
+  }),
+  '@react-native-firebase/analytics': () => ({
+    getAnalytics: () => ({}),
+    setAnalyticsCollectionEnabled: async () => undefined,
+    logEvent: () => undefined,
+  }),
+  '@react-native-firebase/app-check': () => ({
+    ReactNativeFirebaseAppCheckProvider: class {
+      configure(): void {}
+    },
+    initializeAppCheck: () => undefined,
+    getAppCheck: () => ({}),
+    getToken: async () => ({ token: 'app-check' }),
+  }),
+  '@react-native-firebase/auth': () => ({
+    getAuth: () => ({ currentUser: null }),
+    getIdToken: async () => 'id-token',
+  }),
+  '@react-native-firebase/firestore': () => ({}),
+  '@react-native-firebase/storage': () => ({}),
+};
+
+/**
+ * Which App Check provider each environment gets, and what it is handed.
+ *
+ * Nothing asserted this before, which is how a dev build came to ship the debug provider with no
+ * token: the SDK then mints a random debug secret per install, the console has never seen it, and
+ * every Firestore read is refused -- surfacing as "Messaging is not available in this build.".
+ */
+describe('App Check', () => {
+  interface ProviderChoice {
+    readonly provider: string;
+    readonly debugToken?: string;
+  }
+  interface AppCheckConfig {
+    readonly android: ProviderChoice;
+    readonly apple: ProviderChoice;
+  }
+
+  /** The config object the gateway hands to the provider, or null if it never configured one. */
+  async function configuredWith(
+    env: 'dev' | 'prod',
+    options: Parameters<Gateway['initializeFirebase']>[1] = {},
+  ): Promise<AppCheckConfig | null> {
+    jest.resetModules();
+    let seen: AppCheckConfig | null = null;
+    for (const [id, factory] of Object.entries(AVAILABLE_MODULES)) {
+      if (id === '@react-native-firebase/app-check') continue;
+      jest.doMock(id, factory);
+    }
+    jest.doMock('@react-native-firebase/app-check', () => ({
+      ReactNativeFirebaseAppCheckProvider: class {
+        configure(config: AppCheckConfig): void {
+          seen = config;
+        }
+      },
+      initializeAppCheck: () => ({}),
+      getAppCheck: () => ({}),
+      getToken: async () => ({ token: 'app-check' }),
+    }));
+    await loadGateway().initializeFirebase(env, {
+      configured: true,
+      storageBucket: 'silentsum-vault',
+      ...options,
+    });
+    return seen;
+  }
+
+  beforeEach(() => {
+    warn.mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    for (const id of FIREBASE_PACKAGES) jest.dontMock(id);
+    jest.resetModules();
+  });
+
+  it('attests a production build with Play Integrity, and App Attest on Apple', async () => {
+    const config = await configuredWith('prod');
+    expect(config?.android.provider).toBe('playIntegrity');
+    expect(config?.apple.provider).toBe('appAttestWithDeviceCheckFallback');
+  });
+
+  /**
+   * The security-relevant one. `app.config.ts` will not publish a debug token for a prod build, so
+   * this should never arrive -- and if it does, by a stray environment variable or a future caller,
+   * it must not reach the provider. A registered debug token inside a public APK is a project-wide
+   * App Check bypass for anyone who unzips it.
+   */
+  it('never hands a production build a debug token, even when given one', async () => {
+    const config = await configuredWith('prod', { appCheckDebugToken: 'should-be-ignored' });
+    expect(config?.android.provider).toBe('playIntegrity');
+    expect(config?.android.debugToken).toBeUndefined();
+    expect(config?.apple.debugToken).toBeUndefined();
+  });
+
+  it('gives a dev build the debug provider and the token the build supplied', async () => {
+    const config = await configuredWith('dev', { appCheckDebugToken: 'dev-token' });
+    expect(config?.android).toEqual({ provider: 'debug', debugToken: 'dev-token' });
+    expect(config?.apple).toEqual({ provider: 'debug', debugToken: 'dev-token' });
+  });
+
+  /**
+   * Still activates, deliberately: App Check stays on and the requests are refused. Turning it off
+   * to make a tokenless build work would be the one thing this must never do.
+   */
+  it('keeps App Check on for a dev build with no token, and says what will happen', async () => {
+    const config = await configuredWith('dev');
+    expect(config?.android).toEqual({ provider: 'debug' });
+    expect(config?.apple).toEqual({ provider: 'debug' });
+  });
+});
+
 /**
  * Billing needs three things from the gateway: a cloud backend to read entitlements through,
  * the project id (or an explicit https override) to find the functions, and not having been
  * switched off. Each of the three is checked on its own.
  */
 describe('billing', () => {
-  const AVAILABLE_MODULES: Readonly<Record<string, () => unknown>> = {
-    '@react-native-firebase/app': () => ({
-      getApps: () => [{ name: '[DEFAULT]' }],
-      getApp: () => ({ name: '[DEFAULT]', options: { projectId: 'demo-project' } }),
-    }),
-    '@react-native-firebase/crashlytics': () => ({
-      getCrashlytics: () => ({}),
-      setCrashlyticsCollectionEnabled: async () => undefined,
-      recordError: () => undefined,
-      log: () => undefined,
-    }),
-    '@react-native-firebase/analytics': () => ({
-      getAnalytics: () => ({}),
-      setAnalyticsCollectionEnabled: async () => undefined,
-      logEvent: () => undefined,
-    }),
-    '@react-native-firebase/app-check': () => ({
-      ReactNativeFirebaseAppCheckProvider: class {
-        configure(): void {}
-      },
-      initializeAppCheck: () => undefined,
-      getAppCheck: () => ({}),
-      getToken: async () => ({ token: 'app-check' }),
-    }),
-    '@react-native-firebase/auth': () => ({
-      getAuth: () => ({ currentUser: null }),
-      getIdToken: async () => 'id-token',
-    }),
-    '@react-native-firebase/firestore': () => ({}),
-    '@react-native-firebase/storage': () => ({}),
-  };
-
   async function available(
     options: Parameters<Gateway['initializeFirebase']>[1],
   ): Promise<FirebaseServices> {

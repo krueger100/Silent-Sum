@@ -80,9 +80,31 @@ prod, debug providers in dev. In the console:
 
 - Android: register the Play Integrity provider, which needs the SHA-256 fingerprints.
 - iOS: enable App Attest with your Team ID.
-- Dev builds print a debug token; register it under App Check, Apps, Manage debug tokens, and set
-  `APP_CHECK_DEBUG_TOKEN` in `.env` if you want it passed explicitly.
+- Dev builds need `APP_CHECK_DEBUG_TOKEN` set in `.env`, and that exact value registered under
+  App Check, Apps, Manage debug tokens. Any UUID will do; generate one with
+  `node -e "console.log(require('crypto').randomUUID())"`.
 - Enforce App Check for Firestore and Storage only after you have seen a verified token.
+
+### A dev build with no debug token
+
+Leaving `APP_CHECK_DEBUG_TOKEN` empty does not disable App Check. The native SDK mints a random
+debug secret per install (Android: `DebugAppCheckProviderFactory`), nothing has registered it, and
+every Firestore read and Storage upload is refused. What you see in the app is:
+
+> Messaging is not available in this build.
+
+which is a claim about the build, for a server refusal. It comes from
+`describeMessagingError('unavailable')`, and `messagingService.ts` maps a failed read of
+`messagingKeys/{uid}` -- the peer's published key, needed by every conversation -- onto that code.
+So the first symptom of a missing debug token is a message that sends you looking at the APK.
+
+`app.config.ts` warns at build time when a dev build has no token, and refuses to publish one for a
+prod build: a registered debug token inside a public APK would let anyone who unzips it bypass App
+Check for the whole project. Prod attests with Play Integrity and needs no token.
+
+To confirm what the device is doing: `adb logcat -d | grep -i appcheck`. An unregistered secret
+shows as a rejected token exchange; "Enter this debug secret into the allow list" is the SDK
+printing the random one it just invented.
 
 ## 6. Crashlytics and Analytics
 

@@ -184,10 +184,23 @@ function activateAppCheck(
   }
   try {
     const isProd = env === 'prod';
+    // Belt to `app.config.ts`'s braces: it will not publish a debug token for prod, and prod does
+    // not hand one to the provider either. Both platforms read `debugToken` only inside their own
+    // "debug" branch, so this is inert rather than load-bearing -- which is exactly why it is worth
+    // stating here, where a future provider change would otherwise make it matter silently.
+    const debug = isProd || debugToken === undefined ? {} : { debugToken };
+    if (!isProd && debugToken === undefined) {
+      // Only visible in a debug build (`note` is `__DEV__`-gated), which is why the build-time
+      // warning in app.config.ts is the one that catches this for a release dev APK.
+      note(
+        'no App Check debug token: the SDK will mint a random secret this install, which the ' +
+          'console has not registered, so every Firestore read will be refused',
+      );
+    }
     const provider = new module.ReactNativeFirebaseAppCheckProvider();
     provider.configure({
-      android: { provider: isProd ? 'playIntegrity' : 'debug', debugToken },
-      apple: { provider: isProd ? 'appAttestWithDeviceCheckFallback' : 'debug', debugToken },
+      android: { provider: isProd ? 'playIntegrity' : 'debug', ...debug },
+      apple: { provider: isProd ? 'appAttestWithDeviceCheckFallback' : 'debug', ...debug },
     });
     const instance = module.initializeAppCheck(app.getApp(), {
       provider,
