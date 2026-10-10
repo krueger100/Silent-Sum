@@ -51,13 +51,42 @@ describe('FirebaseDirectory', () => {
     ['permission-denied', 'pro-required'],
     ['resource-exhausted', 'rate-limited'],
     ['invalid-argument', 'invalid-email'],
+    // The server answered, just not usefully. A 404 is an undeployed function or a base URL
+    // pointing somewhere it should not; a 500 is the function breaking. Neither is App Check,
+    // and neither is the network.
     ['internal', 'unavailable'],
+    ['not-found', 'unavailable'],
+    ['unknown', 'unavailable'],
+    // Our own code for 'no response at all'. The server never spoke, so a retry can help.
+    ['unavailable', 'offline'],
   ])('maps the callable code %s to %s', async (from, to) => {
     expect(await codeOf(() => failing(from).findByEmail('a@b.test'))).toBe(to);
   });
 
-  it('still says nothing rather than throwing when the reverse lookup is refused', async () => {
-    // Naming a correspondent is decoration: a refusal leaves the account id showing.
-    await expect(failing('unauthenticated').emailForUid('u2')).resolves.toBeNull();
+  /**
+   * The reverse lookup draws a line the forward one does not have to: between an answer of
+   * "nobody" and not getting an answer at all.
+   *
+   * It used to return null for both, which read as "asked and answered" either way. The caller
+   * marked the peer as asked and never asked again, so a row whose single lookup failed showed a
+   * raw account id until the app was killed -- which is exactly what an unregistered App Check
+   * token produced, and what it was mistaken for.
+   */
+  it('throws when the reverse lookup is refused, so the caller can ask again', async () => {
+    expect(await codeOf(() => failing('unauthenticated').emailForUid('u2'))).toBe('attestation');
+    expect(await codeOf(() => failing('resource-exhausted').emailForUid('u2'))).toBe(
+      'rate-limited',
+    );
+  });
+
+  it('returns null only when the server answered and has no address', async () => {
+    const answering = (body: unknown): FirebaseDirectory =>
+      new FirebaseDirectory({ call: <T,>(): Promise<T> => Promise.resolve(body as T) }, () => SIGNED_IN);
+
+    await expect(answering({ found: false }).emailForUid('u2')).resolves.toBeNull();
+    await expect(answering({ found: true, email: '' }).emailForUid('u2')).resolves.toBeNull();
+    await expect(
+      answering({ found: true, email: 'peer@example.test' }).emailForUid('u2'),
+    ).resolves.toBe('peer@example.test');
   });
 });

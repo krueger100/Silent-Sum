@@ -46,13 +46,24 @@ function isMessageProblem(problem: unknown): problem is MessageProblem {
  */
 function codeIsRetryable(code: MessagingErrorCode): boolean {
   switch (code) {
+    // The one failure here that a later tap can genuinely fix: the request never reached the
+    // server, so nothing was decided and nothing is stale. Everything below was an answer.
+    case 'offline':
+      return true;
     case 'unauthenticated':
     case 'attestation':
     case 'locked':
     case 'pro-required':
+    case 'rate-limited':
+    case 'invalid-email':
     case 'no-such-user':
     case 'self':
     case 'peer-has-no-key':
+    // Tapping again re-derives the same identity from the same vault and reaches the same
+    // conclusion. Only recovering the vault changes this one.
+    case 'foreign-vault':
+    // Recovering the CURRENT key changes this. Offering the same send again does not.
+    case 'historical-identity':
     case 'rejected':
     case 'not-mine':
     case 'vault-refused':

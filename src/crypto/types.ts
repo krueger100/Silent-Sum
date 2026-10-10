@@ -80,6 +80,13 @@ export const WRAPPED_KEY_LIMITS = {
 export const AAD = {
   vault: 'silentsum/vmk/v1',
   backupEnvelope: 'silentsum/backup-envelope/v1',
+  /**
+   * The messaging key escrow. Distinct from `backupEnvelope` so the two records are not
+   * interchangeable: a wrapped key lifted from one and pasted into the other fails to
+   * authenticate, which is what stops a rebind-replaced envelope from ever being read back as a
+   * messaging key.
+   */
+  messagingEscrow: 'silentsum/messaging-escrow/v1',
 } as const;
 
 export interface KeyWrapping {

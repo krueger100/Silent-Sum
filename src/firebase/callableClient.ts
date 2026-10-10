@@ -46,6 +46,16 @@ export interface CallableInvoker {
  * `unauthenticated`, `failed-precondition`, `invalid-argument`, `unavailable`, and so on.
  */
 export class CallableError extends Error {
+  /**
+   * Whether an App Check token went out with the request that failed.
+   *
+   * The server cannot tell a caller which half of its refusal applies: a callable answers
+   * `UNAUTHENTICATED` whether the ID token or the App Check token was the problem, because it
+   * saw neither. Only this side knows which it actually sent, so recording it turns a guess
+   * into a fact -- and the remedy for the two is completely different.
+   */
+  appCheckSent = false;
+
   constructor(
     readonly code: string,
     message?: string,
@@ -54,6 +64,19 @@ export class CallableError extends Error {
     super(message ?? `CallableError(${code})`);
     this.name = 'CallableError';
   }
+}
+
+const CALLABLE_DEV = (globalThis as { __DEV__?: boolean }).__DEV__ === true;
+
+/**
+ * Development-only breadcrumb. A callable refusal otherwise reaches the screen as one word,
+ * and the difference between "App Check refused this build", "that function is not deployed"
+ * and "the network dropped" is invisible from the message alone -- which is exactly the hole
+ * that made one misconfiguration look like another for a whole afternoon. Never carries user
+ * data: a function name, an HTTP status, and whether a token was attached.
+ */
+function noteCallable(name: string, detail: string): void {
+  if (CALLABLE_DEV) console.warn(`[silentsum] callable ${name}: ${detail}`);
 }
 
 export const CALLABLE_TIMEOUT_MS = 30_000;
@@ -137,7 +160,8 @@ export class CallableClient implements CallableInvoker {
     const idToken = await quietly(() => this.tokens.idToken());
     if (idToken !== null && idToken !== '') headers.Authorization = `Bearer ${idToken}`;
     const appCheck = await quietly(() => this.tokens.appCheckToken());
-    if (appCheck !== null && appCheck !== '') headers['X-Firebase-AppCheck'] = appCheck;
+    const appCheckSent = appCheck !== null && appCheck !== '';
+    if (appCheckSent) headers['X-Firebase-AppCheck'] = appCheck;
 
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -154,7 +178,8 @@ export class CallableClient implements CallableInvoker {
       });
     } catch {
       // No connection, DNS or TLS failure, or our own timeout: all "not reachable right now".
-      throw new CallableError('unavailable', 'The server could not be reached.');
+      noteCallable(name, 'request failed before any response');
+      throw this.tag(new CallableError('unavailable', 'The server could not be reached.'), appCheckSent);
     } finally {
       clearTimeout(timer);
     }
@@ -169,15 +194,40 @@ export class CallableClient implements CallableInvoker {
 
     if (!response.ok) {
       const error = readError(parsed);
-      if (error !== null) throw new CallableError(error.code, error.message, error.details);
+      if (error !== null) {
+        noteCallable(
+          name,
+          `HTTP ${String(response.status)} ${error.code}` +
+            (appCheckSent ? ' (App Check token sent)' : ' (NO App Check token sent)'),
+        );
+        throw this.tag(
+          new CallableError(error.code, error.message, error.details),
+          appCheckSent,
+        );
+      }
       const fallback =
         HTTP_STATUS_CODES[response.status] ?? (response.status >= 500 ? 'internal' : 'unknown');
-      throw new CallableError(fallback, `HTTP ${String(response.status)}`);
+      // A body that is not the callable protocol at all. A 404 here is the signature of a
+      // function that is not deployed, or a base URL pointing somewhere it should not --
+      // nothing to do with App Check, and it must not be reported as though it were.
+      noteCallable(name, `HTTP ${String(response.status)} -> ${fallback} (body was not a callable error)`);
+      throw this.tag(
+        new CallableError(fallback, `HTTP ${String(response.status)}`),
+        appCheckSent,
+      );
     }
 
     if (typeof parsed !== 'object' || parsed === null || !('result' in parsed)) {
-      throw new CallableError('internal', 'The server answered without a result.');
+      throw this.tag(
+        new CallableError('internal', 'The server answered without a result.'),
+        appCheckSent,
+      );
     }
     return (parsed as { result: T }).result;
+  }
+
+  private tag(error: CallableError, appCheckSent: boolean): CallableError {
+    error.appCheckSent = appCheckSent;
+    return error;
   }
 }

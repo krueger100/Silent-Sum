@@ -31,6 +31,8 @@ export interface SettingsScreenProps {
   onAutoLock: () => void;
   onSecurity: () => void;
   onWipePin: () => void;
+  /** The list of what THIS account has in the cloud. Absent where there is no cloud at all. */
+  onCloudGallery?: () => void;
   onCloudBackup: () => void;
   /** The SilentSum Pro and Cloud page: prices, status, and the way to buy. */
   onPlans: () => void;
@@ -61,6 +63,7 @@ export function SettingsScreen({
   onSecurity,
   onWipePin,
   onCloudBackup,
+  onCloudGallery,
   onPlans,
   onSupport,
   onMessages,
@@ -186,6 +189,14 @@ export function SettingsScreen({
           }
           onPress={onCloudBackup}
         />
+        {onCloudGallery === undefined || !cloudAvailable ? null : (
+          <ListRow
+            testID="settings_cloud_gallery"
+            label="Cloud Gallery"
+            detail="What this account has in the cloud. Your Local Gallery is unlimited and stays on this device."
+            onPress={onCloudGallery}
+          />
+        )}
         {onMessages === undefined || !services.messaging.available ? null : (
           <ListRow
             testID="settings_messages"

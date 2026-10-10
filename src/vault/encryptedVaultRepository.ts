@@ -50,6 +50,7 @@ import {
 } from '@/vault/types';
 import { utf8Decode, utf8Encode, zeroBytes, type Bytes } from '@/utils/bytes';
 import type { Clock } from '@/utils/clock';
+import type { ProgressReport } from '@/utils/progress';
 
 const THUMBNAIL_CACHE_BYTES = 24 * 1024 * 1024;
 const FULL_IMAGE_CACHE_BYTES = 48 * 1024 * 1024;
@@ -299,18 +300,27 @@ export class EncryptedVaultRepository implements VaultRepository {
     );
   }
 
-  async deletePhotos(ids: Iterable<string>): Promise<void> {
+  async deletePhotos(ids: Iterable<string>, onProgress?: ProgressReport): Promise<void> {
     this.ensureOpen();
     const set = new Set(ids);
     if (set.size === 0) return;
     await this.serialized(async () => {
       // The index goes first: if the process dies mid-delete the photo is already unreachable.
       await this.commitIndex(withoutPhotos(this.index, set));
+      // Reported from here rather than from the caller: secure deletion overwrites before it
+      // unlinks, so a selection of videos takes real time and only this loop knows how far in
+      // it is. The index is already committed by now, so the count is of erasure, not of
+      // whether the photos are gone -- they are, from the first line above.
+      const total = set.size;
+      let done = 0;
+      onProgress?.(0, total);
       for (const id of set) {
         this.thumbCache.remove(id);
         this.fullCache.remove(id);
         await this.secureDelete.file(this.paths.photoFile(id));
         await this.secureDelete.file(this.paths.thumbFile(id));
+        done += 1;
+        onProgress?.(done, total);
       }
     });
   }

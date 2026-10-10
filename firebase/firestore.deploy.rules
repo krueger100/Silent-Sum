@@ -116,6 +116,45 @@ service cloud.firestore {
       allow create, update: if ssOwner(uid) && ssValidManifest(request.resource.data);
     }
 
+    // The account's messaging key, wrapped under its recovery passphrase.
+    //
+    // A SEPARATE document from the envelope on purpose, and that separation is the security
+    // property. `rebindBackup` ends by rewriting the envelope with the rebinding device's vault
+    // key; when the envelope was the only recoverable copy of the messaging key, one rebind made
+    // every conversation on the account permanently unreadable, silently. The client will not
+    // write here from a vault whose key is not the one the account published -- see
+    // `BackupService.writeMessagingEscrow` -- so a rebind leaves this untouched.
+    //
+    // Opaque to the server exactly as the envelope is: a passphrase-wrapped key with its own
+    // salt and its own AAD. `publicKey` is the one plaintext field and is not a secret -- it is
+    // the same string `messagingKeys/{uid}` already publishes to every signed-in user, kept here
+    // so a stale escrow can be recognised without paying for a key derivation.
+    //
+    // This does NOT touch key rotation. Rotation is `messagingKeys/{uid}`, a different
+    // collection, whose rules are unchanged; a match here can only ever grant on this path.
+    function ssValidMessagingEscrow(d) {
+      return d.keys().hasOnly(['v', 'salt', 'kdf', 'wrapped', 'publicKey', 'createdAt'])
+        && d.v == 1
+        && d.salt is string && d.salt.size() <= 64
+        && d.kdf is map && d.kdf.keys().hasOnly(['alg', 'm', 't', 'p', 'len'])
+        && d.kdf.alg == 'argon2id'
+        && d.kdf.m is int && d.kdf.m >= 8192 && d.kdf.m <= 262144
+        && d.kdf.t is int && d.kdf.t >= 1 && d.kdf.t <= 10
+        && d.kdf.p is int && d.kdf.p >= 1 && d.kdf.p <= 4
+        && d.kdf.len == 32
+        && d.wrapped is map
+        && d.wrapped.nonce is string && d.wrapped.nonce.size() <= 64
+        && d.wrapped.ct is string && d.wrapped.ct.size() <= 256
+        && d.wrapped.mac is string && d.wrapped.mac.size() <= 64
+        && d.publicKey is string && d.publicKey.size() > 0 && d.publicKey.size() <= 64
+        && d.createdAt is string;
+    }
+
+    match /users/{uid}/vault/messaging {
+      allow read, delete: if ssOwner(uid);
+      allow create, update: if ssOwner(uid) && ssValidMessagingEscrow(request.resource.data);
+    }
+
     // ---- ADDED: SilentSum billing entitlements --------------------------------------------
     // What the account has paid for. Server-written; the owner reads, nobody else does anything.
     match /users/{uid}/billing/entitlements {
@@ -208,20 +247,64 @@ service cloud.firestore {
         : ssConvMembers(cid)[0];
     }
 
-    // The published X25519 public key. Any signed-in account may read one -- that is what makes
-    // it public -- and only its owner may write it. A key is never deleted, because deleting one
-    // would make every conversation it protects unreadable.
+    // The published X25519 public key, and every key this account published before it.
+    //
+    // A GET names the account it wants, and that is what makes a key public. A LIST would hand any
+    // signed-in caller the whole collection in one request -- and because the key is a function of
+    // the vault alone, two accounts on one device publish the SAME key, so a listing is a
+    // ready-made way to group accounts by the device behind them. Nothing in the client lists this
+    // collection; it only ever gets one by uid. So listing is refused outright.
+    //
+    // `previous` is APPEND-ONLY, enforced here rather than trusted to the client, because losing an
+    // entry is not a failure anyone can see: it makes messages ALREADY SENT unreadable to the other
+    // side, silently and permanently. The conversation key is X25519 over whichever key was current
+    // when the message was sent, a peer caches nothing across a lock, and this document is the only
+    // record. Deleting a key was already refused; overwriting one has exactly the same effect, and
+    // was not.
+    //
+    // A rotation may add exactly one entry, it must be the key being replaced, and everything
+    // already retired must still be present. A client that computed its rotation from a stale read
+    // therefore fails the size check instead of overwriting a rotation it never saw, which is what
+    // makes two devices rotating at once safe without a transaction.
+    //
+    // Documents written before `previous` existed do not have it, so the stored side is read
+    // through `get('previous', [])`. A CREATE may omit it, so that an older build publishing its
+    // first key keeps working. An UPDATE may not: an older build's rotation fails the size check
+    // and is refused, which is the point -- it would otherwise erase the history it cannot see.
     match /messagingKeys/{uid} {
-      allow read: if request.auth != null;
-      allow create, update: if ssOwner(uid)
-        && request.resource.data.keys().hasOnly(['v', 'uid', 'publicKey', 'updatedAt'])
+      allow get: if request.auth != null;
+      allow list: if false;
+
+      allow create: if ssOwner(uid)
+        && ssValidKeyDoc(uid)
+        && request.resource.data.get('previous', []).size() == 0;
+
+      allow update: if ssOwner(uid)
+        && ssValidKeyDoc(uid)
+        && request.resource.data.publicKey != resource.data.publicKey
+        && request.resource.data.get('previous', []).hasAll(resource.data.get('previous', []))
+        && request.resource.data.get('previous', []).size()
+             == resource.data.get('previous', []).size() + 1
+        && request.resource.data.get('previous', [])[resource.data.get('previous', []).size()]
+             == resource.data.publicKey;
+
+      allow delete: if false;
+    }
+
+    // The shape of a published key document. The cap on `previous` bounds the document; sixty-four
+    // rotations is far past anything a real account reaches, and hitting it refuses the rotation
+    // rather than dropping a key, which is the safe direction to fail.
+    function ssValidKeyDoc(uid) {
+      return request.resource.data.keys()
+          .hasOnly(['v', 'uid', 'publicKey', 'updatedAt', 'previous'])
         && request.resource.data.v == 1
         && request.resource.data.uid == uid
         && request.resource.data.publicKey is string
         && request.resource.data.publicKey.size() > 0
         && request.resource.data.publicKey.size() <= 128
+        && request.resource.data.get('previous', []) is list
+        && request.resource.data.get('previous', []).size() <= 64
         && ssRecentMillis(request.resource.data.updatedAt);
-      allow delete: if false;
     }
 
     function ssValidNewConversation(cid, d) {

@@ -56,10 +56,11 @@ export function useChatMedia(
         try {
           const bytes = await messaging.fetchThumb(conversationId, message);
           if (!mounted.current) return;
-          if (bytes === null) {
-            // Gone, which after 30 days is exactly what it should be. Not a failure, and no
-            // retry will ever change it.
-            setStates((prev) => new Map(prev).set(key, 'expired'));
+          if (typeof bytes === 'string') {
+            // `expired` is gone, which after 30 days is exactly what it should be. `sealed` is
+            // present but unopenable here. Neither is a failure and no retry changes either, but
+            // they are not the same sentence, and this used to tell both of them the first one.
+            setStates((prev) => new Map(prev).set(key, bytes));
             return;
           }
           setPreviews((prev) => new Map(prev).set(key, bytes));

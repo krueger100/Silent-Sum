@@ -26,7 +26,7 @@
  * explains that and stops; it never crashes and never implies something is broken.
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 
 import {
   useEntitlements,
@@ -35,16 +35,19 @@ import {
   useSettings,
   useVaultState,
 } from '@/app/ServicesProvider';
-import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
+import { radius, spacing, type Palette, typography, useStyles } from '@/app/theme';
 import { describeCloudError } from '@/backup/screens/cloudErrors';
+import { restoreMessagingIdentity } from '@/messaging/identityRecovery';
+import { describeMessagingRestore } from '@/messaging/restoreNotice';
 import { cloudActive } from '@/billing/entitlements';
 import { CloudRequiredCard } from '@/billing/screens/CloudRequiredCard';
 import { requestPasswordReset, RESET_REASSURANCE } from '@/backup/screens/passwordReset';
 import { validatePassphrase } from '@/backup/passphrasePolicy';
-import { ForeignVaultError, type BackupService } from '@/backup/types';
+import { ForeignVaultError, type BackupProgress, type BackupService } from '@/backup/types';
 import type { Ownership } from '@/backup/vaultOwner';
 import { Button } from '@/components/Button';
 import { Field } from '@/components/Field';
+import { ProgressBar } from '@/components/ProgressBar';
 import { ConfirmDialog, TypedConfirmDialog } from '@/components/Dialog';
 import { ListRow } from '@/components/ListRow';
 import { Paragraph, Screen, SectionLabel } from '@/components/Screen';
@@ -122,7 +125,6 @@ function CloudBackupBody({
   onBack?: () => void;
   onPlans?: () => void;
 }): React.JSX.Element {
-  const colors = useTheme();
   const styles = useStyles(makeStyles);
   const services = useServices();
   const settings = useSettings();
@@ -153,9 +155,15 @@ function CloudBackupBody({
    */
   const [ownership, setOwnership] = useState<Ownership>({ kind: 'unbound' });
   /** A cross-account write the user has been asked about but has not yet answered. */
-  const [confirmingCrossAccount, setConfirmingCrossAccount] = useState<null | 'enable' | 'backup'>(
-    null,
-  );
+  /**
+   * The cross-account question, and whether this device can actually name the account it is asking
+   * about. `ownerKnown` false means the local note would not parse -- still worth asking, because
+   * nothing has established that these photos belong in this account, but not worth asserting.
+   */
+  const [confirmingCrossAccount, setConfirmingCrossAccount] = useState<null | {
+    readonly which: 'enable' | 'backup';
+    readonly ownerKnown: boolean;
+  }>(null);
   /**
    * The ids this account's own backup holds, captured by the last foreign restore. Non-null is
    * what offers "make this device the owner", and it is exactly what that would re-upload.
@@ -168,6 +176,16 @@ function CloudBackupBody({
   const [deleting, setDeleting] = useState(false);
   const [deletePassword, setDeletePassword] = useState('');
   const [busy, setBusy] = useState(false);
+  /**
+   * What the operation in flight has finished so far. Null while something is running that has
+   * nothing countable yet -- unwrapping the envelope, fetching the index -- which is a real phase
+   * and is shown as an indeterminate bar rather than a made-up percentage.
+   */
+  const [progress, setProgress] = useState<{
+    readonly verb: string;
+    readonly done: number;
+    readonly total: number;
+  } | null>(null);
   /** Synchronous re-entrancy guard; `busy` drives the UI but lags a double tap by a frame. */
   const inFlight = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -224,6 +242,7 @@ function CloudBackupBody({
     inFlight.current = true;
     setBusy(true);
     setError(null);
+    setProgress(null);
     try {
       await action();
     } catch (cause) {
@@ -231,8 +250,20 @@ function CloudBackupBody({
     } finally {
       inFlight.current = false;
       setBusy(false);
+      // Cleared on the way out as well as in: a bar left at "71 of 73" under a finished status
+      // line reads as though the run stopped short of the end.
+      setProgress(null);
     }
   }, []);
+
+  /** A progress callback for one operation, labelled with what that operation is doing. */
+  const track = useCallback(
+    (verb: string): BackupProgress =>
+      (done, total) => {
+        setProgress({ verb, done, total });
+      },
+    [],
+  );
 
   /**
    * Typing into a credential field is an attempt to fix whatever the last message complained
@@ -304,7 +335,7 @@ function CloudBackupBody({
         if (cause instanceof ForeignVaultError) {
           // Held, not failed: the passphrase fields keep their contents so answering the question
           // does not cost the user their typing.
-          setConfirmingCrossAccount('enable');
+          setConfirmingCrossAccount({ which: 'enable', ownerKnown: cause.ownerUid !== null });
           return;
         }
         throw cause;
@@ -319,7 +350,17 @@ function CloudBackupBody({
   };
 
   /**
-   * Uploads whatever the cloud does not already have.
+   * Re-uploads anything missing from the set already in the Cloud Gallery. It never ADDS.
+   *
+   * This used to upload the whole vault, and that is no longer what the cloud is. The Local
+   * Gallery is unlimited, device-level and private; the cloud holds the subset the user picked,
+   * one photo at a time, through "Back up to Cloud" in the vault. A button here that swept the
+   * entire device into an account would undo that in a single tap -- including photos belonging
+   * to nobody but this device, and photos another account had never been shown.
+   *
+   * So the ids come from the account's own index: exactly what is already backed up, re-offered
+   * so a half-finished or interrupted upload can be completed. An empty index means there is
+   * nothing to repair, not that the vault is empty.
    *
    * Two outcomes, and they are reported differently on purpose. An upload that moved something
    * gets the quiet status line, because the user asked for it and got it. An upload with nothing
@@ -336,12 +377,19 @@ function CloudBackupBody({
     void run(async () => {
       let report;
       try {
-        report = await backup.backupNow(repository, services.session.requireKeys(), {
+        const keys = services.session.requireKeys();
+        // Whatever this account already holds. A foreign backup cannot be listed, and the
+        // upload below refuses it anyway -- for the same reason and with the same message.
+        const contents = await backup.cloudContents(keys);
+        const ids = contents.kind === 'listed' ? contents.entries.map((entry) => entry.id) : [];
+        report = await backup.backupNow(repository, keys, {
+          ids,
           confirmedCrossAccount,
+          onProgress: track('Uploading'),
         });
       } catch (cause) {
         if (cause instanceof ForeignVaultError) {
-          setConfirmingCrossAccount('backup');
+          setConfirmingCrossAccount({ which: 'backup', ownerKnown: cause.ownerUid !== null });
           return;
         }
         throw cause;
@@ -350,22 +398,35 @@ function CloudBackupBody({
       logEventSafely(services.firebase.analytics, ANALYTICS_EVENTS.backupCompleted, {
         count: report.total,
       });
+      // The one outcome that must never be reported as success. These entries are named in the
+      // index, their files are gone from the cloud, and this device has no copy to upload -- so a
+      // run that uploaded nothing is not a healthy backup here, it is a loss nobody has mentioned
+      // to the user yet. Zero uploads because everything is safe and zero uploads because the
+      // bytes are gone on both sides are the same number and opposite facts.
+      const lost =
+        report.unrepairable === 0
+          ? ''
+          : ` ${plural(report.unrepairable, 'item')} could not be put back: the cloud no longer ` +
+            'has their files and this device has no copy either. Open the Cloud Gallery to see ' +
+            'which ones.';
       if (report.uploaded === 0) {
         setStatus(null);
         setNothingToUpload(
           report.total === 0
-            ? 'There are no photos in the vault yet, so there was nothing to upload.'
-            : `Every photo on this device is already in the backup, so nothing was uploaded. ` +
-                `${plural(report.total, 'photo')} are in the backup and none of them were changed.`,
+            ? 'Nothing has been added to the Cloud Gallery yet, so there was nothing to check. ' +
+              'Pick photos in the vault and choose "Back up to Cloud". Your Local Gallery stays ' +
+              'on this device.'
+            : report.unrepairable === 0
+              ? `All ${plural(report.total, 'cloud item')} are backed up. ` +
+                'Nothing needed repairing.'
+              : `${plural(report.total, 'cloud item')} in your Cloud Gallery.` + lost,
         );
       } else {
+        // A repair, not an addition: membership did not change, only the bytes behind it.
         setStatus(
-          `Uploaded ${plural(report.uploaded, 'photo')}. ` +
-            `${plural(report.total, 'photo')} now in the backup.` +
-            (report.cloudOnly === 0
-              ? ''
-              : ` That includes ${plural(report.cloudOnly, 'photo')} this device no longer has, ` +
-                'kept rather than deleted.'),
+          `Restored ${plural(report.uploaded, 'item')} to cloud backup. ` +
+            `${plural(report.total, 'item')} in your Cloud Gallery.` +
+            lost,
         );
       }
       await refreshEnvelope();
@@ -420,8 +481,8 @@ function CloudBackupBody({
       const foreign = !constantTimeEquals(recovered, keys.masterKey);
       try {
         const report = foreign
-          ? await backup.restoreForeignInto(repository, keys, recovered)
-          : await backup.restoreInto(repository, keys);
+          ? await backup.restoreForeignInto(repository, keys, recovered, track('Restoring'))
+          : await backup.restoreInto(repository, keys, track('Restoring'));
         // A restore proves this device has a backup, whatever the local flag said beforehand -- it
         // reads false on a device that was erased, or that restored without ever backing up.
         await services.settings.update({ backupEnabled: true });
@@ -436,18 +497,61 @@ function CloudBackupBody({
         // it and asking for the same words twice in a row teaches people to retype secrets on
         // demand. It is dropped the moment the offer is taken or declined, and on every path
         // where no offer is made.
+        // Before the state is cleared below, so this does not depend on reading a value out of
+        // a closure that something has just asked React to blank. The passphrase is in hand
+        // exactly once, here; asking for it again from a banner after the user has noticed that
+        // none of their messages open is not a recovery flow, it is a puzzle. `recovered` is
+        // tried first, so an account that was never rebound pays for nothing extra.
+        const messagingOutcome = await restoreMessagingIdentity(
+          backup,
+          services.messaging,
+          restorePassphrase,
+          { vaultMasterKey: recovered },
+        );
+        // Before the passphrase state is cleared, and only where the key is actually this
+        // account's -- `protectMessagingKey` decides that, not this screen.
+        if (messagingOutcome === 'ok')
+          await backup.protectMessagingKey(recovered, restorePassphrase);
         if (foreign) setRebindableIds(report.cloudIds);
         else setRestorePassphrase('');
-        setStatus(
-          report.restored === 0 && report.skipped === 0
+        // Built as sentences rather than one expression, so a clause that does not apply is
+        // absent instead of being printed as a zero. "0 photos already on this device" was only
+        // clumsy; the clause this replaces also reported LOST photos in those words, which was
+        // not.
+        //
+        // The empty case is a SENTENCE here rather than a replacement for the whole line. It used
+        // to short-circuit the lot, which meant an account with no photos in its backup -- a real
+        // shape, and the one a user is most likely to be restoring in order to get their messages
+        // back -- was told nothing whatsoever about whether that had worked.
+        const nothingToRestore =
+          report.restored === 0 && report.skipped === 0 && report.missing === 0;
+        const sentences = [
+          nothingToRestore
             ? 'There was nothing in the backup to restore.'
-            : `Restored ${plural(report.restored, 'photo')}. ` +
-                `${plural(report.skipped, 'photo')} already on this device, left untouched.` +
-                (foreign
-                  ? ' That backup was made by a different vault, so its photos were re-encrypted ' +
-                    'for this one. The backup itself is unchanged and still belongs to that vault.'
-                  : ''),
-        );
+            : `Restored ${plural(report.restored, 'photo')}.`,
+        ];
+        if (report.skipped > 0) {
+          sentences.push(
+            `${plural(report.skipped, 'photo')} already on this device, left untouched.`,
+          );
+        }
+        if (report.missing > 0) {
+          sentences.push(
+            `${plural(report.missing, 'photo')} could not be downloaded: the backup lists them, ` +
+              'but their files are no longer in the cloud.',
+          );
+        }
+        // Only where photos actually arrived: with none, "its photos were re-encrypted for this
+        // one" describes something that did not happen.
+        if (foreign && report.restored > 0) {
+          sentences.push(
+            'That backup was made by a different vault, so its photos were re-encrypted for ' +
+              'this one. The backup itself is unchanged and still belongs to that vault.',
+          );
+        }
+        const messagingNotice = describeMessagingRestore(messagingOutcome);
+        if (messagingNotice !== null) sentences.push(messagingNotice);
+        setStatus(sentences.join(' '));
       } finally {
         zeroBytes(recovered);
       }
@@ -474,15 +578,19 @@ function CloudBackupBody({
     }
     void run(async () => {
       const keys = services.session.requireKeys();
-      await backup.rebindBackup(repository, keys, restorePassphrase, ids);
+      await backup.rebindBackup(repository, keys, restorePassphrase, ids, track('Re-uploading'));
       await services.settings.update({ backupEnabled: true, lastBackupAt: services.clock.now() });
       setRebindableIds(null);
       setRestorePassphrase('');
       setOwnership(await backup.ownership());
       await refreshEnvelope();
       setStatus(
-        `This device now owns the backup for this account. ${plural(ids.length, 'photo')} were ` +
-          're-uploaded under this vault\'s key. Nothing else on this device was uploaded.',
+        ids.length === 0
+          ? 'This device now owns the backup for this account. It held no photos, so nothing ' +
+            'was uploaded.'
+          : `This device now owns the backup for this account. ${plural(ids.length, 'photo')} ` +
+            `${ids.length === 1 ? 'was' : 'were'} re-uploaded under this vault's key. Nothing ` +
+            'else on this device was uploaded.',
       );
     });
   };
@@ -585,7 +693,19 @@ function CloudBackupBody({
     >
       <HowItWorks />
 
-      {busy ? <ActivityIndicator testID="backup_busy" color={colors.accent} /> : null}
+      {busy ? (
+        <ProgressBar
+          testID="backup_busy"
+          {...(progress === null
+            ? {}
+            : { value: progress.total === 0 ? 1 : progress.done / progress.total })}
+          {...(progress === null || progress.total === 0
+            ? {}
+            : {
+                label: `${progress.verb} ${String(progress.done)} of ${String(progress.total)}`,
+              })}
+        />
+      ) : null}
       {error === null ? null : (
         <Text testID="backup_error" style={styles.error}>
           {error}
@@ -709,14 +829,18 @@ function CloudBackupBody({
                       backupNow();
                     }}
                   />
+                  <Text testID="backup_now_note" style={styles.muted}>
+                    Checks that everything in your Cloud Gallery really is uploaded, and puts
+                    back anything missing. It never adds a new photo: choose those in the vault
+                    with &quot;Back up to Cloud&quot;.
+                  </Text>
 
                   {rebindableIds === null ? null : (
                     <View style={styles.card} testID="backup_rebind_offer">
                       <Text style={styles.cardTitle}>Move this backup onto this device?</Text>
                       <Text style={styles.cardLine}>
                         This account&apos;s backup still belongs to the vault that made it, so
-                        &quot;Back up now&quot; cannot add to it. Moving it re-uploads its own
-                        photos under this vault&apos;s key. Nothing else on this device is uploaded.
+                        &quot;Back up now&quot; cannot add to it. {describeRebind(rebindableIds.length)}
                       </Text>
                       <Text style={styles.cardLine}>
                         Afterwards this account&apos;s recovery passphrase will unwrap this
@@ -935,22 +1059,17 @@ function CloudBackupBody({
         testID="backup_cross_account_dialog"
         visible={confirmingCrossAccount !== null}
         title={
-          confirmingCrossAccount === 'enable'
+          confirmingCrossAccount?.which === 'enable'
             ? 'Turn on backup for this account?'
             : 'Upload these photos to this account?'
         }
-        message={
-          confirmingCrossAccount === 'enable'
-            ? 'The photos on this device are backed up to a different account. Turning backup on ' +
-              'here lets this account\'s recovery passphrase unwrap this vault\'s key. The other ' +
-              'account keeps its own backup, unchanged.'
-            : `${plural(services.vault.current?.photos.length ?? 0, 'photo')} on this device are ` +
-              'backed up to a different account. Uploading puts a copy in this account as well. ' +
-              'Nothing is deleted from the other account.'
-        }
-        confirmLabel={confirmingCrossAccount === 'enable' ? 'Turn on backup' : 'Upload'}
+        message={describeCrossAccount(
+          confirmingCrossAccount,
+          services.vault.current?.photos.length ?? 0,
+        )}
+        confirmLabel={confirmingCrossAccount?.which === 'enable' ? 'Turn on backup' : 'Upload'}
         onConfirm={() => {
-          const which = confirmingCrossAccount;
+          const which = confirmingCrossAccount?.which;
           setConfirmingCrossAccount(null);
           if (which === 'backup') backupNow(true);
           else if (which === 'enable') enableBackup(true);
@@ -970,9 +1089,13 @@ function CloudBackupBody({
         visible={confirmingRebind}
         title="Move the backup onto this device"
         message={
-          `${plural(rebindableIds?.length ?? 0, 'photo')} from this account's backup will be ` +
-          "re-uploaded under this vault's key, and this account's recovery passphrase will then " +
-          'unwrap this vault. No other photo on this device is uploaded.'
+          (rebindableIds?.length ?? 0) === 0
+            ? "This account's backup holds no photos, so nothing is uploaded. What changes is " +
+              "who it belongs to: this account's recovery passphrase will unwrap this vault from " +
+              'now on, and backing up from this device will add to this account.'
+            : `${plural(rebindableIds?.length ?? 0, 'photo')} from this account's backup will be ` +
+              "re-uploaded under this vault's key, and this account's recovery passphrase will " +
+              'then unwrap this vault. No other photo on this device is uploaded.'
         }
         phrase="MOVE"
         confirmLabel="Move backup"
@@ -1048,6 +1171,52 @@ function HowItWorks(): React.JSX.Element {
       ))}
     </View>
   );
+}
+
+/**
+ * What moving the backup will do to the photos, which is nothing at all when it holds none.
+ *
+ * Separate from the ownership sentence beside it, because that one is true either way and is the
+ * reason the offer stands for an empty backup at all.
+ */
+function describeRebind(count: number): string {
+  return count === 0
+    ? 'It holds no photos, so nothing would be uploaded: moving it changes which vault this ' +
+        'account belongs to, so that backing up from this device adds to it.'
+    : "Moving it re-uploads its own photos under this vault's key. Nothing else on this device " +
+        'is uploaded.';
+}
+
+/**
+ * What the cross-account confirmation says.
+ *
+ * Two versions, because the honest sentence depends on what this device actually knows. It used to
+ * state that the photos ARE backed up to a different account in both cases -- a claim about
+ * somebody's data, made in the second case on the strength of a local note that could not even be
+ * read. The question is the same either way and so is the consequence; only the reason differs, and
+ * the reason is the part the user is being asked to weigh.
+ */
+function describeCrossAccount(
+  pending: { readonly which: 'enable' | 'backup'; readonly ownerKnown: boolean } | null,
+  devicePhotos: number,
+): string {
+  if (pending === null) return '';
+  if (!pending.ownerKnown) {
+    return pending.which === 'enable'
+      ? 'This device cannot tell which account its photos were last backed up to, so it is ' +
+          'asking rather than assuming. Turning backup on here lets this account\'s recovery ' +
+          'passphrase unwrap this vault\'s key. No other account loses anything.'
+      : `This device cannot tell which account its ${plural(devicePhotos, 'photo')} were last ` +
+          'backed up to, so it is asking rather than assuming. Uploading puts a copy in this ' +
+          'account. Nothing is deleted from any other account.';
+  }
+  return pending.which === 'enable'
+    ? 'The photos on this device are backed up to a different account. Turning backup on ' +
+        'here lets this account\'s recovery passphrase unwrap this vault\'s key. The other ' +
+        'account keeps its own backup, unchanged.'
+    : `${plural(devicePhotos, 'photo')} on this device are ` +
+        'backed up to a different account. Uploading puts a copy in this account as well. ' +
+        'Nothing is deleted from the other account.';
 }
 
 function plural(count: number, noun: string): string {

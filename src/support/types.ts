@@ -44,9 +44,19 @@ export interface SupportMessage {
  *
  * `configuration` means this build cannot send at all (bad or rejected credentials) - a user
  * retrying will never succeed, so the screen says so instead of offering a retry.
+ *
+ * `missing` is the neighbouring case and is kept apart from both: the address answered, and there
+ * is nothing at it. That is what an undeployed relay looks like from here, and it used to arrive
+ * as `rejected` -- telling a user to shorten a message that was never read by anything.
  */
 export type SupportFailure =
-  'unreachable' | 'configuration' | 'rejected' | 'rateLimited' | 'server' | 'unknown';
+  | 'unreachable'
+  | 'configuration'
+  | 'missing'
+  | 'rejected'
+  | 'rateLimited'
+  | 'server'
+  | 'unknown';
 
 export type SupportSendResult =
   | { readonly kind: 'sent'; readonly reference: string | null }

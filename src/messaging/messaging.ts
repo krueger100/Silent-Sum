@@ -104,6 +104,16 @@ export function peerOf(conversationId: string, me: string): string | null {
 export interface PublishedKey {
   readonly uid: string;
   readonly publicKey: string;
+  /**
+   * Every key this account published before the current one, oldest first.
+   *
+   * A peer needs these and has nowhere else to find them. The conversation key is X25519
+   * over whichever key was current when the message was sent, so a rotation that dropped
+   * the key it replaced would make everything sent before it unreadable to the other side,
+   * silently and for good. Nothing caches a peer key across a lock, and the document is the
+   * only record.
+   */
+  readonly previous: readonly string[];
   readonly updatedAt: number;
 }
 
@@ -114,15 +124,56 @@ export function parsePublishedKey(
   if (doc === null) return null;
   const publicKey = doc.publicKey;
   if (typeof publicKey !== 'string' || publicKey === '') return null;
-  return { uid, publicKey, updatedAt: readMillis(doc.updatedAt) ?? 0 };
+  // Absent on every document written before the field existed, which is not an error: it
+  // means this account has never rotated, so the current key is the only one there is.
+  const history = doc.previous;
+  const previous = Array.isArray(history)
+    ? history.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+    : [];
+  return { uid, publicKey, previous, updatedAt: readMillis(doc.updatedAt) ?? 0 };
 }
+
+/**
+ * How a vault's own derived key stands against what its account has published.
+ *
+ * `historical` is the case this exists for. A key in `previous` was this account's published key
+ * once, so a vault deriving it IS this account's vault -- one rotation behind, not a stranger.
+ * Calling that `foreign` sent users to recover a passphrase that would hand back the very key
+ * already in their hands.
+ *
+ * Trust comes from where the entry lives, not from its shape: `previous` is append-only and
+ * owner-written under the `messagingKeys` rules, and {@link parsePublishedKey} has already
+ * dropped anything that is not a non-empty string. A value that is not a real key simply fails to
+ * equal a derived one, so no comparison here can be talked into a match.
+ */
+export type IdentityStanding = 'current' | 'historical' | 'foreign';
+
+export function identityStanding(
+  published: PublishedKey,
+  derivedPublicKey: string,
+): IdentityStanding {
+  if (published.publicKey === derivedPublicKey) return 'current';
+  return published.previous.includes(derivedPublicKey) ? 'historical' : 'foreign';
+}
+
+/**
+ * How many retired keys a published record may carry, matching the cap the Firestore rules
+ * impose on `previous`. Named here so the client can say "this account has rotated as many times
+ * as it can" instead of surfacing a bare permission error, and so the two numbers sit in code
+ * that is read together rather than drifting apart silently.
+ */
+export const MAX_PUBLISHED_KEY_HISTORY = 64;
 
 export function publishedKeyRecord(
   uid: string,
   publicKey: string,
+  previous: readonly string[],
   now: number,
 ): Record<string, unknown> {
-  return { v: 1, uid, publicKey, updatedAt: now };
+  // `v` stays 1. `previous` is additive, and an older build reads only `publicKey`, so the
+  // shape it already understands is unchanged; bumping the version would refuse those
+  // clients for a field they can safely ignore.
+  return { v: 1, uid, publicKey, previous: [...previous], updatedAt: now };
 }
 
 /** A conversation as the list screen needs it. */

@@ -105,7 +105,7 @@ describe('CloudBackupScreen with a cloud backend', () => {
     expect(screen.getByTestId('backup_passphrase_warning')).toHaveTextContent(/cannot be reset/);
   });
 
-  it('enables backup, uploads, and reports the counts', async () => {
+  it('enables backup without putting the vault in the cloud', async () => {
     const harness = buildCloudHarness();
     await openVaultWithPhotos(harness, '2468', 2);
     const user = await harness.cloud.signUp(EMAIL, ACCOUNT_PASSWORD);
@@ -128,11 +128,13 @@ describe('CloudBackupScreen with a cloud backend', () => {
 
     await fireEvent.press(screen.getByTestId('backup_now'));
 
+    // Enabling is not consent to upload: nothing has been chosen, so nothing goes.
     await waitFor(() => {
-      expect(screen.getByTestId('backup_status')).toHaveTextContent(
-        /Uploaded 2 photos\. 2 photos now in the backup\./,
+      expect(screen.getByTestId('backup_nothing_dialog')).toHaveTextContent(
+        /Nothing has been added to the Cloud Gallery yet/,
       );
     });
+    await fireEvent.press(screen.getByTestId('backup_nothing_dialog-confirm'));
     expect(harness.cloud.blobs.has(BACKUP_PATHS.index(user.uid))).toBe(true);
     expect(harness.services.settings.current.lastBackupAt).toBe(harness.clock.now());
     expect(screen.getByTestId('backup_last_backup')).toHaveTextContent(/Last backup:/);
@@ -176,7 +178,7 @@ describe('CloudBackupScreen with a cloud backend', () => {
 describe('CloudBackupScreen account flow', () => {
   const NEW_EMAIL = 'fresh@example.test';
 
-  it('registers an account, enables backup and uploads, all under that uid', async () => {
+  it('registers an account and keeps every written byte under that uid', async () => {
     const harness = buildCloudHarness();
     await openVaultWithPhotos(harness, '2468', 2);
 
@@ -204,9 +206,12 @@ describe('CloudBackupScreen account flow', () => {
       expect(screen.getByTestId('backup_now')).toBeTruthy();
     });
 
-    await fireEvent.press(screen.getByTestId('backup_now'));
-    await waitFor(() => {
-      expect(screen.getByTestId('backup_status')).toHaveTextContent(/Uploaded 2 photos/);
+    // Choosing both for the cloud, which is now the only way anything goes up.
+    const repository = harness.services.vault.current;
+    const backupService = harness.services.backup;
+    if (repository === null || backupService === null) throw new Error('no vault or backup');
+    await backupService.backupNow(repository, harness.services.session.requireKeys(), {
+      ids: repository.photos.map((photo) => photo.id),
     });
 
     // Everything that was written is addressed to this account and nothing else.
@@ -533,6 +538,58 @@ describe('CloudBackupScreen restore', () => {
     expect(await backup.recoverMasterKey(PASSPHRASE)).toEqual(keys.masterKey);
   });
 
+  /**
+   * A backup holding no photos is a real shape, and the one most likely to be restored by someone
+   * who only wants their messages back.
+   *
+   * The offer belongs there: `rebindBackup` with no ids still writes the index and manifest and
+   * still calls `enable`, which rewraps the envelope around this vault's key -- and that, not the
+   * uploading, is the operation. Without it the three ownership gates refuse every future backup
+   * from this device, so suppressing the offer would strand this user for good.
+   *
+   * What it must not do is describe itself by counting photos. It used to offer to re-upload
+   * photos there were none of, then ask for MOVE to be typed under the words "0 photos", then
+   * report that "0 photos were re-uploaded" -- three chances to read a working feature as broken.
+   */
+  it('offers an empty backup without promising photos, and still moves it', async () => {
+    const cloud = new InMemoryCloudBackend();
+    const source = buildCloudHarness(cloud);
+    await deviceWithBackup(source, 0);
+    source.services.session.lock();
+    await cloud.signOut();
+
+    const other = buildCloudHarness(cloud);
+    await openVaultWithPhotos(other, '1357', 1);
+    await cloud.signIn(EMAIL, ACCOUNT_PASSWORD);
+
+    await renderWithServices(other.services, <CloudBackupScreen />);
+    await restoreWith(PASSPHRASE);
+
+    const offer = await waitFor(() => screen.getByTestId('backup_rebind_offer'));
+    expect(offer).toHaveTextContent(/holds no photos/);
+    expect(offer).not.toHaveTextContent(/re-uploads its own photos/);
+
+    await fireEvent.press(screen.getByTestId('backup_rebind'));
+    const dialog = screen.getByTestId('backup_rebind_dialog');
+    expect(dialog).toHaveTextContent(/holds no photos/);
+    expect(dialog).not.toHaveTextContent(/0 photos/);
+
+    await fireEvent.changeText(screen.getByTestId('typed-confirm-input'), 'MOVE');
+    await fireEvent.press(screen.getByTestId('backup_rebind_dialog-confirm'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('backup_status')).toHaveTextContent(/held no photos/);
+    });
+    expect(screen.getByTestId('backup_status')).not.toHaveTextContent(/0 photos/);
+
+    // Why the offer was worth making: the account now follows this vault, so the ownership gate
+    // no longer refuses a backup from this device.
+    const backup = requireBackup(other);
+    const keys = other.services.session.requireKeys();
+    expect(await backup.recoverMasterKey(PASSPHRASE)).toEqual(keys.masterKey);
+    await expect(backup.backupNow(requireRepository(other), keys)).resolves.toBeDefined();
+  });
+
   it('will not restore into a vault that is not open', async () => {
     const harness = buildCloudHarness();
     await deviceWithBackup(harness, 1);
@@ -549,7 +606,7 @@ describe('CloudBackupScreen restore', () => {
     expect(getBlob).not.toHaveBeenCalled();
   });
 
-  it('alerts rather than whispering when there is nothing new to upload', async () => {
+  it('alerts rather than whispering when nothing needs repairing', async () => {
     const harness = buildCloudHarness();
     await deviceWithBackup(harness, 2);
     const putBlob = jest.spyOn(harness.cloud, 'putBlob');
@@ -563,8 +620,8 @@ describe('CloudBackupScreen restore', () => {
     // A dialog, not a status line: "nothing happened" in small type under a button reads exactly
     // like a button that did not work, and not being sure is why people press this twice.
     const dialog = await waitFor(() => screen.getByTestId('backup_nothing_dialog'));
-    expect(dialog).toHaveTextContent(/already in the backup/);
-    expect(dialog).toHaveTextContent(/none of them were changed/);
+    expect(dialog).toHaveTextContent(/are backed up/);
+    expect(dialog).toHaveTextContent(/Nothing needed repairing/);
     expect(screen.queryByTestId('backup_status')).toBeNull();
     // Only the index and manifest are rewritten; no photo or thumbnail was re-uploaded.
     expect(putBlob.mock.calls.every(([path]) => path.endsWith('index.enc'))).toBe(true);
@@ -575,7 +632,60 @@ describe('CloudBackupScreen restore', () => {
     });
   });
 
-  it('says so plainly when the vault itself is empty', async () => {
+  /**
+   * The outcome that used to be indistinguishable from success. An item whose cloud files have
+   * gone AND whose local copy has gone cannot be repaired by anything on this screen, so a run
+   * that uploaded nothing for that reason must not be handed back as a clean bill of health.
+   */
+  it('refuses to call a loss "nothing needed repairing"', async () => {
+    const harness = buildCloudHarness();
+    const repository = await deviceWithBackup(harness, 2);
+    const uid = harness.cloud.currentUser?.uid ?? '';
+    const gone = repository.photos[0]?.id;
+    if (gone === undefined) throw new Error('expected a photo');
+    harness.cloud.blobs.delete(BACKUP_PATHS.photo(uid, gone));
+    harness.cloud.blobs.delete(BACKUP_PATHS.thumb(uid, gone));
+    await repository.deletePhotos([gone]);
+
+    await renderWithServices(harness.services, <CloudBackupScreen />);
+    await waitFor(() => {
+      expect(screen.getByTestId('backup_now')).toBeTruthy();
+    });
+    await fireEvent.press(screen.getByTestId('backup_now'));
+
+    const dialog = await waitFor(() => screen.getByTestId('backup_nothing_dialog'));
+    expect(dialog).toHaveTextContent(/could not be put back/);
+    expect(dialog).toHaveTextContent(/no copy either/);
+    expect(dialog).not.toHaveTextContent(/Nothing needed repairing/);
+  });
+
+  /** The repairable half is still repaired, and the loss is reported beside it rather than instead. */
+  it('repairs what it can and still reports what it could not', async () => {
+    const harness = buildCloudHarness();
+    const repository = await deviceWithBackup(harness, 3);
+    const uid = harness.cloud.currentUser?.uid ?? '';
+    const ids = repository.photos.map((photo) => photo.id);
+    const fixable = ids[0];
+    const lost = ids[1];
+    if (fixable === undefined || lost === undefined) throw new Error('expected photos');
+    harness.cloud.blobs.delete(BACKUP_PATHS.photo(uid, fixable));
+    harness.cloud.blobs.delete(BACKUP_PATHS.photo(uid, lost));
+    harness.cloud.blobs.delete(BACKUP_PATHS.thumb(uid, lost));
+    await repository.deletePhotos([lost]);
+
+    await renderWithServices(harness.services, <CloudBackupScreen />);
+    await waitFor(() => {
+      expect(screen.getByTestId('backup_now')).toBeTruthy();
+    });
+    await fireEvent.press(screen.getByTestId('backup_now'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('backup_status')).toHaveTextContent(/Restored 1 item/);
+    });
+    expect(screen.getByTestId('backup_status')).toHaveTextContent(/could not be put back/);
+  });
+
+  it('says plainly that nothing has been chosen for the cloud yet', async () => {
     const harness = buildCloudHarness();
     await openVaultWithPhotos(harness, PIN, 0);
     await harness.cloud.signUp(EMAIL, ACCOUNT_PASSWORD);
@@ -589,18 +699,23 @@ describe('CloudBackupScreen restore', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('backup_nothing_dialog')).toHaveTextContent(
-        /no photos in the vault yet/,
+        /Nothing has been added to the Cloud Gallery yet/,
       );
     });
   });
 
-  it('uploads something new without disturbing what the cloud already holds', async () => {
+  /**
+   * The rule the opt-in model rests on: a photo added to the vault AFTER the cloud set was
+   * chosen is not swept in by pressing this. The Local Gallery is unlimited and private, and
+   * one tap here must never quietly turn that into an upload.
+   */
+  it('never sweeps in a photo that was not chosen for the cloud', async () => {
     const harness = buildCloudHarness();
     const repository = await deviceWithBackup(harness, 2);
-    const [removed] = repository.photos;
-    if (removed === undefined) throw new Error('expected a photo to remove');
-    await repository.deletePhotos([removed.id]);
-    await repository.addPhoto({ bytes: new Uint8Array(512).fill(7) }, { source: 'import' });
+    const added = await repository.addPhoto(
+      { bytes: new Uint8Array(512).fill(7) },
+      { source: 'import' },
+    );
     const deleteBlob = jest.spyOn(harness.cloud, 'deleteBlob');
 
     await renderWithServices(harness.services, <CloudBackupScreen />);
@@ -610,16 +725,15 @@ describe('CloudBackupScreen restore', () => {
     await fireEvent.press(screen.getByTestId('backup_now'));
 
     await waitFor(() => {
-      expect(screen.getByTestId('backup_status')).toHaveTextContent(/Uploaded 1 photo/);
+      expect(screen.getByTestId('backup_nothing_dialog')).toHaveTextContent(
+        /are backed up/,
+      );
     });
-    // Three in the cloud: the two originals and the new one. The locally deleted one stayed.
-    expect(screen.getByTestId('backup_status')).toHaveTextContent(/3 photos now in the backup/);
-    expect(screen.getByTestId('backup_status')).toHaveTextContent(
-      /1 photo this device no longer has, kept rather than deleted/,
-    );
-    expect(deleteBlob).not.toHaveBeenCalled();
     const uid = harness.cloud.currentUser?.uid ?? '';
-    expect(harness.cloud.blobs.has(BACKUP_PATHS.photo(uid, removed.id))).toBe(true);
+    // The new photo is in the vault and nowhere else.
+    expect(repository.photos.some((photo) => photo.id === added.id)).toBe(true);
+    expect(harness.cloud.blobs.has(BACKUP_PATHS.photo(uid, added.id))).toBe(false);
+    expect(deleteBlob).not.toHaveBeenCalled();
   });
 
   it('offers no restore until this account actually has a backup', async () => {

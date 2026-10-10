@@ -22,6 +22,7 @@ import { RestoreFlowScreen } from '@/backup/screens/RestoreFlowScreen';
 import { PlansScreen } from '@/billing/screens/PlansScreen';
 import { CloudBackupScreen } from '@/backup/screens/CloudBackupScreen';
 import { CalculatorScreen } from '@/calculator/CalculatorScreen';
+import { CloudGalleryScreen } from '@/gallery/CloudGalleryScreen';
 import { GalleryScreen } from '@/gallery/GalleryScreen';
 import { PhotoViewerScreen } from '@/gallery/PhotoViewerScreen';
 import { AboutScreen } from '@/settings/screens/AboutScreen';
@@ -56,6 +57,7 @@ export type VaultStackParams = {
   AutoLock: undefined;
   Security: undefined;
   WipePin: undefined;
+  CloudGallery: undefined;
   CloudBackup: undefined;
   Plans: undefined;
   Support: undefined;
@@ -259,6 +261,9 @@ function VaultFlow(): React.JSX.Element {
             onCloudBackup={() => {
               navigation.navigate('CloudBackup');
             }}
+            onCloudGallery={() => {
+              navigation.navigate('CloudGallery');
+            }}
             onPlans={() => {
               navigation.navigate('Plans');
             }}
@@ -319,6 +324,19 @@ function VaultFlow(): React.JSX.Element {
             onBack={() => {
               setWipePinToken((token) => token + 1);
               navigation.goBack();
+            }}
+          />
+        )}
+      </VaultStack.Screen>
+
+      <VaultStack.Screen name="CloudGallery">
+        {({ navigation }) => (
+          <CloudGalleryScreen
+            onBack={() => {
+              navigation.goBack();
+            }}
+            onOpenBackup={() => {
+              navigation.navigate('CloudBackup');
             }}
           />
         )}

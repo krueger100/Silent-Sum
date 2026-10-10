@@ -23,6 +23,8 @@ export const SUPPORT_FAILURE_COPY: Readonly<Record<SupportFailure, string>> = {
     'Could not reach the support service. Check your connection and send again - your message is still here.',
   configuration:
     'This build cannot send support messages: the service refused its credentials. Sending again will not help; please report this another way.',
+  missing:
+    'Support is not switched on for this build - the address it sends to has nothing behind it. There is nothing wrong with your message, and sending it again will not help.',
   rejected: 'The support service refused the message. Try shortening it, or check the reply address.',
   rateLimited: 'Too many messages have been sent just now. Please try again in a few minutes.',
   server: 'The support service is having trouble right now. Please try again later.',

@@ -104,7 +104,73 @@ Check for the whole project. Prod attests with Play Integrity and needs no token
 
 To confirm what the device is doing: `adb logcat -d | grep -i appcheck`. An unregistered secret
 shows as a rejected token exchange; "Enter this debug secret into the allow list" is the SDK
-printing the random one it just invented.
+printing the random one it just invented. Be aware before you capture one that this log contains
+the real token too -- see below.
+
+### Where the token leaks
+
+Two places, and an earlier version of this section got the first one wrong. Both matter.
+
+**The logs.** The Firebase SDK prints the registered token in cleartext on every cold start, under
+the obfuscated tag `D/w8.g`, as a ready-to-run line:
+
+```
+D/w8.g: firebase appcheck:debugtokens:create <uuid> --project <project> --app <app-id>
+```
+
+Confirmed by byte-comparing the logged value against `.env`: they are equal, so this is the token
+the console has registered, not an invented one. Anyone with `adb` access to the device, or an app
+holding `READ_LOGS`, can read it and bypass App Check for the whole project. Find it with
+`adb logcat -d | grep appcheck:debugtokens:create` -- against a capture that actually contains a
+cold start, which is the trap described next. **Treat a dev-build logcat as a secret-bearing file:
+do not paste one into a chat, an issue, or a transcript.**
+
+This section previously said "not the logs", for two reasons worth recording because the shape of
+the mistake repeats. First, the search that produced that answer ran over a 29 MB capture with no
+cold start in it, and absence from a log that cannot contain the thing is not absence. Second,
+both `ProviderFactory::configure` and `Provider::configure` in `@react-native-firebase/app-check`
+do print `(not shown)` in place of the value -- but that is the wrapper. The SDK underneath it
+redacts nothing, on either the supplied or the generated path, and a wrapper being careful says
+nothing about what it wraps.
+
+**The APK.** `extra` is plaintext JSON at `assets/app.config` inside the archive, so
+**a dev-environment APK is a secret-bearing artifact**: unzip it, read one key, and you can bypass
+App Check for the whole Firebase project from any client. Treat the file the way you would treat
+`.env`:
+
+- never send a dev APK to a tester -- give them a Play internal-testing build, which is `prod` and
+  carries no token (`withAppCheckEnvGuard` makes that the only kind of `.aab` that builds);
+- delete stale ones. `android/app/build` is junctioned to `D:\silentsum-rn-build`, which is outside
+  the repo and therefore outside `.gitignore`'s reach and outside anything that sweeps it;
+- to check an artifact either way, inflate `assets/app.config` and look for `appCheckDebugToken`. A
+  `prod` build does not have the key at all.
+
+### Rotating the debug token
+
+Register the replacement BEFORE revoking the old one. The other order leaves dev unable to read
+Firestore between the two steps, with the symptom described above -- a message about the build, for a
+server refusal.
+
+1. Generate one: `node -e "console.log(require('crypto').randomUUID())"`. Never reuse a value, and
+   never derive it from anything.
+2. Firebase console, App Check, Apps, the Android app, Manage debug tokens, Add debug token. Give it
+   a name you can trace to one machine, e.g. `carlo-emulator-2026-10-09`. Leave the old one in place.
+3. Put the new value in `.env` under `APP_CHECK_DEBUG_TOKEN`. It is already git-ignored
+   (`.env`, `.env.*`, `!.env.example`); `.env.example` keeps an empty placeholder and nothing else.
+4. Rebuild and reinstall: `SILENTSUM_ENV=dev ./gradlew assembleRelease`. Not `bundleRelease` -- the
+   guard refuses that outside `prod`, which is the point of it.
+5. Confirm the new build attests before going further. `debugToken: (not shown)` in the log proves
+   only that RNFB was handed something, so the test that counts is behavioural: a Firestore read in
+   the app must succeed -- open Messages and let a conversation load. To check WHICH token the build
+   carries, compare `appcheck:debugtokens:create` from a cold-start logcat against `.env` by
+   digest, never by printing either; then delete the capture.
+6. Only now delete the old token in the console.
+7. Delete every artifact built with the old one, starting with
+   `D:\silentsum-rn-build\app\outputs\apk\release\app-release.apk`.
+
+One token per machine, each named, so a single leak can be revoked without stopping anyone else.
+Nothing here touches enforcement: App Check stays enforced on Firestore and Storage throughout, and
+a build that cannot attest is refused rather than waved through.
 
 ## 6. Crashlytics and Analytics
 

@@ -109,6 +109,10 @@ describe('RelaySupportService', () => {
     const cases: readonly [number, string][] = [
       [401, 'configuration'],
       [403, 'configuration'],
+      // The shape an undeployed relay has from here. NOT 'rejected': nothing read the message,
+      // so telling the user to shorten it sends them to edit something that was never seen.
+      [404, 'missing'],
+      [405, 'missing'],
       [422, 'rejected'],
       [400, 'rejected'],
       [429, 'rateLimited'],

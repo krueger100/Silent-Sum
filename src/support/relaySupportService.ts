@@ -106,6 +106,10 @@ export class RelaySupportService implements SupportService {
 
 function failureFor(status: number): SupportFailure {
   if (status === 401 || status === 403) return 'configuration';
+  // Statements about the ADDRESS rather than about the message: nothing is deployed there, or
+  // what is deployed is not this relay. Folded into `rejected` once, which sent users off to
+  // shorten a message nothing had read.
+  if (status === 404 || status === 405) return 'missing';
   if (status === 429) return 'rateLimited';
   if (status >= 500) return 'server';
   if (status >= 400) return 'rejected';

@@ -107,6 +107,45 @@ service cloud.firestore {
       allow create, update: if ssOwner(uid) && ssValidManifest(request.resource.data);
     }
 
+    // The account's messaging key, wrapped under its recovery passphrase.
+    //
+    // A SEPARATE document from the envelope on purpose, and that separation is the security
+    // property. `rebindBackup` ends by rewriting the envelope with the rebinding device's vault
+    // key; when the envelope was the only recoverable copy of the messaging key, one rebind made
+    // every conversation on the account permanently unreadable, silently. The client will not
+    // write here from a vault whose key is not the one the account published -- see
+    // `BackupService.writeMessagingEscrow` -- so a rebind leaves this untouched.
+    //
+    // Opaque to the server exactly as the envelope is: a passphrase-wrapped key with its own
+    // salt and its own AAD. `publicKey` is the one plaintext field and is not a secret -- it is
+    // the same string `messagingKeys/{uid}` already publishes to every signed-in user, kept here
+    // so a stale escrow can be recognised without paying for a key derivation.
+    //
+    // This does NOT touch key rotation. Rotation is `messagingKeys/{uid}`, a different
+    // collection, whose rules are unchanged; a match here can only ever grant on this path.
+    function ssValidMessagingEscrow(d) {
+      return d.keys().hasOnly(['v', 'salt', 'kdf', 'wrapped', 'publicKey', 'createdAt'])
+        && d.v == 1
+        && d.salt is string && d.salt.size() <= 64
+        && d.kdf is map && d.kdf.keys().hasOnly(['alg', 'm', 't', 'p', 'len'])
+        && d.kdf.alg == 'argon2id'
+        && d.kdf.m is int && d.kdf.m >= 8192 && d.kdf.m <= 262144
+        && d.kdf.t is int && d.kdf.t >= 1 && d.kdf.t <= 10
+        && d.kdf.p is int && d.kdf.p >= 1 && d.kdf.p <= 4
+        && d.kdf.len == 32
+        && d.wrapped is map
+        && d.wrapped.nonce is string && d.wrapped.nonce.size() <= 64
+        && d.wrapped.ct is string && d.wrapped.ct.size() <= 256
+        && d.wrapped.mac is string && d.wrapped.mac.size() <= 64
+        && d.publicKey is string && d.publicKey.size() > 0 && d.publicKey.size() <= 64
+        && d.createdAt is string;
+    }
+
+    match /users/{uid}/vault/messaging {
+      allow read, delete: if ssOwner(uid);
+      allow create, update: if ssOwner(uid) && ssValidMessagingEscrow(request.resource.data);
+    }
+
     // ---- ADDED: SilentSum billing entitlements --------------------------------------------
     // What the account has paid for. Server-written; the owner reads, nobody else does anything.
     match /users/{uid}/billing/entitlements {

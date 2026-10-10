@@ -4,7 +4,13 @@ import { fireEvent, screen } from '@testing-library/react-native';
 import { renderWithServices } from '@/billing/screens/__tests__/harness';
 import { MESSAGING_PATHS } from '@/messaging/messaging';
 import { ConversationScreen } from '@/messaging/screens/ConversationScreen';
-import { ALICE, BOB, MessagingWorld, flush } from '@/messaging/screens/__tests__/harness';
+import {
+  ALICE,
+  BOB,
+  MessagingWorld,
+  flush,
+  vaultKeysFor,
+} from '@/messaging/screens/__tests__/harness';
 
 describe('ConversationScreen', () => {
   it('sends a message and shows it, and the other account reads it back', async () => {
@@ -394,5 +400,75 @@ describe('deleting a message from the thread', () => {
       'This message was deleted',
     );
     expect(view.queryByText('regretted')).toBeNull();
+  });
+});
+
+/**
+ * The foreign-vault gate, as a user actually meets it.
+ *
+ * Everything else pinning this gate works on the service. This works on the screen, through the
+ * real composition root: the same account signed in, the vault locked, and a DIFFERENT master key
+ * unlocked in its place -- which is precisely what happens when somebody installs SilentSum on a
+ * new phone, signs into their account, and sets up a fresh vault instead of recovering the old one.
+ *
+ * What they must not get is a composer that looks ready and sends something neither end can read.
+ */
+describe('ConversationScreen on a vault that did not set messaging up', () => {
+  it('asks for recovery instead of offering a composer', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    const bob = await world.join(BOB, 2);
+    // Bob starts it, so the conversation exists on Alice's account without her vault having
+    // typed anything -- the state a second device really arrives into.
+    const conversationId = await bob.messaging.startConversation(ALICE);
+    await flush();
+
+    // Alice's account on another vault. Lock first: that is the real sequence, and it is what
+    // disposes the old messaging identity and drops the cached conversation keys.
+    alice.services.session.lock();
+    alice.services.session.adopt(vaultKeysFor(7));
+    await alice.services.messaging.publishKey();
+    await flush();
+
+    await renderWithServices(
+      alice.services,
+      <ConversationScreen conversationId={conversationId} />,
+    );
+    await flush();
+
+    const banner = screen.getByTestId('conversation_cannot_send');
+    expect(banner).toHaveTextContent(/not the one that set up messaging/i);
+    expect(banner).toHaveTextContent(/recovery passphrase/i);
+    // Not a Pro problem. Offering plans here sells a purchase that cannot fix it.
+    expect(screen.queryByTestId('conversation_cannot_send_plans')).toBeNull();
+    // And there is no composer at all, rather than one that looks ready.
+    expect(screen.queryByTestId('conversation_input')).toBeNull();
+    expect(screen.queryByTestId('conversation_send')).toBeNull();
+  });
+
+  /** The published key is the account's identity. Opening the screen must not touch it. */
+  it('leaves the published key exactly where it was', async () => {
+    const world = new MessagingWorld();
+    const alice = await world.join(ALICE, 1);
+    const bob = await world.join(BOB, 2);
+    const conversationId = await bob.messaging.startConversation(ALICE);
+    await flush();
+
+    const path = MESSAGING_PATHS.publicKey(alice.uid);
+    const before = JSON.stringify(world.store.documents.get(path) ?? null);
+
+    alice.services.session.lock();
+    alice.services.session.adopt(vaultKeysFor(7));
+    world.clock.advance(60 * 60 * 1000); // any write at all would move `updatedAt`
+    await alice.services.messaging.publishKey();
+    await flush();
+
+    await renderWithServices(
+      alice.services,
+      <ConversationScreen conversationId={conversationId} />,
+    );
+    await flush();
+
+    expect(JSON.stringify(world.store.documents.get(path) ?? null)).toBe(before);
   });
 });

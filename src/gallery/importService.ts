@@ -24,6 +24,7 @@ import type { FileSystem } from '@/storage/fileSystem';
 import type { SecureDelete } from '@/storage/secureDelete';
 import { ImageDecodeError, type VaultRepository } from '@/vault/types';
 import { zeroBytes, type Bytes } from '@/utils/bytes';
+import type { ProgressReport } from '@/utils/progress';
 
 export interface ImportReport {
   readonly imported: number;
@@ -103,7 +104,11 @@ export class ImportService {
    */
   async importFromLibrary(
     repository: VaultRepository,
-    options: { readonly selectionLimit?: number } = {},
+    options: {
+      readonly selectionLimit?: number;
+      /** Fires per picked asset. The total is known only after the picker returns. */
+      readonly onProgress?: ProgressReport;
+    } = {},
   ): Promise<ImportReport> {
     if (options.selectionLimit !== undefined && options.selectionLimit <= 0) {
       return { imported: 0, failed: 0, oversized: 0, removed: 0, overLimit: 0 };
@@ -123,8 +128,14 @@ export class ImportService {
     let failed = 0;
     let oversized = 0;
 
+    const total = assets.length;
+
     try {
       for (const item of assets) {
+        // Reported at the TOP of the body, which is what lets the `continue` below keep counting:
+        // an oversized item is still one of the selection the user is waiting on. The running
+        // totals ARE the done count, so nothing extra has to be tracked.
+        options.onProgress?.(imported + failed + oversized, total);
         // Checked from the picker's own metadata, before `readBytes` pulls the file into memory:
         // refusing a 500 MB video must not cost 500 MB of heap first. A provider that omits the
         // size is trusted -- an unknown size is not evidence of a large one.
@@ -162,6 +173,7 @@ export class ImportService {
           zeroBytes(bytes);
         }
       }
+      options.onProgress?.(imported + failed + oversized, total);
     } finally {
       // Every picked asset, always: an abort halfway through must not leave the untouched
       // selection's plaintext copies behind.

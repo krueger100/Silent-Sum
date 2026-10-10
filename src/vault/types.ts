@@ -3,6 +3,7 @@
  * On-disk formats are shared with the Flutter reference (docs/reference/flutter-vault-gallery-camera.md).
  */
 import type { Bytes } from '@/utils/bytes';
+import type { ProgressReport } from '@/utils/progress';
 
 export type PhotoSource = 'camera' | 'import' | 'restore';
 
@@ -141,7 +142,11 @@ export interface VaultRepository {
    * caller, which must delete it as soon as playback ends (see `@/vault/playbackScratch`).
    */
   readVideoToFile(id: string, targetUri: string): Promise<void>;
-  deletePhotos(ids: Iterable<string>): Promise<void>;
+  /**
+   * Removes photos and securely erases their files. `onProgress` fires per id, because a
+   * selection of videos is slow enough that a silent screen reads as a frozen one.
+   */
+  deletePhotos(ids: Iterable<string>, onProgress?: ProgressReport): Promise<void>;
   readEncryptedPhoto(id: string): Promise<Bytes>;
   readEncryptedThumbnail(id: string): Promise<Bytes>;
   /** Where a payload blob sits on disk, for transfers that must not pass through JS memory. */

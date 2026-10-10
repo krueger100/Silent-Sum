@@ -152,7 +152,7 @@ describe('BackupService uploading', () => {
     await service.enable(keys, PASSPHRASE);
 
     const report = await service.backupNow(repository, keys);
-    expect(report).toEqual({ uploaded: 1, cloudOnly: 0, total: 1 });
+    expect(report).toEqual({ uploaded: 1, cloudOnly: 0, total: 1, unrepairable: 0 });
 
     const uid = backend.currentUser?.uid ?? '';
     const uploaded = await backend.getBlob(BACKUP_PATHS.photo(uid, entry.id));
@@ -176,6 +176,7 @@ describe('BackupService uploading', () => {
       uploaded: 0,
       cloudOnly: 0,
       total: 1,
+      unrepairable: 0,
     });
 
     await repository.addPhoto({ bytes: makeImage('b') }, { source: 'camera' });
@@ -183,6 +184,7 @@ describe('BackupService uploading', () => {
       uploaded: 1,
       cloudOnly: 0,
       total: 2,
+      unrepairable: 0,
     });
   });
 
@@ -206,7 +208,7 @@ describe('BackupService uploading', () => {
     await repository.deletePhotos([gone.id]);
     const report = await service.backupNow(repository, keys);
 
-    expect(report).toEqual({ uploaded: 0, cloudOnly: 1, total: 2 });
+    expect(report).toEqual({ uploaded: 0, cloudOnly: 1, total: 2, unrepairable: 0 });
     const uid = backend.currentUser?.uid ?? '';
     await expect(backend.getBlob(BACKUP_PATHS.photo(uid, gone.id))).resolves.toBeDefined();
 
@@ -273,7 +275,7 @@ describe('BackupService uploading', () => {
     );
     const report = await service.backupNow(second.repository, second.keys);
 
-    expect(report).toEqual({ uploaded: 1, cloudOnly: 1, total: 2 });
+    expect(report).toEqual({ uploaded: 1, cloudOnly: 1, total: 2, unrepairable: 0 });
     const target = await makeVault(master);
     expect(await service.restoreInto(target.repository, target.keys)).toMatchObject({
       restored: 2,
@@ -359,7 +361,12 @@ describe('BackupService recovery', () => {
     expect(await service.restoreInto(repository, keys)).toMatchObject({ restored: 0, skipped: 0 });
   });
 
-  it('skips an object that disappeared from the cloud rather than failing the whole restore', async () => {
+  /**
+   * Two separate promises. The restore must not abort over one dead object -- and it must not
+   * call that object skipped, because "skipped" is what the screen prints as "already on this
+   * device, left untouched".
+   */
+  it('reports an object that disappeared from the cloud as missing, not as skipped', async () => {
     const master = random.bytes(32);
     const source = await makeVault(master);
     const kept = await source.repository.addPhoto({ bytes: makeImage('kept') }, { source: 'camera' });
@@ -376,8 +383,115 @@ describe('BackupService recovery', () => {
     const target = await makeVault(master);
     const report = await service.restoreInto(target.repository, target.keys);
 
-    expect(report).toMatchObject({ restored: 1, skipped: 1 });
+    expect(report).toMatchObject({ restored: 1, skipped: 0, missing: 1 });
     expect(target.repository.photos.map((p) => p.id)).toEqual([kept.id]);
+    // And it is not offered to a rebind, which could only re-upload what is on this device.
+    expect(report.cloudIds).toEqual([kept.id]);
+  });
+
+  /**
+   * The distinction the two counters exist to make, in the one situation that produces both.
+   *
+   * `skipped` means the photo is here already. `missing` means it is nowhere. Before they were
+   * split, this restore reported "skipped: 2" and the screen turned that into "2 photos already
+   * on this device, left untouched" -- for one photo that was, and one that was gone for good.
+   */
+  it('tells a photo that is already here apart from one whose bytes are gone', async () => {
+    const master = random.bytes(32);
+    const source = await makeVault(master);
+    const here = await source.repository.addPhoto(
+      { bytes: makeImage('here') },
+      { source: 'camera' },
+    );
+    const gone = await source.repository.addPhoto(
+      { bytes: makeImage('gone') },
+      { source: 'camera' },
+    );
+    const fresh = await source.repository.addPhoto(
+      { bytes: makeImage('fresh') },
+      { source: 'camera' },
+    );
+
+    const backend = await signedInBackend();
+    const service = makeService(backend);
+    await service.enable(source.keys, PASSPHRASE);
+    await service.backupNow(source.repository, source.keys);
+
+    const uid = backend.currentUser?.uid ?? '';
+    await backend.deleteBlob(BACKUP_PATHS.photo(uid, gone.id));
+    // Two of the three leave the device, so the restore meets one of each kind: one still here,
+    // one downloadable, one whose bytes no longer exist anywhere.
+    await source.repository.deletePhotos([gone.id, fresh.id]);
+
+    const report = await service.restoreInto(source.repository, source.keys);
+
+    expect(report).toMatchObject({ restored: 1, skipped: 1, missing: 1 });
+    expect([...source.repository.photos.map((p) => p.id)].sort()).toEqual(
+      [here.id, fresh.id].sort(),
+    );
+    expect([...report.cloudIds].sort()).toEqual([here.id, fresh.id].sort());
+  });
+
+  /** The same split on the foreign-key path, which is the one a stranded user actually reaches. */
+  it('reports a missing object as missing when re-encrypting a foreign backup', async () => {
+    const backupMaster = random.bytes(32);
+    const source = await makeVault(backupMaster);
+    const kept = await source.repository.addPhoto(
+      { bytes: makeImage('kept') },
+      { source: 'camera' },
+    );
+    const lost = await source.repository.addPhoto(
+      { bytes: makeImage('lost') },
+      { source: 'camera' },
+    );
+
+    const backend = await signedInBackend();
+    const service = makeService(backend);
+    await service.enable(source.keys, PASSPHRASE);
+    await service.backupNow(source.repository, source.keys);
+
+    const uid = backend.currentUser?.uid ?? '';
+    await backend.deleteBlob(BACKUP_PATHS.photo(uid, lost.id));
+
+    // A different vault entirely: its own master key, so every blob is re-encrypted on the way in.
+    const target = await makeVault(random.bytes(32));
+    const report = await service.restoreForeignInto(target.repository, target.keys, backupMaster);
+
+    expect(report).toMatchObject({ restored: 1, skipped: 0, missing: 1 });
+    expect(target.repository.photos.map((p) => p.id)).toEqual([kept.id]);
+    // The id a rebind must not be handed: nothing local answers to it.
+    expect(report.cloudIds).toEqual([kept.id]);
+  });
+
+  /** Progress still accounts for every item, including the ones that turn out to be gone. */
+  it('counts a missing object as progress so the bar cannot stall on it', async () => {
+    const master = random.bytes(32);
+    const source = await makeVault(master);
+    await source.repository.addPhoto({ bytes: makeImage('kept') }, { source: 'camera' });
+    const lost = await source.repository.addPhoto(
+      { bytes: makeImage('lost') },
+      { source: 'camera' },
+    );
+
+    const backend = await signedInBackend();
+    const service = makeService(backend);
+    await service.enable(source.keys, PASSPHRASE);
+    await service.backupNow(source.repository, source.keys);
+
+    const uid = backend.currentUser?.uid ?? '';
+    await backend.deleteBlob(BACKUP_PATHS.photo(uid, lost.id));
+
+    const calls: [number, number][] = [];
+    const target = await makeVault(master);
+    await service.restoreInto(target.repository, target.keys, (done, total) => {
+      calls.push([done, total]);
+    });
+
+    expect(calls).toEqual([
+      [0, 2],
+      [1, 2],
+      [2, 2],
+    ]);
   });
 });
 
@@ -659,7 +773,7 @@ describe('BackupService manifest against older rules', () => {
 
     const report = await service.backupNow(repository, keys);
 
-    expect(report).toEqual({ uploaded: 1, cloudOnly: 0, total: 1 });
+    expect(report).toEqual({ uploaded: 1, cloudOnly: 0, total: 1, unrepairable: 0 });
     const manifest = backend.documents.get(BACKUP_PATHS.manifest(uid));
     expect(manifest?.photoCount).toBe(1);
     expect(manifest?.index).toBeUndefined();

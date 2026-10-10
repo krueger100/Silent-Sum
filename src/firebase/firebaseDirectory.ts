@@ -21,6 +21,11 @@ function toDirectoryError(error: unknown, signedIn: boolean): DirectoryError {
       // The server sends the same refusal for "no ID token" and "no App Check token", because it
       // saw neither. Only this side knows which, and telling a signed-in user to sign in is the
       // one answer that is certainly wrong. Same split as `FirebaseBillingService`.
+      //
+      // Deliberately NOT keyed on `CallableError.appCheckSent`, though that is now recorded:
+      // somebody signed out has no App Check token either, and "sign in" is the one thing they
+      // can act on. The flag earns its keep in the development breadcrumb, where it says which
+      // token was missing without having to guess.
       return new DirectoryError(signedIn ? 'attestation' : 'unauthenticated');
     case 'permission-denied':
       return new DirectoryError('pro-required');
@@ -28,6 +33,16 @@ function toDirectoryError(error: unknown, signedIn: boolean): DirectoryError {
       return new DirectoryError('rate-limited');
     case 'invalid-argument':
       return new DirectoryError('invalid-email');
+    case 'unavailable':
+        // Our own code for "no response at all". The server never spoke.
+      return new DirectoryError('offline');
+    case 'not-found':
+    case 'internal':
+    case 'unknown':
+      // The server DID answer. A 404 means the function is not deployed or the base URL is
+      // wrong; a 500 means it broke. Both are configuration or server faults, and neither is
+      // an App Check problem -- reporting them as one sends the reader to the wrong console.
+      return new DirectoryError('unavailable');
     default:
       return new DirectoryError('unavailable');
   }
@@ -54,12 +69,16 @@ export class FirebaseDirectory implements Directory {
   }
 
   /**
-   * Naming a correspondent never fails loudly.
+   * Naming a correspondent is best effort, but it is not silent.
    *
-   * Nothing depends on the answer: with it a row says who is writing, without it the row says
-   * their account id. Every refusal the server can give here -- no App Check, budget spent, not a
-   * correspondent, offline -- has the same right response, which is to leave the id showing and
-   * try again the next time the list is opened.
+   * Null means the server answered and has no address to give. A refusal -- no App Check, budget
+   * spent, not a correspondent, offline -- throws, because the two call for opposite things: an
+   * answer of "nobody" is settled and asking again would waste the hourly budget on it, while a
+   * refusal is the one case worth retrying when the list is next opened.
+   *
+   * This used to swallow both into null, which read as "asked and answered" either way. The
+   * caller marked the peer as asked, never asked again, and a row that failed its one lookup
+   * showed an account id until the app was killed and reopened.
    */
   async emailForUid(uid: string): Promise<string | null> {
     try {
@@ -71,8 +90,14 @@ export class FirebaseDirectory implements Directory {
         return null;
       }
       return result.email;
-    } catch {
-      return null;
+    } catch (error) {
+      // The breadcrumb stays: a lookup that never works leaves every row showing a uid, and
+      // without this there is nothing on hand to say why.
+      if ((globalThis as { __DEV__?: boolean }).__DEV__ === true) {
+        const code = error instanceof CallableError ? error.code : String(error);
+        console.warn(`[silentsum] peer e-mail lookup failed: ${code}`);
+      }
+      throw toDirectoryError(error, this.currentUser() !== null);
     }
   }
 }

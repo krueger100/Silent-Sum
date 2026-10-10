@@ -10,6 +10,10 @@
  * vault that locks mid-decrypt makes the repository throw, which renders a neutral placeholder
  * rather than propagating.
  *
+ * LOCAL FIRST, ALWAYS. Where the vault still holds the photo the tile reads it from there and no
+ * network call happens. `fallback` is for the Cloud Gallery, whose tiles may describe photos this
+ * device no longer has a copy of; it is tried only after the local read has failed.
+ *
  * A video tile is the same encrypted JPEG -- a poster frame, produced by the same thumbnail
  * pipeline -- with a play badge and its length drawn over it, so a video is recognisable at a
  * glance without a second decrypt path or a second kind of blob.
@@ -20,6 +24,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { radius, type Palette, useStyles } from '@/app/theme';
 import { toBase64 } from '@/crypto/sodium';
+import type { Bytes } from '@/utils/bytes';
 import { formatDuration, isVideo } from '@/vault/mediaKind';
 import type { PhotoEntry, VaultRepository } from '@/vault/types';
 
@@ -31,6 +36,28 @@ export interface PhotoTileProps {
   selecting: boolean;
   onPress: () => void;
   onLongPress: () => void;
+  /**
+   * Where else to look when the vault has no copy of this photo.
+   *
+   * Absent in the Local Gallery, where a failed read means the vault locked and the only honest
+   * answer is a placeholder. The Cloud Gallery passes one for the tiles whose files are in the
+   * cloud, so "Cloud only" shows the photo rather than a grey square.
+   *
+   * Its presence also decides what a total failure looks like. With no fallback the tile draws
+   * the error placeholder, because local data that will not read is a fault worth showing. With
+   * one, it draws the neutral placeholder: a thumbnail that could not be fetched is an offline
+   * device or a slow network, and marking a perfectly healthy backup as broken would be a lie.
+   */
+  fallback?: (id: string) => Promise<Bytes>;
+  /**
+   * A short word drawn over the tile, for a gallery that has to explain a tile it cannot draw.
+   *
+   * The Local Gallery never passes one: there a tile either shows its photo or the vault has
+   * locked, and neither needs explaining. The Cloud Gallery does, because "no bytes on this
+   * device" covers three situations with three different answers -- safe in the cloud, repairable
+   * from here, or gone for good -- and one grey square for all three tells the user nothing.
+   */
+  caption?: string;
 }
 
 export function PhotoTile({
@@ -41,6 +68,8 @@ export function PhotoTile({
   selecting,
   onPress,
   onLongPress,
+  fallback,
+  caption,
 }: PhotoTileProps): React.JSX.Element {
   const styles = useStyles(makeStyles);
   const [dataUri, setDataUri] = useState<string | null>(null);
@@ -51,17 +80,28 @@ export function PhotoTile({
     let cancelled = false;
 
     void (async () => {
+      let bytes: Bytes;
       try {
-        const bytes = await repository.readThumbnail(entry.id);
-        if (cancelled) return;
-        // `toBase64` copies, so the shared cache buffer being zeroed on lock cannot blank a
-        // thumbnail that is already on screen.
-        const uri = `data:image/jpeg;base64,${toBase64(bytes)}`;
-        if (!cancelled) setDataUri(uri);
+        bytes = await repository.readThumbnail(entry.id);
       } catch {
         // Locked mid-decrypt, a missing blob, an unreadable thumbnail: all the same to a tile.
-        if (!cancelled) setUnavailable(true);
+        if (cancelled) return;
+        if (fallback === undefined) {
+          setUnavailable(true);
+          return;
+        }
+        try {
+          bytes = await fallback(entry.id);
+        } catch {
+          // Offline, or the object really is gone. Either way the tile stays neutral and lets
+          // its caption do the explaining.
+          return;
+        }
       }
+      if (cancelled) return;
+      // `toBase64` copies, so the shared cache buffer being zeroed on lock cannot blank a
+      // thumbnail that is already on screen.
+      setDataUri(`data:image/jpeg;base64,${toBase64(bytes)}`);
     })();
 
     return () => {
@@ -71,7 +111,7 @@ export function PhotoTile({
       setDataUri(null);
       setUnavailable(false);
     };
-  }, [entry.id, repository]);
+  }, [entry.id, fallback, repository]);
 
   return (
     <Pressable
@@ -85,8 +125,15 @@ export function PhotoTile({
       style={[styles.cell, { width: size, height: size }]}
     >
       {dataUri === null ? (
-        <View style={[styles.placeholder, unavailable ? styles.placeholderError : null]}>
-          {unavailable ? <Text style={styles.placeholderGlyph}>!</Text> : null}
+        <View
+          testID="gallery-tile-placeholder"
+          style={[styles.placeholder, unavailable ? styles.placeholderError : null]}
+        >
+          {unavailable ? (
+            <Text testID="gallery-tile-unavailable" style={styles.placeholderGlyph}>
+              !
+            </Text>
+          ) : null}
         </View>
       ) : (
         <Image
@@ -107,6 +154,13 @@ export function PhotoTile({
           </Text>
         </View>
       ) : null}
+      {caption === undefined ? null : (
+        <View style={styles.caption} pointerEvents="none">
+          <Text testID="gallery-tile-caption" style={styles.captionText}>
+            {caption}
+          </Text>
+        </View>
+      )}
       {selected ? <View style={styles.selectedOverlay} /> : null}
       {selecting ? (
         <View style={[styles.badge, selected ? styles.badgeSelected : null]}>
@@ -143,6 +197,18 @@ const makeStyles = (colors: Palette) =>
     videoGlyph: { color: '#FFFFFF', fontSize: 10, lineHeight: 14 },
     videoDuration: { color: '#FFFFFF', fontSize: 11, lineHeight: 14, fontWeight: '600' },
     placeholderGlyph: { color: colors.textMuted, fontSize: 20, fontWeight: '600' },
+    // Bottom RIGHT: the video badge owns bottom-left and the selection tick owns top-right, so a
+    // captioned video in a selecting gallery still shows all three without one covering another.
+    caption: {
+      position: 'absolute',
+      right: 4,
+      bottom: 4,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: radius.pill,
+      backgroundColor: 'rgba(17,24,39,0.78)',
+    },
+    captionText: { color: '#FFFFFF', fontSize: 10, lineHeight: 13, fontWeight: '700' },
     selectedOverlay: {
       position: 'absolute',
       top: 0,

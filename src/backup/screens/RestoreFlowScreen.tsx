@@ -16,20 +16,24 @@
  * locked again if the user walks away before the vault is actually handed over.
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, BackHandler, StyleSheet, Text, View } from 'react-native';
+import { BackHandler, StyleSheet, Text, View } from 'react-native';
 
 import { useServices } from '@/app/ServicesProvider';
-import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
+import { radius, spacing, type Palette, typography, useStyles } from '@/app/theme';
 import { describePinError, validatePin } from '@/auth/pinPolicy';
 import type { VaultKeys } from '@/crypto/types';
 import { PIN_POLICY } from '@/auth/types';
 import { describeCloudError } from '@/backup/screens/cloudErrors';
+import { restoreMessagingIdentity } from '@/messaging/identityRecovery';
+import type { RecoveredIdentityResult } from '@/messaging/messagingService';
+import { describeMessagingRestore } from '@/messaging/restoreNotice';
 import { requestPasswordReset, RESET_REASSURANCE } from '@/backup/screens/passwordReset';
 import { validatePassphrase } from '@/backup/passphrasePolicy';
-import type { BackupService } from '@/backup/types';
+import type { BackupProgress, BackupService } from '@/backup/types';
 import { cloudActive } from '@/billing/entitlements';
 import { CloudRequiredCard } from '@/billing/screens/CloudRequiredCard';
 import { Button } from '@/components/Button';
+import { ProgressBar } from '@/components/ProgressBar';
 import { Field } from '@/components/Field';
 import { Paragraph, Screen } from '@/components/Screen';
 import { ANALYTICS_EVENTS, logEventSafely, type CloudBackend } from '@/firebase/types';
@@ -116,7 +120,6 @@ function RestoreFlowBody({
   onPlans?: () => void;
   allowOverwrite: boolean;
 }): React.JSX.Element {
-  const colors = useTheme();
   const styles = useStyles(makeStyles);
   const services = useServices();
 
@@ -129,7 +132,14 @@ function RestoreFlowBody({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
-  const [report, setReport] = useState<{ restored: number; skipped: number } | null>(null);
+  const [report, setReport] = useState<RestoreTally | null>(null);
+  /**
+   * Photos finished so far. Null until the download starts, which is a real and slow phase here:
+   * Argon2id runs first, then the envelope and index are fetched, and none of that is countable.
+   */
+  const [progress, setProgress] = useState<{ readonly done: number; readonly total: number } | null>(
+    null,
+  );
 
   const mounted = useRef(true);
   const adopted = useRef(false);
@@ -150,6 +160,16 @@ function RestoreFlowBody({
    * asked for a PIN, and it costs a single 64 MiB Argon2id run instead of two.
    */
   const recoveredMaster = useRef<Bytes | null>(null);
+  /**
+   * The key that opens this account's MESSAGING, when that is not the one above.
+   *
+   * Null in the ordinary case, where the envelope's key is the messaging key and there is nothing
+   * extra to hold. Non-null only for an account whose messaging was set up by a different vault,
+   * where it is derived here -- during the passphrase step, because `setPassphrase('')` below is
+   * the last moment the passphrase exists and deriving it later would mean keeping the passphrase
+   * around for a whole restore to avoid one Argon2id run. Zeroed wherever the master key is.
+   */
+  const recoveredMessaging = useRef<Bytes | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -162,6 +182,9 @@ function RestoreFlowBody({
   // master key does not outlive it.
   useEffect(
     () => () => {
+      const messaging = recoveredMessaging.current;
+      recoveredMessaging.current = null;
+      if (messaging !== null) zeroBytes(messaging);
       const master = recoveredMaster.current;
       recoveredMaster.current = null;
       if (master !== null) zeroBytes(master);
@@ -269,6 +292,13 @@ function RestoreFlowBody({
         const previous = recoveredMaster.current;
         if (previous !== null) zeroBytes(previous);
         recoveredMaster.current = master;
+        // One document read. A second Argon2id is only spent on an account whose messaging the
+        // envelope's key cannot open -- which is exactly the account this whole change is for.
+        const staleMessaging = recoveredMessaging.current;
+        if (staleMessaging !== null) zeroBytes(staleMessaging);
+        recoveredMessaging.current = (await backup.messagingKeyIsMine(master))
+          ? null
+          : await backup.recoverMessagingKey(passphrase);
         if (!mounted.current) return;
         setPassphrase('');
         setStep('pin');
@@ -315,8 +345,26 @@ function RestoreFlowBody({
         zeroBytes(master);
         recoveredMaster.current = null;
         const repository = await services.vault.open(keys);
-        const result = await backup.restoreInto(repository, keys);
-        setReport({ restored: result.restored, skipped: result.skipped });
+        const onProgress: BackupProgress = (done, total) => {
+          if (mounted.current) setProgress({ done, total });
+        };
+        const result = await backup.restoreInto(repository, keys, onProgress);
+        // A new device, which is the case this whole screen exists for -- and the one where
+        // messaging silently did not come back. The vault key is already adopted here, so it is
+        // handed over first and the escrow is only paid for if that key is not the account's.
+        // The passphrase is long gone by now, deliberately. `confirmPassphrase` left behind
+        // whichever keys are needed, which is all this call wants.
+        const messagingKey = recoveredMessaging.current;
+        const messagingOutcome = await restoreMessagingIdentity(backup, services.messaging, '', {
+          vaultMasterKey: keys.masterKey,
+          ...(messagingKey === null ? {} : { messagingMasterKey: messagingKey }),
+        });
+        setReport({
+          restored: result.restored,
+          skipped: result.skipped,
+          missing: result.missing,
+          messaging: messagingOutcome,
+        });
         await services.settings.update({ onboardingDone: true, backupEnabled: true });
         logEventSafely(services.firebase.analytics, ANALYTICS_EVENTS.restoreCompleted);
         if (!mounted.current) return;
@@ -477,8 +525,16 @@ function RestoreFlowBody({
 
       {step === 'working' ? (
         <View style={styles.busy} testID="restore_busy">
-          <ActivityIndicator size="large" color={colors.accent} />
           <Text style={styles.heading}>Restoring your vault</Text>
+          <ProgressBar
+            testID="restore_progress"
+            {...(progress === null
+              ? {}
+              : { value: progress.total === 0 ? 1 : progress.done / progress.total })}
+            {...(progress === null || progress.total === 0
+              ? {}
+              : { label: `${String(progress.done)} of ${String(progress.total)} photos` })}
+          />
           <Paragraph>
             Unwrapping the key and downloading your encrypted photos. Please keep the app open.
           </Paragraph>
@@ -489,9 +545,7 @@ function RestoreFlowBody({
         <View style={styles.form}>
           <Text style={styles.heading}>Restore complete</Text>
           <Text testID="restore_summary" style={styles.body}>
-            {report === null
-              ? 'Your vault is ready.'
-              : `Restored ${plural(report.restored, 'photo')}, skipped ${plural(report.skipped, 'photo')}.`}
+            {report === null ? 'Your vault is ready.' : describeRestore(report)}
           </Text>
           <Paragraph>
             From now on, type your new PIN on the calculator and press = to open the vault.
@@ -513,6 +567,38 @@ function RestoreFlowBody({
       ) : null}
     </Screen>
   );
+}
+
+/** What the restore did, in the three outcomes an item can have. */
+interface RestoreTally {
+  readonly restored: number;
+  readonly skipped: number;
+  readonly missing: number;
+  readonly messaging: RecoveredIdentityResult;
+}
+
+/**
+ * The restore, in plain sentences.
+ *
+ * This screen restores into a vault that was just created, so `skipped` is almost always zero
+ * and `missing` is almost always a real loss. The old line read "Restored 45 photos, skipped 28
+ * photos" either way -- a number that sounded procedural for the one thing on this screen the
+ * user cannot recover from and would want to know about immediately.
+ */
+function describeRestore(report: RestoreTally): string {
+  const sentences = [`Restored ${plural(report.restored, 'photo')}.`];
+  if (report.skipped > 0) {
+    sentences.push(`${plural(report.skipped, 'photo')} were already in this vault.`);
+  }
+  if (report.missing > 0) {
+    sentences.push(
+      `${plural(report.missing, 'photo')} could not be downloaded: the backup lists them, but ` +
+        'their files are no longer in the cloud.',
+    );
+  }
+  const messaging = describeMessagingRestore(report.messaging);
+  if (messaging !== null) sentences.push(messaging);
+  return sentences.join(' ');
 }
 
 function plural(count: number, noun: string): string {

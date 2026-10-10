@@ -12,11 +12,14 @@
  *   loading  a placeholder at the bubble's size, so the list does not jump as previews land
  *   ready    the decrypted preview
  *   expired  dimmed, "This photo has expired", and NO preview -- the point of expiring both
+ *   sealed   dimmed, "could not be opened on this device", and no retry, because none can help
  *   failed   the same placeholder with a retry, worded so it is not mistaken for expiry
  *
- * `fetchThumb` returning null means the object is gone and no retry will ever help; a thrown
- * error means the network failed and a retry may. Showing "expired" for a dropped connection
- * would tell someone their photo had been destroyed when it had not.
+ * `fetchThumb` says which: `expired` means the object is gone, `sealed` means it is there and no
+ * key this device holds opens it, and a thrown error means the network failed and a retry may.
+ * Showing "expired" for a dropped connection would tell someone their photo had been destroyed
+ * when it had not -- and showing it for a key mismatch did exactly that, to a photo sent a
+ * minute earlier, until `sealed` existed to say the true thing.
  */
 import React from 'react';
 import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from 'react-native';
@@ -29,6 +32,8 @@ export type MediaBubbleState =
   | 'loading'
   | 'ready'
   | 'expired'
+  /** Present, intact, and sealed under a key this device does not hold. Not expiry. */
+  | 'sealed'
   | 'failed'
   /** Picked and on its way: the preview is local and the item has no message yet. */
   | 'uploading'
@@ -95,6 +100,22 @@ export function MediaBubble({
       >
         <Text style={styles.note}>{`This ${label(kind)} has expired.`}</Text>
         <Text style={styles.sub}>Media is kept for 30 days.</Text>
+      </View>
+    );
+  }
+
+  // No retry, deliberately. The bytes are there and intact; what is missing is a key this
+  // device will never have, so a tap can only fail again. Worded to match the text placeholder
+  // beside it ("This message could not be opened on this device"), because to the reader it is
+  // the same event -- and worded so nobody is told a photo from a minute ago was destroyed.
+  if (state === 'sealed') {
+    return (
+      <View
+        style={[styles.frame, styles.placeholder]}
+        testID={`conversation_media_sealed_${messageId}`}
+      >
+        <Text style={styles.note}>{`This ${label(kind)} could not be opened on this device.`}</Text>
+        <Text style={styles.sub}>It was sent to an earlier messaging key for this account.</Text>
       </View>
     );
   }

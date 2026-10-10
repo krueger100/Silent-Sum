@@ -15,6 +15,7 @@ import { EntitlementsController } from '@/billing/entitlementsController';
 import { SequentialRandom } from '@/crypto/random';
 import { MASTER_KEY_LENGTH } from '@/crypto/types';
 import { InMemoryCloudBackend, InMemoryCloudStore } from '@/firebase/cloudBackend';
+import { CloudError } from '@/firebase/types';
 import { InMemorySecureStore } from '@/secure-storage/secureStore';
 import { InMemoryConversationAdmin } from '@/messaging/conversationAdmin';
 import { InMemoryDirectory } from '@/messaging/directory';
@@ -673,7 +674,9 @@ describe('media messages', () => {
     if (received === undefined) throw new Error('expected the message');
 
     expect(received.thumbObject).toBe(`messages/${conversationId}/thumb/${received.id}`);
-    expect(await bob.messaging.fetchThumb(conversationId, received)).not.toBeNull();
+    // Bytes, not a miss. `not.toBeNull()` passed for the string 'sealed' too, which is exactly
+    // the confusion the return type now rules out.
+    expect(await bob.messaging.fetchThumb(conversationId, received)).toBeInstanceOf(Uint8Array);
   });
 
   // The preview must be regenerated at the chat size, never reused from the vault's 512px one:
@@ -970,12 +973,74 @@ describe('media messages', () => {
 
     bob.cloud.expireBlobsUnder(`messages/${conversationId}/`);
 
-    expect(await bob.messaging.fetchThumb(conversationId, received)).toBeNull();
+    // 'expired' and not 'sealed': the object really is gone, which is the one case that word is
+    // allowed to describe.
+    expect(await bob.messaging.fetchThumb(conversationId, received)).toBe('expired');
     await expect(bob.messaging.fetchMedia(conversationId, received)).rejects.toMatchObject({
       code: 'expired',
     });
     // The record itself survives: the conversation history is not rewritten.
     expect(thread.last().messages[0]?.kind).toBe('photo');
+  });
+
+  /**
+   * The lie this replaced: a photo that is sitting right there, intact, sixty seconds old, and
+   * unopenable because it was sealed under a key this device has since retired -- reported to
+   * its owner as destroyed by a 30-day rule.
+   *
+   * `fetchThumb` returned a bare null for that, for a swept object, for a malformed blob and
+   * for a dropped connection alike, and the screen read every one of them as expiry. The object
+   * being PRESENT is the whole difference, and nothing in the old contract could express it.
+   */
+  it('calls an unopenable preview sealed, not expired, while the object is still there', async () => {
+    const { alice, bob, conversationId } = await pair();
+    await alice.messaging.sendMedia(conversationId, { uri: 'file:///photo.jpg', kind: 'photo' });
+    await flush();
+
+    const thread = collect<ConversationState>((on) =>
+      bob.messaging.watchConversation(conversationId, on),
+    );
+    await flush();
+    const received = thread.last().messages[0];
+    if (received === undefined) throw new Error('expected the message');
+    // It opens before anything changes, so the assertion below is about the key and not about a
+    // fixture that never worked.
+    expect(await bob.messaging.fetchThumb(conversationId, received)).toBeInstanceOf(Uint8Array);
+
+    // Bob's vault is now a different one: the bytes are untouched and no key here opens them.
+    bob.identity = deriveMessagingIdentity(masterKey(99));
+    bob.messaging.forgetKeys();
+
+    expect(await bob.messaging.fetchThumb(conversationId, received)).toBe('sealed');
+    thread.stop();
+  });
+
+  /**
+   * A dropped connection is not expiry either, and this is the half that still throws. The
+   * screen turns a throw into a retry; turning it into "expired" would tell someone on a bad
+   * signal that their photo had been destroyed.
+   */
+  it('throws rather than claim expiry when the preview simply could not be fetched', async () => {
+    const { alice, bob, conversationId } = await pair();
+    await alice.messaging.sendMedia(conversationId, { uri: 'file:///photo.jpg', kind: 'photo' });
+    await flush();
+
+    const thread = collect<ConversationState>((on) =>
+      bob.messaging.watchConversation(conversationId, on),
+    );
+    await flush();
+    const received = thread.last().messages[0];
+    if (received === undefined) throw new Error('expected the message');
+
+    const get = jest
+      .spyOn(bob.cloud, 'getBlob')
+      .mockRejectedValue(new CloudError('unavailable', 'no connection'));
+    await expect(bob.messaging.fetchThumb(conversationId, received)).rejects.toBeInstanceOf(
+      CloudError,
+    );
+
+    get.mockRestore();
+    thread.stop();
   });
 
   // The cross-plan guard: chat media belongs to Pro, not to the Cloud backup allowance.

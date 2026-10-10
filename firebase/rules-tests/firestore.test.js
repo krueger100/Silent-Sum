@@ -58,16 +58,28 @@ const RULES_GATE_BACKUP_WRITES =
   RULES.includes('ssCloudActive(uid) && ssValidManifest');
 // Phase 1: the optional `vaultId` field allowed on both backup documents.
 const RULES_ALLOW_VAULT_ID = RULES.includes('vaultId');
+// The messaging key escrow: `users/{uid}/vault/messaging`, the document that keeps an account's
+// messaging recoverable across a rebind. Present in every ruleset in this repo and NOT YET
+// DEPLOYED to the project, so the client treats a refusal here as "rules are behind" and carries
+// on without one.
+const RULES_HAVE_MESSAGING_ESCROW = RULES.includes('/vault/messaging');
+// Gated on the pending ruleset exactly as the envelope is, so a lapsed account cannot add to its
+// backup -- while reads and deletes stay open, which is what lets it take its data out.
+const RULES_GATE_ESCROW_WRITES =
+  RULES.includes('ssCloudActive(uid) && ssValidMessagingEscrow') ||
+  RULES.includes('cloudActive(uid) && validMessagingEscrow');
 
 const describeGatedWrites = RULES_GATE_BACKUP_WRITES ? describe : describe.skip;
 const describeUngatedWrites = RULES_GATE_BACKUP_WRITES ? describe.skip : describe;
 const describeVaultId = RULES_ALLOW_VAULT_ID ? describe : describe.skip;
+const describeEscrow = RULES_HAVE_MESSAGING_ESCROW ? describe : describe.skip;
 
 // Printed once per run, so a green suite can never be mistaken for the other ruleset.
 console.log(
   `[rules] ${RULES_FILE}` +
     ` | backup-write Cloud gate: ${RULES_GATE_BACKUP_WRITES ? 'ON (pending)' : 'off (deployed)'}` +
     ` | vaultId: ${RULES_ALLOW_VAULT_ID ? 'allowed' : 'refused'}` +
+    ` | messaging escrow: ${RULES_HAVE_MESSAGING_ESCROW ? 'present' : 'absent'}` +
     `${RULES_FILE === PENDING_RULES ? ' | NOT THE DEPLOYED RULESET' : ''}`,
 );
 
@@ -83,6 +95,18 @@ const ENVELOPE = {
 };
 
 const MANIFEST = { photoIds: ['a'], photoCount: 1, updatedAt: '2026-09-21T12:00:00.000Z' };
+
+// The messaging key escrow. Same shape as the envelope plus `publicKey`, which is the only
+// plaintext field and is not a secret: it is what `messagingKeys/{uid}` already publishes to
+// every signed-in user, kept here so a stale escrow can be spotted without a key derivation.
+const ESCROW = {
+  v: 1,
+  salt: 'c2FsdDI=',
+  kdf: { alg: 'argon2id', m: 65536, t: 3, p: 1, len: 32 },
+  wrapped: { nonce: 'bm9uY2U=', ct: 'Y3Q=', mac: 'bWFj' },
+  publicKey: 'MCowBQYDK2VuAyEAJmmoDk3jSmGlLwGLyQKLmX1dXOW5F8rfPaE0cHnyAzg=',
+  createdAt: '2026-10-09T12:00:00.000Z',
+};
 
 let env;
 
@@ -298,6 +322,72 @@ describe('backup reads and deletes never need a term', () => {
   });
 });
 
+/**
+ * The document that fixes the rebind data loss.
+ *
+ * The client will not write here from a vault whose key is not the one the account published, so
+ * a rebind leaves it alone -- but that is a client rule, and the rules' job is narrower: this
+ * belongs to its owner, has a fixed shape, and grants nothing anywhere else. In particular it
+ * touches NOTHING about key rotation, which lives in `messagingKeys/{uid}` and is proved
+ * independently by the two `messaging key` blocks below.
+ */
+describeEscrow('the messaging key escrow', () => {
+  const escrowPath = `users/${ALICE}/vault/messaging`;
+
+  it('accepts a valid escrow from its owner', async () => {
+    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+    await assertSucceeds(setDoc(doc(asAlice(), escrowPath), ESCROW));
+  });
+
+  it('refuses a shape it does not recognise', async () => {
+    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+    // An extra field is how a second secret would be smuggled in beside the first.
+    await assertFails(setDoc(doc(asAlice(), escrowPath), { ...ESCROW, extra: 1 }));
+    // No public key: the one field that lets a stale escrow be recognised.
+    const { publicKey, ...withoutKey } = ESCROW;
+    expect(publicKey).toBeDefined();
+    await assertFails(setDoc(doc(asAlice(), escrowPath), withoutKey));
+    await assertFails(setDoc(doc(asAlice(), escrowPath), { ...ESCROW, publicKey: '' }));
+    // A KDF nobody could afford to run, which is how a tampered document stalls a recovery.
+    await assertFails(
+      setDoc(doc(asAlice(), escrowPath), { ...ESCROW, kdf: { ...ESCROW.kdf, m: 4096 } }),
+    );
+    await assertFails(
+      setDoc(doc(asAlice(), escrowPath), { ...ESCROW, kdf: { ...ESCROW.kdf, len: 64 } }),
+    );
+  });
+
+  /** An account's messaging key is its own, and the wrapped half is nobody else's business. */
+  it('is closed to every other account, read and write alike', async () => {
+    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+    await serverWritesEntitlements(BOB, Date.now() + DAY);
+    await assertSucceeds(setDoc(doc(asAlice(), escrowPath), ESCROW));
+
+    await assertFails(getDoc(doc(asBob(), escrowPath)));
+    await assertFails(setDoc(doc(asBob(), escrowPath), ESCROW));
+    await assertFails(deleteDoc(doc(asBob(), escrowPath)));
+  });
+
+  /** Reading and deleting never need a term, so a lapsed account can still get out. */
+  it('can always be read and deleted by its owner', async () => {
+    await serverWritesEntitlements(ALICE, Date.now() + DAY);
+    await assertSucceeds(setDoc(doc(asAlice(), escrowPath), ESCROW));
+    await serverWritesEntitlements(ALICE, Date.now() - 1000);
+
+    await assertSucceeds(getDoc(doc(asAlice(), escrowPath)));
+    await assertSucceeds(deleteDoc(doc(asAlice(), escrowPath)));
+  });
+
+  (RULES_GATE_ESCROW_WRITES ? it : it.skip)(
+    'needs an active Cloud term to write [pending rollout]',
+    async () => {
+      await assertFails(setDoc(doc(asAlice(), escrowPath), ESCROW));
+      await serverWritesEntitlements(ALICE, Date.now() - 1000);
+      await assertFails(setDoc(doc(asAlice(), escrowPath), ESCROW));
+    },
+  );
+});
+
 describe('server-only billing collections', () => {
   it.each([
     'silentsum_billing_refs/cs_1',
@@ -486,6 +576,233 @@ describe('published messaging keys', () => {
     await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), { ...key, extra: 1 }));
     await assertFails(
       setDoc(doc(asAlice(), keyOf(ALICE)), { ...key, updatedAt: Date.now() + 600000 }),
+    );
+  });
+});
+
+/**
+ * The published key is the only record of how to open what was sent while it was current: the
+ * conversation key is X25519 over it, and a peer caches nothing across a lock. Dropping one
+ * therefore makes messages ALREADY SENT unreadable to the other side, silently and for good.
+ * Deleting was already refused; overwriting had exactly the same effect and was not.
+ */
+describe('messaging key history is append-only', () => {
+  const keyOf = (uid) => `messagingKeys/${uid}`;
+  const A = 'a2V5LWE=';
+  const B = 'a2V5LWI=';
+  const C = 'a2V5LWM=';
+  const rec = (publicKey, previous) => ({
+    v: 1,
+    uid: ALICE,
+    publicKey,
+    previous,
+    updatedAt: Date.now(),
+  });
+  /** The shape written before `previous` existed, which every live document still has. */
+  const legacy = { v: 1, uid: ALICE, publicKey: A, updatedAt: Date.now() };
+
+  it('is readable one at a time, and not as a collection', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(A, [])));
+    // One key by uid is public: that is what publishing it means.
+    await assertSucceeds(getDoc(doc(asBob(), keyOf(ALICE))));
+    // The whole collection at once is not. The key is a function of the vault alone, so two
+    // accounts on one device publish the same bytes, and a listing groups accounts by device.
+    await assertFails(getDocs(collection(asBob(), 'messagingKeys')));
+  });
+
+  it('accepts a rotation that retires the key it replaces', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(A, [])));
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [A])));
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(C, [A, B])));
+  });
+
+  it('refuses a rotation that drops the key it replaces', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(A, [])));
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [])));
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [C])));
+  });
+
+  it('refuses history that shrinks, is replaced, or quietly loses an entry', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(A, [])));
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [A])));
+    // Shrinking.
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(C, [])));
+    // Replaced with something else of the same length.
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(C, [C, B])));
+    // Still growing by one, but A is gone.
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(C, [B, C])));
+    // Growing the history without rotating at all.
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [A, B])));
+  });
+
+  // Two devices of one account rotating at once. Without this the second writer publishes a
+  // history that never saw the first, and the first rotation is erased.
+  it('refuses a rotation computed from a stale read', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(A, [])));
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [A])));
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(C, [A])));
+  });
+
+  it('lets a document written before `previous` existed rotate', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), legacy));
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(B, [A])));
+  });
+
+  // An older build cannot see `previous`, so its rotation would erase it. Refusing the write is
+  // the safe direction to fail: that client simply does not publish, rather than destroying the
+  // history its peers need.
+  it('refuses an older client rotating without a history', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), legacy));
+    await assertFails(
+      setDoc(doc(asAlice(), keyOf(ALICE)), {
+        v: 1,
+        uid: ALICE,
+        publicKey: B,
+        updatedAt: Date.now(),
+      }),
+    );
+  });
+
+  // An older build publishing its FIRST key must keep working, so a create may omit the field.
+  it('still lets an older client publish a first key', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), legacy));
+  });
+
+  it('still refuses another account, and still refuses every delete', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(A, [])));
+    await assertFails(setDoc(doc(asBob(), keyOf(ALICE)), rec(B, [A])));
+    await assertFails(deleteDoc(doc(asBob(), keyOf(ALICE))));
+    await assertFails(deleteDoc(doc(asAlice(), keyOf(ALICE))));
+  });
+});
+
+/**
+ * Several accounts, one vault.
+ *
+ * The messaging identity is derived from the vault master key with no uid in it, so one person
+ * with two or three accounts on one phone publishes the SAME public key under each uid. That is
+ * deliberate -- and it means these rules are the only thing holding the accounts apart. There is
+ * no cryptographic difference between them to fall back on: every one of those accounts can
+ * derive every other's conversation keys. What stops them is the uid in the path, which is
+ * asserted here against the real ruleset rather than against a client fake.
+ */
+describe('several accounts publishing the same vault key', () => {
+  const keyOf = (uid) => `messagingKeys/${uid}`;
+  /** One vault, therefore one key, published by three different accounts. */
+  const SHARED = 'c2hhcmVkLXZhdWx0LWtleQ==';
+  const OTHER = 'YS1kaWZmZXJlbnQtdmF1bHQ=';
+  const rec = (uid, publicKey = SHARED, previous) => ({
+    v: 1,
+    uid,
+    publicKey,
+    ...(previous === undefined ? {} : { previous }),
+    updatedAt: Date.now(),
+  });
+
+  /** Nothing here requires keys to differ, and the design depends on that staying true. */
+  it('lets three accounts publish identical bytes under their own uids', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(ALICE)));
+    await assertSucceeds(setDoc(doc(asBob(), keyOf(BOB)), rec(BOB)));
+    await assertSucceeds(setDoc(doc(asCarol(), keyOf(CAROL)), rec(CAROL)));
+
+    for (const uid of [ALICE, BOB, CAROL]) {
+      const snap = await assertSucceeds(getDoc(doc(asCarol(), keyOf(uid))));
+      expect(snap.data().publicKey).toBe(SHARED);
+    }
+  });
+
+  /**
+   * THE BOUNDARY. Identical key bytes are not authority over somebody else's document: ownership
+   * is the uid in the path and nothing else. If this ever passes, one account can rewrite
+   * another's published identity on the strength of sharing a phone with it.
+   */
+  it('still refuses one account writing another\u2019s document, identical bytes and all', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(ALICE)));
+    await assertSucceeds(setDoc(doc(asBob(), keyOf(BOB)), rec(BOB)));
+
+    // Bob writing Alice's path, with the very bytes Alice published.
+    await assertFails(setDoc(doc(asBob(), keyOf(ALICE)), rec(ALICE)));
+    // And trying to claim it by putting his own uid in the field.
+    await assertFails(setDoc(doc(asBob(), keyOf(ALICE)), rec(BOB)));
+    // Creating one for an account that has published nothing yet is no different.
+    await assertFails(setDoc(doc(asBob(), keyOf(CAROL)), rec(CAROL)));
+  });
+
+  it('refuses a document whose uid field is not the account it is filed under', async () => {
+    await assertFails(setDoc(doc(asAlice(), keyOf(ALICE)), rec(BOB)));
+    await assertFails(setDoc(doc(asCarol(), keyOf(CAROL)), rec(ALICE)));
+  });
+
+  /**
+   * The histories are per account even when the key is not. One account moving to a new vault
+   * must not retire anything for the others, which still hold the old one and are still using it.
+   */
+  it('keeps one account\u2019s rotation out of the others', async () => {
+    for (const [as, uid] of [
+      [asAlice, ALICE],
+      [asBob, BOB],
+      [asCarol, CAROL],
+    ]) {
+      await assertSucceeds(setDoc(doc(as(), keyOf(uid)), rec(uid)));
+    }
+
+    // Alice alone moves to a different vault, retiring the shared key in her own history.
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(ALICE, OTHER, [SHARED])));
+
+    const alice = await assertSucceeds(getDoc(doc(asAlice(), keyOf(ALICE))));
+    expect(alice.data().publicKey).toBe(OTHER);
+    expect(alice.data().previous).toEqual([SHARED]);
+    // The other two are untouched, and neither has acquired a history.
+    for (const uid of [BOB, CAROL]) {
+      const snap = await assertSucceeds(getDoc(doc(asBob(), keyOf(uid))));
+      expect(snap.data().publicKey).toBe(SHARED);
+      expect(snap.data().previous).toBeUndefined();
+    }
+  });
+
+  /** And Alice's rotation is hers to make: nobody else may make it for her. */
+  it('refuses another account rotating a shared key on one\u2019s behalf', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(ALICE)));
+
+    await assertFails(setDoc(doc(asBob(), keyOf(ALICE)), rec(ALICE, OTHER, [SHARED])));
+    await assertFails(deleteDoc(doc(asBob(), keyOf(ALICE))));
+    await assertFails(deleteDoc(doc(asAlice(), keyOf(ALICE))));
+  });
+
+  /**
+   * The residual, stated rather than wished away: a targeted read is public by design, so anyone
+   * holding two uids can discover they share a vault. Enumeration is what is closed -- see the
+   * listing refusal in the history block -- and that is the difference between asking about an
+   * account you already know of and harvesting the device graph.
+   */
+  it('lets any signed-in account read each one by uid, which is what publishing means', async () => {
+    await assertSucceeds(setDoc(doc(asAlice(), keyOf(ALICE)), rec(ALICE)));
+    await assertSucceeds(setDoc(doc(asBob(), keyOf(BOB)), rec(BOB)));
+
+    await assertSucceeds(getDoc(doc(asCarol(), keyOf(ALICE))));
+    await assertSucceeds(getDoc(doc(asCarol(), keyOf(BOB))));
+    await assertFails(getDoc(doc(env.unauthenticatedContext().firestore(), keyOf(ALICE))));
+  });
+
+  /**
+   * Sharing a key buys nothing in the collection that matters. Conversation membership is read
+   * from the id, so Carol -- on the same vault, publishing the same bytes -- is no closer to
+   * Alice and Bob's thread than any stranger.
+   */
+  it('gives an account on the same vault no reach into a conversation it is not in', async () => {
+    for (const [as, uid] of [
+      [asAlice, ALICE],
+      [asBob, BOB],
+      [asCarol, CAROL],
+    ]) {
+      await assertSucceeds(setDoc(doc(as(), keyOf(uid)), rec(uid)));
+    }
+    await serverCreatesConversation();
+
+    await assertFails(getDoc(doc(asCarol(), `conversations/${CONVERSATION}`)));
+    await assertFails(getDocs(collection(asCarol(), `conversations/${CONVERSATION}/messages`)));
+    await assertFails(
+      setDoc(doc(asCarol(), `conversations/${CONVERSATION}/messages/m1`), message(CAROL)),
     );
   });
 });

@@ -17,6 +17,13 @@
  * switched off changes nothing about unlocking or viewing photos.
  */
 import { envelopeFromJson, envelopeToJson } from '@/backup/backupEnvelope';
+import { keyFingerprint, traceRecovery } from '@/messaging/recoveryTrace';
+import {
+  escrowFromJson,
+  escrowToJson,
+  messagingEscrowPath,
+  type MessagingEscrow,
+} from '@/backup/messagingEscrow';
 import { assertValidPassphrase } from '@/backup/passphrasePolicy';
 import {
   AccountDataRemainsError,
@@ -27,6 +34,9 @@ import {
   VaultIdMismatchError,
   WrongPassphraseError,
   type CrossAccountOptions,
+  type BackupProgress,
+  type BackupSelection,
+  type CloudContents,
   type BackupReport,
   type BackupService as BackupServiceContract,
   type RestoreReport,
@@ -86,7 +96,35 @@ export interface BackupServiceOptions {
   /** Which account this device's vault is backed up to. Not optional: it is a safety gate. */
   owner: VaultOwnerStore;
   kdfParams?: KdfParams;
+  /**
+   * What this service needs to know about messaging, and nothing more.
+   *
+   * Two pure questions -- "which public key does this master key produce" and "which one has the
+   * account published" -- injected rather than imported, so backup keeps no dependency on the
+   * messaging module and a build without messaging simply maintains no escrow. The answers decide
+   * only whether the escrow may be WRITTEN; they can never cause one to be destroyed.
+   */
+  messaging?: MessagingKeyBridge;
 }
+
+export interface MessagingKeyBridge {
+  /** `deriveMessagingIdentity(masterKey).publicKey`, base64. Must not retain the key. */
+  publicKeyFor(masterKey: Bytes): string;
+  /** What `messagingKeys/{uid}` holds, or null when the account has published nothing. */
+  publishedKey(uid: string): Promise<string | null>;
+}
+
+/**
+ * Which vault the account's backup belongs to, as its envelope reports it.
+ *
+ * Deliberately three-valued. The absence of a `vaultId` is not evidence of a mismatch, and
+ * collapsing it into either answer would strand the oldest backups or wave through a genuine
+ * mismatch.
+ */
+type EnvelopeOwner =
+  | { readonly kind: 'this-vault' }
+  | { readonly kind: 'another-vault'; readonly theirs: string; readonly mine: string }
+  | { readonly kind: 'unknown' };
 
 export class BackupService implements BackupServiceContract {
   private readonly backend: CloudBackend;
@@ -108,6 +146,14 @@ export class BackupService implements BackupServiceContract {
   private readonly fs: FileSystem;
   private readonly secureDelete: SecureDelete;
   private readonly kdfParams: KdfParams;
+  private readonly messaging: MessagingKeyBridge | null;
+  /**
+   * Whether the rules have been seen to accept the escrow document, same idea as
+   * {@link vaultIdWritesAccepted} and for the same reason: `users/{uid}/vault/messaging` needs a
+   * rules match that may not be deployed yet, and turning backup on must not start failing the
+   * day this ships. A refusal is absorbed once and not retried for the session.
+   */
+  private escrowWritesAccepted = true;
 
   constructor(options: BackupServiceOptions) {
     this.backend = options.backend;
@@ -121,21 +167,54 @@ export class BackupService implements BackupServiceContract {
     this.secureDelete = options.secureDelete;
     this.kdfParams = options.kdfParams ?? KDF_PRESETS.backup;
     this.owner = options.owner;
+    this.messaging = options.messaging ?? null;
   }
 
   /**
-   * Refuses an operation that would move this device's photos, or the power to unwrap its master
-   * key, into an account that has never held them.
+   * Stops and asks before moving this device's photos, or the power to unwrap its master key, into
+   * an account that has never held them.
    *
-   * Three outcomes, and the middle one is the whole point: a vault nobody has backed up yet is
-   * free to be backed up (there is no other account to disturb), a vault this account already owns
-   * carries on silently, and a vault owned by someone else stops and asks. The caller re-runs with
-   * `confirmedCrossAccount` once the user has said yes.
+   * A vault nobody has backed up yet is free to be backed up -- there is no other account to
+   * disturb -- and a vault this account already owns carries on silently. The interesting case is
+   * everything else, and it used to be settled by {@link VaultOwnerStore} alone, which was wrong in
+   * two directions that both looked like a broken app:
+   *
+   *   - the note holds ONE uid, so a person with two of their own accounts on one phone had it
+   *     rewritten on every backup and was asked to confirm a cross-account transfer every time they
+   *     switched back -- while both accounts' envelopes already named this very vault;
+   *   - a note that would not parse resolved to "owned by someone else", so a damaged byte refused
+   *     every write, with no way past it but to confirm a transfer that was not happening.
+   *
+   * So the note is a cache now and the account's own envelope is the authority. `vaultId` is
+   * derived from the master key and written by whichever vault owns the backup: if it names this
+   * vault, this vault demonstrably owns this account's backup and there is nothing to ask about.
+   * The note is corrected and the write proceeds.
+   *
+   * Only where the cloud CANNOT say -- no envelope yet, an envelope from before `vaultId` existed,
+   * or a read that failed -- does the note get the last word, and then only to ask. It never
+   * refuses on its own: {@link ForeignVaultError} is a question the UI puts to the user, who
+   * answers it with `confirmedCrossAccount`.
+   *
+   * Costs one document read, and only on the path that was about to interrupt somebody. In
+   * `backupNow` that is the same document {@link assertVaultOwnsAccount} reads a moment later; a
+   * second read on a path already stopping to ask a human is not worth a cache that could go stale
+   * between the two.
    */
-  private async assertMayWrite(uid: string, options?: CrossAccountOptions): Promise<void> {
+  private async assertMayWrite(
+    uid: string,
+    keys: VaultKeys,
+    options?: CrossAccountOptions,
+  ): Promise<void> {
     if (options?.confirmedCrossAccount === true) return;
     const ownership = ownershipFor(await this.owner.read(), uid);
-    if (ownership.kind === 'other-account') throw new ForeignVaultError(ownership.ownerUid);
+    if (ownership.kind === 'owned' || ownership.kind === 'unbound') return;
+    if ((await this.envelopeOwner(uid, keys)).kind === 'this-vault') {
+      // The cloud says this vault owns this account's backup. The note was behind; correct it
+      // rather than interrogating the user about a transfer they consented to some time ago.
+      await this.owner.bind(uid, this.clock.now());
+      return;
+    }
+    throw new ForeignVaultError(ownership.kind === 'other-account' ? ownership.ownerUid : null);
   }
 
   /**
@@ -172,31 +251,44 @@ export class BackupService implements BackupServiceContract {
   }
 
   /**
+   * Which vault owns this ACCOUNT's backup, according to the account's own envelope.
+   *
+   * The one fact both write gates are built on, read in one place so they cannot drift apart.
+   * `unknown` covers three situations that mean the same thing here -- no envelope, an envelope
+   * from before `vaultId` existed, and a read that failed -- because none of them is evidence
+   * either way, and treating absence as a mismatch would strand exactly the users with the oldest
+   * backups. Those fall through to `readCloudIndex`, whose decrypt has always been the real proof;
+   * the id only ever lets a refusal come EARLIER and say more.
+   */
+  private async envelopeOwner(uid: string, keys: VaultKeys): Promise<EnvelopeOwner> {
+    let envelope;
+    try {
+      const document = await this.backend.getDocument(BACKUP_PATHS.envelope(uid));
+      if (document === null) return { kind: 'unknown' };
+      envelope = envelopeFromJson(document);
+    } catch {
+      return { kind: 'unknown' };
+    }
+    if (envelope.vaultId === null) return { kind: 'unknown' };
+    const mine = deriveVaultId(keys.masterKey);
+    return envelope.vaultId === mine
+      ? { kind: 'this-vault' }
+      : { kind: 'another-vault', theirs: envelope.vaultId, mine };
+  }
+
+  /**
    * Refuses when this ACCOUNT's backup belongs to a different VAULT.
    *
    * A different question from {@link assertMayWrite}, which asks whether these photos belong in
    * this account. This one asks whether this device can coherently add to what the account already
    * holds, and the two fail for different reasons: one is a question for the user, this one is a
-   * fact about the data.
-   *
-   * An envelope with no `vaultId` is not a mismatch. Every envelope written before the field
-   * existed is in that state, and refusing them would strand exactly the users with the oldest
-   * backups; they fall through to `readCloudIndex`, whose decrypt has always been the real proof.
-   * The id only ever lets the refusal come EARLIER and say more.
+   * fact about the data. It is NOT device state -- a vault id lives in the cloud and travels with
+   * the account -- so it stays exactly as strict as it was.
    */
   private async assertVaultOwnsAccount(uid: string, keys: VaultKeys): Promise<void> {
-    let envelope;
-    try {
-      const document = await this.backend.getDocument(BACKUP_PATHS.envelope(uid));
-      if (document === null) return;
-      envelope = envelopeFromJson(document);
-    } catch {
-      // Unreadable or malformed: say nothing here and let the paths that need it fail honestly.
-      return;
-    }
-    if (envelope.vaultId === null) return;
-    const mine = deriveVaultId(keys.masterKey);
-    if (envelope.vaultId !== mine) throw new VaultIdMismatchError(envelope.vaultId, mine);
+    const owner = await this.envelopeOwner(uid, keys);
+    if (owner.kind !== 'another-vault') return;
+    throw new VaultIdMismatchError(owner.theirs, owner.mine);
   }
 
   async ownership(): Promise<Ownership> {
@@ -220,7 +312,7 @@ export class BackupService implements BackupServiceContract {
     const user = this.requireUser();
     // Before the network too: an envelope hands this account's passphrase the power to unwrap this
     // vault's master key, which is a transfer of reach even though no photo moves.
-    await this.assertMayWrite(user.uid, options);
+    await this.assertMayWrite(user.uid, keys, options);
     const salt = this.random.bytes(SALT_LENGTH);
     const kek = await this.deriveKek(passphrase, salt, this.kdfParams);
     try {
@@ -245,9 +337,178 @@ export class BackupService implements BackupServiceContract {
         vaultId,
       );
       await this.owner.bind(user.uid, this.clock.now());
+      // After the envelope, and deliberately not inside its try: a failure here must never undo
+      // a backup that is now correctly enabled.
+      await this.writeMessagingEscrow(user.uid, keys.masterKey, passphrase);
     } finally {
       zeroBytes(kek);
     }
+  }
+
+  /**
+   * Keeps the account's messaging key recoverable, and -- the whole point -- knows when NOT to.
+   *
+   * ONE RULE: if the account has published a messaging key that this vault's master key does not
+   * produce, this writes nothing at all. That single condition is what makes a rebind safe. A
+   * rebind is by definition a vault adopting an account it did not set up, so the published key is
+   * not this vault's, so this returns before touching anything, and whatever escrow the real
+   * vault left behind survives untouched. There is no branch here that can overwrite a good
+   * escrow with a key that cannot read the account's conversations -- not because the code checks
+   * for a rebind, but because it cannot tell one from any other foreign vault and refuses them
+   * all alike.
+   *
+   * When the keys DO agree, or the account has published nothing yet, the escrow is written or
+   * refreshed. Refreshing matters: changing the recovery passphrase re-wraps the envelope, and an
+   * escrow left under the old passphrase would be a key nobody could reach.
+   *
+   * Best effort throughout. Not having an escrow is the status quo for every account that
+   * predates it; failing to turn backup on would be a regression.
+   */
+  async protectMessagingKey(masterKey: Bytes, passphrase: string): Promise<void> {
+    const user = this.backend.currentUser;
+    if (user === null || passphrase === '') return;
+    try {
+      await this.writeMessagingEscrow(user.uid, masterKey, passphrase);
+    } catch {
+      // Opportunistic. The caller has just finished something that succeeded, and failing to
+      // store a convenience copy of a key must not turn that into an error the user sees.
+    }
+  }
+
+  private async writeMessagingEscrow(
+    uid: string,
+    masterKey: Bytes,
+    passphrase: string,
+  ): Promise<void> {
+    const messaging = this.messaging;
+    if (messaging === null || !this.escrowWritesAccepted) return;
+    let mine: string;
+    let published: string | null;
+    try {
+      mine = messaging.publicKeyFor(masterKey);
+      published = await messaging.publishedKey(uid);
+    } catch {
+      // A lookup that failed proves nothing about whose key is stored, and acting on "unknown"
+      // is exactly how the original bug destroyed data. Say nothing and write nothing.
+      return;
+    }
+    // THE RULE. A foreign vault never writes here.
+    if (published !== null && published !== mine) return;
+
+    const salt = this.random.bytes(SALT_LENGTH);
+    const kek = await this.deriveKek(passphrase, salt, this.kdfParams);
+    try {
+      const wrappedMasterKey = await this.wrapping.wrap(masterKey, kek, AAD.messagingEscrow);
+      await this.backend.putDocument(
+        messagingEscrowPath(uid),
+        escrowToJson({
+          version: 1,
+          salt,
+          kdf: this.kdfParams,
+          wrappedMasterKey,
+          publicKey: mine,
+          createdAt: this.clock.now(),
+        }),
+      );
+    } catch (cause) {
+      if (cause instanceof CloudError && cause.code === 'permission-denied') {
+        // The rules for this path are not deployed yet. Stop asking for the rest of the session.
+        this.escrowWritesAccepted = false;
+        return;
+      }
+      throw cause;
+    } finally {
+      zeroBytes(kek);
+    }
+  }
+
+  /**
+   * The master key that opens this account's MESSAGING, which is not always the one that opens
+   * its photos.
+   *
+   * Tries the escrow first and falls back to the backup envelope, because the envelope is where
+   * the messaging key lives for every account that enabled backup before the escrow existed and
+   * has not been rebound since -- which is most of them, and they must keep working.
+   *
+   * A stale escrow is skipped rather than used: if its `publicKey` is not what the account
+   * publishes, unwrapping it would cost an Argon2id run to produce a key the caller would then
+   * reject. The envelope is tried instead, which for a never-rebound account is the right answer.
+   *
+   * The returned key belongs to the caller, which MUST zero it.
+   */
+  async recoverMessagingKey(passphrase: string): Promise<Bytes> {
+    const uid = this.requireUser().uid;
+    const escrow = await this.readMessagingEscrow(uid);
+    if (escrow === null) traceRecovery('envelope-fallback');
+    if (escrow !== null) {
+      traceRecovery('escrow-read', keyFingerprint(escrow.publicKey));
+      const kek = await this.deriveKek(passphrase, escrow.salt, escrow.kdf);
+      try {
+        return await this.wrapping.unwrap(escrow.wrappedMasterKey, kek, AAD.messagingEscrow);
+      } catch (cause) {
+        if (cause instanceof WrongKeyError) throw new WrongPassphraseError();
+        throw cause;
+      } finally {
+        zeroBytes(kek);
+      }
+    }
+    return this.recoverMasterKey(passphrase);
+  }
+
+  async messagingKeyIsMine(masterKey: Bytes): Promise<boolean> {
+    const messaging = this.messaging;
+    if (messaging === null) return true;
+    let escrow;
+    try {
+      const document = await this.backend.getDocument(messagingEscrowPath(this.requireUser().uid));
+      if (document === null) return true;
+      escrow = escrowFromJson(document);
+    } catch {
+      return true;
+    }
+    try {
+      return escrow.publicKey === messaging.publicKeyFor(masterKey);
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * The escrow worth using, or null.
+   *
+   * Null covers three different situations on purpose -- no document, a damaged one, and one that
+   * does not match what the account publishes -- because the caller does the same thing in all
+   * three: fall back to the envelope and let the public-key check have the final word.
+   */
+  private async readMessagingEscrow(uid: string): Promise<MessagingEscrow | null> {
+    let escrow: MessagingEscrow;
+    try {
+      const document = await this.backend.getDocument(messagingEscrowPath(uid));
+      if (document === null) {
+        traceRecovery('escrow-absent');
+        return null;
+      }
+      escrow = escrowFromJson(document);
+    } catch (cause) {
+      // A refused read and a malformed document are different problems with the same answer --
+      // fall back to the envelope -- and telling them apart in a log is the whole point of this.
+      traceRecovery('escrow-absent', cause instanceof CloudError ? cause.code : 'malformed');
+      return null;
+    }
+    const messaging = this.messaging;
+    if (messaging === null) return escrow;
+    let published: string | null;
+    try {
+      published = await messaging.publishedKey(uid);
+    } catch {
+      // Offline. The escrow is the best thing available and the caller re-checks it anyway.
+      return escrow;
+    }
+    if (published !== null && published !== escrow.publicKey) {
+      traceRecovery('escrow-skipped-stale', keyFingerprint(escrow.publicKey));
+      return null;
+    }
+    return escrow;
   }
 
   /**
@@ -272,7 +533,7 @@ export class BackupService implements BackupServiceContract {
   async backupNow(
     repository: VaultRepository,
     keys: VaultKeys,
-    options?: CrossAccountOptions,
+    options?: BackupSelection,
   ): Promise<BackupReport> {
     const user = this.requireUser();
     if (!(await this.hasEnvelope())) throw new BackupNotEnabledError();
@@ -280,7 +541,7 @@ export class BackupService implements BackupServiceContract {
     // Asked before the cloud index is even read. The index check below proves whether this vault
     // can OPEN this account's backup; this one answers the different question of whether these
     // photos belong in this account, which no key comparison can settle.
-    await this.assertMayWrite(uid, options);
+    await this.assertMayWrite(uid, keys, options);
     // Cheaper and more specific than the index decrypt below, and it works even when the index is
     // missing: one document read, and the refusal names both vaults.
     await this.assertVaultOwnsAccount(uid, keys);
@@ -297,19 +558,154 @@ export class BackupService implements BackupServiceContract {
     // Entries the cloud has and this device does not. Nothing is ever deleted from the cloud here,
     // so these are the ones that would be stranded if the local index simply replaced the remote.
     const localIds = new Set(repository.photos.map((p) => p.id));
-    const carried = (await this.readCloudIndex(uid, keys)).filter(
-      (entry) => !localIds.has(entry.id),
-    );
+    const cloudBefore = await this.readCloudIndex(uid, keys);
+    const carried = cloudBefore.filter((entry) => !localIds.has(entry.id));
 
-    const manifest = await this.backend.getDocument(BACKUP_PATHS.manifest(uid));
-    const skip = new Set<string>(readPhotoIds(manifest));
-    const uploaded = await this.uploadPhotos(repository, repository.photos, uid, skip);
+    // Which of this device's photos this run is for. Omitting `ids` keeps the original
+    // meaning -- the whole vault -- which is what a first backup and every existing spec
+    // expect. Passing them is what makes the Cloud Gallery opt-in: the local gallery is
+    // unlimited and private, and nothing joins the backup without being named here.
+    const wanted = options?.ids === undefined ? null : new Set(options.ids);
+    const chosen =
+      wanted === null ? repository.photos : repository.photos.filter((p) => wanted.has(p.id));
 
-    const merged = sortedNewestFirst([...repository.photos, ...carried]);
+    // What is ALREADY uploaded, which is the question that decides whether a byte moves.
+    //
+    // With a selection in hand this has to come from Storage, not from the manifest. The
+    // manifest lists exactly what the index lists -- they are written together from one list --
+    // so a selection drawn from the index is always a subset of it, every candidate would be
+    // skipped, and an item whose bytes went missing could never be put back. Asking Storage
+    // costs one listing and answers the question actually being asked: which of these is
+    // really there?
+    //
+    // Without a selection the whole vault is the candidate set and the manifest is both cheaper
+    // and sufficient, so that path is left exactly as it was -- down to not paying for a listing
+    // it has no use for, and not reading a manifest the other path never looks at.
+    let skip: Set<string>;
+    let unrepairable = 0;
+    if (wanted === null) {
+      const manifest = await this.backend.getDocument(BACKUP_PATHS.manifest(uid));
+      skip = new Set<string>(readPhotoIds(manifest));
+    } else {
+      skip = await this.idsFullyUploaded(uid);
+      // Named for repair, bytes gone from Storage, and no local copy to put back. Nothing here
+      // can fix one of these, and the report has to say so: a run that uploads nothing because
+      // everything is healthy and a run that uploads nothing because the bytes are lost on both
+      // sides produce the same number and mean opposite things.
+      for (const id of wanted) if (!skip.has(id) && !localIds.has(id)) unrepairable += 1;
+    }
+    const uploaded = await this.uploadPhotos(repository, chosen, uid, skip, options?.onProgress);
+
+    // The index must name exactly what the cloud holds: everything it already had, plus what
+    // this run added. Listing the rest of the vault would claim photos are backed up that were
+    // never uploaded -- and the index is what a restore trusts.
+    const keptById = new Map(cloudBefore.map((entry) => [entry.id, entry]));
+    for (const photo of chosen) keptById.set(photo.id, photo);
+    const merged = sortedNewestFirst([...keptById.values()]);
 
     await this.writeIndexAndManifest(uid, keys, merged);
     await this.owner.bind(uid, this.clock.now());
-    return { uploaded, cloudOnly: carried.length, total: merged.length };
+    return { uploaded, cloudOnly: carried.length, total: merged.length, unrepairable };
+  }
+
+  /**
+   * What this account's backup holds.
+   *
+   * The index IS the record. There is no local list of "what is backed up" to keep in step,
+   * which is the whole reason a Cloud Gallery can be account-scoped without any new state: ask
+   * a different account and you read a different account's index, under a different key.
+   *
+   * A `foreign` answer is not a failure. The index is sealed with the master key of whichever
+   * vault wrote it, so a backup made on another device cannot be listed from here at all. Say
+   * that, rather than returning an empty list that reads as "nothing is backed up".
+   */
+  async cloudContents(keys: VaultKeys): Promise<CloudContents> {
+    const uid = this.requireUser().uid;
+    if (!(await this.hasEnvelope())) return { kind: 'none' };
+    let entries: readonly PhotoEntry[];
+    try {
+      entries = await this.readCloudIndex(uid, keys);
+    } catch (cause) {
+      if (cause instanceof ForeignBackupError) return { kind: 'foreign' };
+      throw cause;
+    }
+    if (entries.length === 0) return { kind: 'none' };
+    return { kind: 'listed', entries, missing: await this.missingFromStorage(uid, entries) };
+  }
+
+  /**
+   * Which of `entries` Storage no longer holds complete, or null when it could not be asked.
+   *
+   * The index says what the user chose; this says which of those choices still have bytes behind
+   * them. BOTH objects have to be there -- a photo with no thumbnail cannot be drawn, a thumbnail
+   * with no photo cannot be restored -- so either one missing makes the entry incomplete.
+   *
+   * A failed listing returns null rather than an empty array, and the difference matters. Offline
+   * is the ordinary reason to fail, and "we could not check" has to stay distinguishable from
+   * "everything is there": reporting the latter would promise a photo is safe at the exact moment
+   * the app has no idea whether it is.
+   */
+  private async missingFromStorage(
+    uid: string,
+    entries: readonly PhotoEntry[],
+  ): Promise<readonly string[] | null> {
+    let present: Set<string>;
+    try {
+      present = await this.idsFullyUploaded(uid);
+    } catch {
+      return null;
+    }
+    return entries.filter((entry) => !present.has(entry.id)).map((entry) => entry.id);
+  }
+
+  /**
+   * One thumbnail out of this account's Storage, decrypted with this vault's thumb key.
+   *
+   * `getBlob`, not `getBlobToFile`: the ciphertext arrives as bytes and the plaintext never
+   * becomes a file. A thumbnail is tens of kilobytes, so there is no reason to involve the disk
+   * and every reason not to.
+   *
+   * The path is built from the signed-in uid, so it is account-scoped by construction -- there
+   * is no id a caller could pass that reaches another account's object.
+   */
+  async readCloudThumbnail(keys: VaultKeys, id: string): Promise<Bytes> {
+    const uid = this.requireUser().uid;
+    const blob = await this.backend.getBlob(BACKUP_PATHS.thumb(uid, id));
+    return this.cipher.decrypt(blob, keys.keyFor(VaultKeyId.thumb), VaultKeyId.thumb);
+  }
+
+  /**
+   * Takes ids out of the cloud. Nothing local is touched, read, or even opened.
+   *
+   * The index shrinks BEFORE the blobs go. Crashing between the two leaves objects nothing
+   * points at -- invisible, and swept by `disable` -- whereas the other order would leave the
+   * index naming photos that are already gone, and a restore trusts the index.
+   *
+   * A blob that has already vanished is not an error: the end state is what was asked for.
+   */
+  async removeFromCloud(keys: VaultKeys, ids: readonly string[]): Promise<number> {
+    const uid = this.requireUser().uid;
+    if (ids.length === 0) return 0;
+    const wanted = new Set(ids);
+    // Throws ForeignBackupError when this vault did not write the index, which is right: an
+    // account whose backup belongs to another vault must not have entries removed from it.
+    const before = await this.readCloudIndex(uid, keys);
+    const kept = before.filter((entry) => !wanted.has(entry.id));
+    const removed = before.length - kept.length;
+    if (removed === 0) return 0;
+
+    await this.writeIndexAndManifest(uid, keys, kept);
+    for (const entry of before) {
+      if (!wanted.has(entry.id)) continue;
+      for (const path of [BACKUP_PATHS.photo(uid, entry.id), BACKUP_PATHS.thumb(uid, entry.id)]) {
+        try {
+          await this.backend.deleteBlob(path);
+        } catch {
+          // Already gone, or gone by another device. Either way the index no longer names it.
+        }
+      }
+    }
+    return removed;
   }
 
   /**
@@ -334,6 +730,7 @@ export class BackupService implements BackupServiceContract {
     keys: VaultKeys,
     passphrase: string,
     ids: readonly string[],
+    onProgress?: BackupProgress,
   ): Promise<void> {
     const uid = this.requireUser().uid;
     // ONLY this account's own photos. `ids` comes from the cloud index that was just restored, so
@@ -344,7 +741,7 @@ export class BackupService implements BackupServiceContract {
     const entries = repository.photos.filter((photo) => wanted.has(photo.id));
     // Nothing is skipped within that set: every blob is rewritten, because the old ones are under
     // the old key.
-    await this.uploadPhotos(repository, entries, uid, new Set());
+    await this.uploadPhotos(repository, entries, uid, new Set(), onProgress);
     await this.writeIndexAndManifest(uid, keys, sortedNewestFirst([...entries]));
     // Last, so the envelope only ever claims a key the rest of the account is already using. The
     // user reached here through an explicit confirmation, so the cross-account gate is satisfied.
@@ -363,7 +760,13 @@ export class BackupService implements BackupServiceContract {
     entries: readonly PhotoEntry[],
     uid: string,
     skip: Set<string>,
+    onProgress?: BackupProgress,
   ): Promise<number> {
+    // Counted BEFORE the loop, because `skip` grows inside it. The total is how many of these
+    // entries still need uploading, not how many were offered -- a bar that counted the skipped
+    // ones would sit at a third full and never move.
+    const total = entries.reduce((count, entry) => (skip.has(entry.id) ? count : count + 1), 0);
+    onProgress?.(0, total);
     let uploaded = 0;
     for (const entry of entries) {
       const id = entry.id;
@@ -387,6 +790,7 @@ export class BackupService implements BackupServiceContract {
       );
       skip.add(id);
       uploaded += 1;
+      onProgress?.(uploaded, total);
     }
     return uploaded;
   }
@@ -549,6 +953,7 @@ export class BackupService implements BackupServiceContract {
     repository: VaultRepository,
     keys: VaultKeys,
     backupMaster: Bytes,
+    onProgress?: BackupProgress,
   ): Promise<RestoreReport> {
     const uid = this.requireUser().uid;
     const source = deriveVaultKeys(backupMaster);
@@ -560,42 +965,67 @@ export class BackupService implements BackupServiceContract {
       const cloudIds = entries.map((entry) => entry.id);
       let restored = 0;
       let skipped = 0;
+      /**
+       * Ids the index listed whose bytes Storage does not have.
+       *
+       * Collected rather than counted, because they have to come out of `cloudIds`: a rebind
+       * can only re-upload what is on this device, and these are precisely what is not.
+       */
+      const lost: string[] = [];
+
+      const total = entries.length;
+      onProgress?.(0, total);
 
       // Oldest first, matching `restoreInto`: an interrupted run leaves the newest still to come
       // rather than a random subset.
       for (const entry of [...entries].reverse()) {
-        if (existing.has(entry.id)) {
-          skipped += 1;
-          continue;
-        }
+        // `finally` rather than a call before each `continue`: both early exits below are items
+        // that are done with, and a bar that stopped counting them would stall on a backup whose
+        // photos are mostly already on this device.
         try {
-          const thumbnailBlob = await this.recrypt(
-            await this.backend.getBlob(BACKUP_PATHS.thumb(uid, entry.id)),
-            source,
-            keys,
-            VaultKeyId.thumb,
-          );
-          if (isVideo(entry)) {
-            await this.recryptVideoInto(repository, uid, entry, thumbnailBlob, source, keys);
-          } else {
-            const photoBlob = await this.recrypt(
-              await this.backend.getBlob(BACKUP_PATHS.photo(uid, entry.id)),
-              source,
-              keys,
-              payloadKeyId(entry),
-            );
-            await repository.importEncrypted({ entry, photoBlob, thumbnailBlob });
-          }
-          restored += 1;
-        } catch (cause) {
-          if (cause instanceof CloudError && cause.code === 'object-not-found') {
+          if (existing.has(entry.id)) {
+            // Already in this vault: nothing to download, and nothing lost.
             skipped += 1;
             continue;
           }
-          throw cause;
+          try {
+            const thumbnailBlob = await this.recrypt(
+              await this.backend.getBlob(BACKUP_PATHS.thumb(uid, entry.id)),
+              source,
+              keys,
+              VaultKeyId.thumb,
+            );
+            if (isVideo(entry)) {
+              await this.recryptVideoInto(repository, uid, entry, thumbnailBlob, source, keys);
+            } else {
+              const photoBlob = await this.recrypt(
+                await this.backend.getBlob(BACKUP_PATHS.photo(uid, entry.id)),
+                source,
+                keys,
+                payloadKeyId(entry),
+              );
+              await repository.importEncrypted({ entry, photoBlob, thumbnailBlob });
+            }
+            restored += 1;
+          } catch (cause) {
+            if (cause instanceof CloudError && cause.code === 'object-not-found') {
+              // The index says this photo was uploaded and Storage disagrees. Not a skip: there
+              // is no copy of it anywhere now, and only the report can say so.
+              lost.push(entry.id);
+              continue;
+            }
+            throw cause;
+          }
+        } finally {
+          onProgress?.(restored + skipped + lost.length, total);
         }
       }
-      return { restored, skipped, cloudIds };
+      return {
+        restored,
+        skipped,
+        missing: lost.length,
+        cloudIds: cloudIds.filter((id) => !lost.includes(id)),
+      };
     } finally {
       source.dispose();
     }
@@ -667,12 +1097,16 @@ export class BackupService implements BackupServiceContract {
    * recovered master key. Blobs the repository cannot authenticate are rejected by
    * `importEncrypted`, so a tampered cloud object cannot be planted in the vault.
    */
-  async restoreInto(repository: VaultRepository, keys: VaultKeys): Promise<RestoreReport> {
+  async restoreInto(
+    repository: VaultRepository,
+    keys: VaultKeys,
+    onProgress?: BackupProgress,
+  ): Promise<RestoreReport> {
     const user = this.requireUser();
     const uid = user.uid;
 
     const indexBlob = await this.fetchIndexBlob(uid);
-    if (indexBlob === null) return { restored: 0, skipped: 0, cloudIds: [] };
+    if (indexBlob === null) return { restored: 0, skipped: 0, missing: 0, cloudIds: [] };
 
     const json = await this.cipher.decrypt(
       indexBlob,
@@ -689,32 +1123,52 @@ export class BackupService implements BackupServiceContract {
     const existing = new Set(repository.photos.map((p) => p.id));
     let restored = 0;
     let skipped = 0;
+    /** As in {@link restoreForeignInto}: listed, but not in Storage, so not on this device. */
+    const lost: string[] = [];
+
+    const total = index.photos.length;
+    onProgress?.(0, total);
 
     // Oldest first, so an interrupted restore leaves the newest photos still to come rather than
     // a random subset.
     for (const entry of [...index.photos].reverse()) {
-      if (existing.has(entry.id)) {
-        skipped += 1;
-        continue;
-      }
+      // `finally` rather than a call before each `continue`: both early exits below are items
+      // that are done with, and a bar that stopped counting them would stall on a backup whose
+      // photos are mostly already here.
       try {
-        const thumbnailBlob = await this.backend.getBlob(BACKUP_PATHS.thumb(uid, entry.id));
-        if (isVideo(entry)) {
-          await this.restoreVideo(repository, uid, entry, thumbnailBlob);
-        } else {
-          const photoBlob = await this.backend.getBlob(BACKUP_PATHS.photo(uid, entry.id));
-          await repository.importEncrypted({ entry, photoBlob, thumbnailBlob });
-        }
-        restored += 1;
-      } catch (cause) {
-        if (cause instanceof CloudError && cause.code === 'object-not-found') {
+        if (existing.has(entry.id)) {
+          // Already in this vault: nothing to download, and nothing lost.
           skipped += 1;
           continue;
         }
-        throw cause;
+        try {
+          const thumbnailBlob = await this.backend.getBlob(BACKUP_PATHS.thumb(uid, entry.id));
+          if (isVideo(entry)) {
+            await this.restoreVideo(repository, uid, entry, thumbnailBlob);
+          } else {
+            const photoBlob = await this.backend.getBlob(BACKUP_PATHS.photo(uid, entry.id));
+            await repository.importEncrypted({ entry, photoBlob, thumbnailBlob });
+          }
+          restored += 1;
+        } catch (cause) {
+          if (cause instanceof CloudError && cause.code === 'object-not-found') {
+            // Counted apart from `skipped`. This is the fresh-device path, where the vault
+            // starts empty and every skip would otherwise be a loss wearing a reassuring name.
+            lost.push(entry.id);
+            continue;
+          }
+          throw cause;
+        }
+      } finally {
+        onProgress?.(restored + skipped + lost.length, total);
       }
     }
-    return { restored, skipped, cloudIds: index.photos.map((entry) => entry.id) };
+    return {
+      restored,
+      skipped,
+      missing: lost.length,
+      cloudIds: index.photos.map((entry) => entry.id).filter((id) => !lost.includes(id)),
+    };
   }
 
   /**
@@ -773,6 +1227,29 @@ export class BackupService implements BackupServiceContract {
   }
 
   /**
+   * The ids whose backup is actually complete in Storage right now.
+   *
+   * Complete means BOTH objects: an item with a photo but no thumbnail is half-uploaded, and
+   * treating it as done would leave the Cloud Gallery listing something it cannot draw. An
+   * interrupted upload is the ordinary way that happens.
+   *
+   * This is the only source of truth for whether bytes are present. The index says what the
+   * user CHOSE; Storage says what survived.
+   */
+  private async idsFullyUploaded(uid: string): Promise<Set<string>> {
+    const strip = (name: string): string => (name.endsWith('.enc') ? name.slice(0, -4) : name);
+    const photos = new Set(
+      (await this.backend.listBlobs(BACKUP_PATHS.photosPrefix(uid))).map(strip),
+    );
+    const thumbs = new Set(
+      (await this.backend.listBlobs(BACKUP_PATHS.thumbsPrefix(uid))).map(strip),
+    );
+    const complete = new Set<string>();
+    for (const id of photos) if (thumbs.has(id)) complete.add(id);
+    return complete;
+  }
+
+  /**
    * Every object filed under the account, found by sweeping its prefix rather than by rebuilding a
    * list of names from the index. A blob whose index entry was lost is exactly the blob a
    * name-driven delete would walk past, and it is also the one nobody will ever come back for.
@@ -821,6 +1298,9 @@ export class BackupService implements BackupServiceContract {
     // First, so that an interrupted delete can never leave a key-mismatched envelope standing.
     await this.backend.deleteDocument(BACKUP_PATHS.envelope(uid));
     await this.backend.deleteDocument(BACKUP_PATHS.manifest(uid));
+    // The messaging key goes with the rest of the account's data. Turning backup off is the one
+    // explicit, confirmed, total erasure, and leaving a wrapped key behind would make it a lie.
+    await this.backend.deleteDocument(messagingEscrowPath(uid));
     // Named explicitly as well as swept: deleting it is the one thing that must not depend on a
     // listing succeeding, because the index is what makes every other blob findable.
     await this.backend.deleteBlob(BACKUP_PATHS.index(uid));

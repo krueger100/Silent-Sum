@@ -45,6 +45,7 @@ import { Avatar } from '@/messaging/screens/Avatar';
 import { AttachSheet, type AttachSource } from '@/messaging/screens/AttachSheet';
 import { MediaBubble } from '@/messaging/screens/MediaBubble';
 import { MediaViewer, type ViewerItem } from '@/messaging/screens/MediaViewer';
+import { RecoverMessagingPanel } from '@/messaging/screens/RecoverMessagingPanel';
 import { VaultPickerSheet } from '@/messaging/screens/VaultPickerSheet';
 import { VaultSendNotice } from '@/messaging/vaultSendNotice';
 import { CameraSheet, type CameraCapture } from '@/camera/CameraSheet';
@@ -91,6 +92,11 @@ export function ConversationScreen({
   const [sending, setSending] = useState(false);
   const marked = useRef(false);
 
+  // Recovering the account's identity writes nothing to the server, so no snapshot arrives to
+  // re-emit this thread. `MessagingService` notifies its open watchers instead -- re-deriving
+  // this conversation's keys and emitting again -- which is why there is no counter here and no
+  // re-subscribe. One mechanism, and it serves the conversation LIST equally, which a counter
+  // living in this file never could.
   useEffect(() => {
     const stop = messaging.watchConversation(conversationId, setState);
     return stop;
@@ -579,6 +585,16 @@ export function ConversationScreen({
                 label="See plans"
                 variant="secondary"
                 onPress={onPlans}
+              />
+            ) : null}
+            {state.sendBlocked === 'foreign-vault' ? (
+              <RecoverMessagingPanel
+                onRecovered={() => {
+                  // The service re-derives this thread's keys and re-emits on its own now, so
+                  // this only has to let the read marker run again against messages that have
+                  // become readable.
+                  marked.current = false;
+                }}
               />
             ) : null}
           </View>

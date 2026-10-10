@@ -39,6 +39,16 @@ function masterKey(seed: number): Uint8Array {
   return bytes;
 }
 
+/**
+ * The vault keys a given master key yields, for a test that opens one account on a second vault.
+ *
+ * Deliberately the same `masterKey` the harness unlocks with, so a test can ask for a seed it did
+ * NOT join with and get a vault that is genuinely foreign to the published messaging key.
+ */
+export function vaultKeysFor(seed: number): ReturnType<typeof deriveVaultKeys> {
+  return deriveVaultKeys(masterKey(seed));
+}
+
 export interface Account {
   readonly services: Services;
   readonly cloud: InMemoryCloudBackend;

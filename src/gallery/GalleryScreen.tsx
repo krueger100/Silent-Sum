@@ -19,9 +19,11 @@ import { useServices, usePhotos, useVaultState } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles } from '@/app/theme';
 import { wipeLocalVault } from '@/auth/vaultWipe';
 import { FREE_TIER, MAX_ITEM_BYTES, type GateReason } from '@/billing/entitlements';
+import { describeCloudError } from '@/backup/screens/cloudErrors';
 import { VaultUpsellDialog } from '@/billing/screens/VaultUpsellDialog';
 import { Button } from '@/components/Button';
 import { ConfirmDialog, TypedConfirmDialog } from '@/components/Dialog';
+import { ProgressBar } from '@/components/ProgressBar';
 import { Paragraph, Screen } from '@/components/Screen';
 import { gridColumns } from '@/gallery/gridColumns';
 import { ImportService, type ImportReport } from '@/gallery/importService';
@@ -76,6 +78,16 @@ export function GalleryScreen({
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [confirmingErase, setConfirmingErase] = useState(false);
   const [busy, setBusy] = useState(false);
+  /**
+   * What the operation in flight has finished. Null while something is running that cannot be
+   * counted yet -- the picker is open, or the selection has not come back from it -- which is a
+   * real phase and shows as an indeterminate bar rather than an invented percentage.
+   */
+  const [progress, setProgress] = useState<{
+    readonly verb: string;
+    readonly done: number;
+    readonly total: number;
+  } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   // The camera is a sheet over this screen, not a separate route: a capture is reviewed and kept
   // or discarded without ever leaving the gallery.
@@ -145,10 +157,12 @@ export function GalleryScreen({
     setBusy(true);
     void (async () => {
       try {
-        const report = await importService.importFromLibrary(
-          target,
-          room === undefined ? {} : { selectionLimit: room },
-        );
+        const report = await importService.importFromLibrary(target, {
+          ...(room === undefined ? {} : { selectionLimit: room }),
+          onProgress: (done, total) => {
+            if (mounted.current) setProgress({ verb: 'Importing', done, total });
+          },
+        });
         if (!mounted.current) return;
         if (report.imported + report.failed + report.oversized + report.overLimit > 0) {
           const plural = report.imported === 1 ? '' : 's';
@@ -173,7 +187,10 @@ export function GalleryScreen({
         // The reason is deliberately not surfaced or logged: it can carry a file path.
         if (mounted.current) setNotice('Import failed.');
       } finally {
-        if (mounted.current) setBusy(false);
+        if (mounted.current) {
+          setBusy(false);
+          setProgress(null);
+        }
       }
     })();
   }, [busy, importService, services]);
@@ -184,11 +201,66 @@ export function GalleryScreen({
     setConfirmingDelete(false);
     clearSelection();
     if (target === null || ids.length === 0) return;
+    // Busy was never set here, so deleting a long selection looked like nothing had happened:
+    // secure erasure overwrites every file before unlinking it, and a page of videos takes real
+    // seconds. It also stops a second tap starting a second delete across the first.
+    setBusy(true);
     void (async () => {
       try {
-        await target.deletePhotos(ids);
+        await target.deletePhotos(ids, (done, total) => {
+          if (mounted.current) setProgress({ verb: 'Deleting', done, total });
+        });
       } catch {
         if (mounted.current) setNotice('Some photos could not be deleted.');
+      } finally {
+        if (mounted.current) {
+          setBusy(false);
+          setProgress(null);
+        }
+      }
+    })();
+  }, [clearSelection, selectedIds, services]);
+
+  /**
+   * Puts the chosen photos in the cloud, and nothing else.
+   *
+   * This is the ONLY way anything reaches the backup. The Local Gallery is unlimited and
+   * private: importing a photo, taking one, or opening one never uploads it. A photo is in the
+   * cloud because the user named it here, which is why the ids go with the call rather than the
+   * service reading the vault for itself.
+   *
+   * Signed out there is no account to put anything in, and saying so beats a generic failure.
+   */
+  const backupSelected = useCallback(() => {
+    const ids = [...selectedIds];
+    const target = openRepository(services);
+    const backup = services.backup;
+    const cloud = services.firebase.cloud;
+    clearSelection();
+    if (target === null || ids.length === 0) return;
+    if (backup === null || cloud === null) {
+      setNotice('Cloud backup is not available in this build.');
+      return;
+    }
+    if (cloud.currentUser === null) {
+      setNotice('Sign in under Settings to back photos up. They stay on this device until you do.');
+      return;
+    }
+    setBusy(true);
+    void (async () => {
+      try {
+        const report = await backup.backupNow(target, services.session.requireKeys(), { ids });
+        if (!mounted.current) return;
+        const plural = report.uploaded === 1 ? '' : 's';
+        setNotice(
+          report.uploaded === 0
+            ? 'Those photos were already in the cloud.'
+            : `Backed up ${String(report.uploaded)} photo${plural}.`,
+        );
+      } catch (cause) {
+        if (mounted.current) setNotice(describeCloudError(cause));
+      } finally {
+        if (mounted.current) setBusy(false);
       }
     })();
   }, [clearSelection, selectedIds, services]);
@@ -247,6 +319,12 @@ export function GalleryScreen({
         onPress={selectAll}
       />
       <HeaderAction
+        testID="gallery-backup-cloud"
+        label="Back up to Cloud"
+        glyph="Cloud"
+        onPress={backupSelected}
+      />
+      <HeaderAction
         testID="gallery-delete"
         label="Delete"
         glyph="Delete"
@@ -280,6 +358,20 @@ export function GalleryScreen({
           {notice}
         </Text>
       )}
+
+      {busy ? (
+        <ProgressBar
+          testID="gallery-progress"
+          {...(progress === null
+            ? {}
+            : { value: progress.total === 0 ? 1 : progress.done / progress.total })}
+          {...(progress === null || progress.total === 0
+            ? {}
+            : {
+                label: `${progress.verb} ${String(progress.done)} of ${String(progress.total)}`,
+              })}
+        />
+      ) : null}
 
       {vaultState.unreadable ? (
         <UnreadableVault

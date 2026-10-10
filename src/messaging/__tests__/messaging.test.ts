@@ -215,13 +215,30 @@ describe('parsing', () => {
   });
 
   it('keeps only a published key that has one', () => {
+    // No `previous` on a document written before the field existed, which is not an error: it
+    // means the account has never rotated, so the current key is the only one there has been.
     expect(parsePublishedKey(A, { publicKey: 'cHVi', updatedAt: 3 })).toEqual({
       uid: A,
       publicKey: 'cHVi',
+      previous: [],
       updatedAt: 3,
     });
     expect(parsePublishedKey(A, null)).toBeNull();
     expect(parsePublishedKey(A, { publicKey: '' })).toBeNull();
+  });
+
+  it('keeps the retired keys, and drops anything in them that is not one', () => {
+    expect(
+      parsePublishedKey(A, {
+        publicKey: 'bmV3',
+        previous: ['b2xk', '', 7, null, 'b2xkZXI='],
+        updatedAt: 3,
+      }),
+    ).toEqual({ uid: A, publicKey: 'bmV3', previous: ['b2xk', 'b2xkZXI='], updatedAt: 3 });
+    // A history that is not a list at all is read as none, rather than failing the whole document
+    // and taking the current key with it.
+    expect(parsePublishedKey(A, { publicKey: 'bmV3', previous: 'nope', updatedAt: 3 })?.previous)
+      .toEqual([]);
   });
 
   it('sorts newest first, with a stable tie-break', () => {

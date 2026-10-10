@@ -98,10 +98,13 @@ describe('RestoreFlowScreen', () => {
     await runFlow(NEW_PIN, PASSPHRASE);
 
     await waitFor(() => {
-      expect(screen.getByTestId('restore_summary')).toHaveTextContent(
-        /Restored 2 photos, skipped 0 photos/,
-      );
+      expect(screen.getByTestId('restore_summary')).toHaveTextContent(/Restored 2 photos\./);
     });
+    // Nothing was skipped and nothing was lost, so neither is mentioned. A zero printed as
+    // "skipped 0 photos" was only clumsy; the clause that wording replaced also reported LOST
+    // photos in the language of safety, which was not.
+    expect(screen.getByTestId('restore_summary')).not.toHaveTextContent(/already in this vault/);
+    expect(screen.getByTestId('restore_summary')).not.toHaveTextContent(/no longer in the cloud/);
 
     expect(await harness.services.auth.isConfigured()).toBe(true);
     // Still locked while the summary is on screen. Unlocking here would swap the navigator's

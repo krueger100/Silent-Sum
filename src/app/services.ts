@@ -9,6 +9,8 @@
 import { PinAuthService } from '@/auth/pinAuthService';
 import { VaultSession } from '@/auth/vaultSession';
 import { BackupService } from '@/backup/backupService';
+import { CloudThumbnails } from '@/backup/cloudThumbnails';
+import { base64Encode } from '@/utils/base64';
 import { VaultOwnerStore } from '@/backup/vaultOwner';
 import type { BillingService } from '@/billing/billingService';
 import { EntitlementsController } from '@/billing/entitlementsController';
@@ -41,6 +43,7 @@ import { RecoveryAccess } from '@/support/recoveryAccess';
 import { readRecoveryPublicKey } from '@/support/recoveryConfig';
 import { HiddenMessages } from '@/messaging/hiddenMessages';
 import { deriveMessagingIdentity, type MessagingIdentity } from '@/messaging/identity';
+import { MESSAGING_PATHS, parsePublishedKey } from '@/messaging/messaging';
 import { MessagingService } from '@/messaging/messagingService';
 import { SupportChatService } from '@/support/chat/supportChatService';
 import type { SupportService } from '@/support/types';
@@ -115,6 +118,14 @@ export interface Services {
   readonly recovery: RecoveryAccess;
   /** Null when Firebase has no cloud backend, i.e. backup cannot be offered at all. */
   readonly backup: BackupService | null;
+  /**
+   * Thumbnails for Cloud Gallery tiles whose photo this device no longer holds.
+   *
+   * Always present; without a cloud backend every read fails and the tiles stay as they are. It
+   * is a service rather than screen state because the plaintext it holds must go when the vault
+   * locks, and that is decided here, not by a screen remembering to tidy up.
+   */
+  readonly cloudThumbnails: CloudThumbnails;
   /**
    * Purchases. Null when this build cannot sell anything (no cloud backend, or billing switched
    * off), in which case every Pro gate stays open and the plans screen says so.
@@ -311,7 +322,35 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
           fs,
           secureDelete,
           owner: new VaultOwnerStore(secureStore),
+          // Two pure questions, so backup can keep the account's messaging key recoverable
+          // without importing the messaging module or being able to touch `messagingKeys`.
+          messaging: {
+            publicKeyFor: (masterKey) => {
+              const derived = deriveMessagingIdentity(masterKey);
+              try {
+                return base64Encode(derived.publicKey);
+              } finally {
+                derived.dispose();
+              }
+            },
+            publishedKey: async (uid) => {
+              const cloud = firebase.cloud;
+              if (cloud === null) return null;
+              const document = await cloud.getDocument(MESSAGING_PATHS.publicKey(uid));
+              return parsePublishedKey(uid, document)?.publicKey ?? null;
+            },
+          },
         });
+
+  const cloudThumbnails = new CloudThumbnails({
+    backup: () => backup,
+    uid: () => firebase.cloud?.currentUser?.uid ?? null,
+  });
+  // Plaintext for photos that are not even on this device. Locking is the app deciding nobody is
+  // trusted right now, and that has to include these.
+  session.onLock(() => {
+    cloudThumbnails.clear();
+  });
 
   return {
     clock,
@@ -341,6 +380,7 @@ export function createServices(overrides: ServiceOverrides = {}): Services {
     support,
     recovery,
     backup,
+    cloudThumbnails,
     billing,
     entitlements,
     supportChat,

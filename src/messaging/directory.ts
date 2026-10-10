@@ -10,10 +10,11 @@ export type DirectoryErrorCode =
   | 'unauthenticated'
   /**
    * The server refused because this build could not prove it is genuine -- App Check got no
-   * token. Indistinguishable from `unauthenticated` on the wire, because neither case sends one;
-   * the client separates them by whether it holds a signed-in user. Kept apart because telling a
-   * signed-in user to sign in is both wrong and unactionable, and the real remedy (update Play
-   * Store, or install from the store) is something they can actually do.
+   * token, or the one it sent was rejected. Indistinguishable from `unauthenticated` on the
+   * wire, because the server saw neither token and says so the same way either time. The
+   * client knows which it actually attached, so this is now read from that rather than guessed
+   * from sign-in state. Kept apart because telling a signed-in user to sign in is both wrong
+   * and unactionable, and the real remedy is something they can do.
    */
   | 'attestation'
   | 'pro-required'
@@ -21,6 +22,14 @@ export type DirectoryErrorCode =
   | 'invalid-email'
   /** Only from the reverse lookup: you may not ask about someone you are not talking to. */
   | 'not-a-correspondent'
+  /**
+   * The request never got an answer: no connection, DNS, TLS, or our own timeout. Separated
+   * from `unavailable` because the user can act on it and because collapsing the two is what
+   * let a deployment problem and a dropped connection wear the same sentence.
+   */
+  | 'offline'
+  /** The server answered, but with something this client did not expect: a 404, a 500, a body */
+  /** that is not the callable protocol. A configuration fault, not a user one. */
   | 'unavailable';
 
 export class DirectoryError extends Error {
@@ -47,8 +56,10 @@ export function describeDirectoryError(code: DirectoryErrorCode): string {
       return 'That is not an e-mail address.';
     case 'not-a-correspondent':
       return 'You are not in a conversation with that account.';
+    case 'offline':
+      return 'Could not reach the server. Check your connection and try again.';
     case 'unavailable':
-      return 'Could not reach the server. Try again.';
+      return 'The server did not answer as expected. Try again shortly.';
   }
 }
 
@@ -56,11 +67,15 @@ export interface Directory {
   /** The account id for exactly this address, or null when nobody has it. */
   findByEmail(email: string): Promise<string | null>;
   /**
-   * The address of an account already in a conversation with this one, or null.
+   * The address of an account already in a conversation with this one, or null when the server
+   * answered and has none.
    *
    * The opposite direction, and a different gate: no Pro, because receiving never needs it, but
    * the server answers only for a correspondent. Best effort by design -- the caller uses it to
    * put a name on a row, and a row with an account id on it is a worse screen, not a broken one.
+   *
+   * A refusal throws {@link DirectoryError} rather than returning null, so the caller can tell
+   * "there is no address" from "we did not get to ask" and retry only the second.
    */
   emailForUid(uid: string): Promise<string | null>;
 }

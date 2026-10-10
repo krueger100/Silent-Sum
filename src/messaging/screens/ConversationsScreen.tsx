@@ -30,6 +30,7 @@ import { Button } from '@/components/Button';
 import { ConfirmDialog } from '@/components/Dialog';
 import { KeyboardAvoider } from '@/components/keyboardAvoidance';
 import { Paragraph, Screen } from '@/components/Screen';
+import { RecoverMessagingPanel } from '@/messaging/screens/RecoverMessagingPanel';
 import { looksLikeEmail } from '@/messaging/messaging';
 import {
   EMPTY_MESSAGING_STATE,
@@ -133,6 +134,40 @@ export function ConversationsScreen({
             </Text>
           </View>
         )}
+
+        {/*
+          The account's messaging key is not this vault's, which is a fact about the ACCOUNT and
+          not about any one thread. It used to be shown only inside a conversation, underneath the
+          messages it had just failed to open -- so somebody signing into their other account met a
+          list that looked perfectly healthy, opened a thread, found everything unreadable, and was
+          given no reason to think one passphrase would fix the lot. It is asked for here instead,
+          once, before any of that.
+        */}
+        {state.foreignVault ? (
+          <View style={styles.banner} testID="messages_foreign_vault">
+            <Text style={styles.bannerText}>
+              These conversations were set up by a different vault, so this device cannot open them
+              yet. Your recovery passphrase for this account unlocks all of them at once.
+            </Text>
+            <RecoverMessagingPanel onRecovered={() => undefined} />
+          </View>
+        ) : null}
+
+        {/*
+          Not an error, and deliberately not offered a passphrase field. The panel above recovers
+          from this account's backup envelope, which is what produced this older key in the first
+          place; putting one here would loop the user through the same words for the same result.
+          The current key is on whichever device still holds it.
+        */}
+        {state.historicalIdentity ? (
+          <View style={styles.banner} testID="messages_historical_identity">
+            <Text style={styles.bannerText}>
+              This vault holds an older messaging key for this account. Conversations sealed under
+              that key open here. Sending is off, because the device holding the current key would
+              never be able to read what you sent.
+            </Text>
+          </View>
+        ) : null}
 
         {state.canMessage ? null : (
           <View style={styles.banner} testID="messages_pro_required">
