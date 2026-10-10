@@ -127,6 +127,66 @@ Two things the rule must keep doing:
 - **Cover `messages/` wholly**, so `photo/`, `video/` and `thumb/` expire together. A preview that
   outlives its media is the failure this design exists to avoid.
 
+## Lapsed Cloud backups: Autoclass (added 2026-10-10, NOT YET APPLIED)
+
+A Cloud term lapses and the backup stays. Storage writes already require `cloudActive`, so a
+lapsed account cannot add anything — but nothing removes what is there, `users/` has no lifecycle
+rule by design, and no function reclaims anything. The result is a bill that only ever grows
+against revenue that has stopped.
+
+The size of it, at roughly $0.023/GB-month: a lapsed 100 GB account costs about $2.30 every
+month, for ever, having paid ₱99 once. Against a Cloud price that nets $1.54, that single account
+is a permanent loss, and nothing bounds how many of them there are.
+
+**The fix is Autoclass, and deliberately NOT deletion.** For some users the cloud copy is the only
+copy, and we cannot warn them before destroying it: `SILENTSUM_SUPPORT_FROM` is Resend's shared
+test sender, which delivers only to the Resend account's own address, so there is no channel to a
+user who has stopped opening the app. Deleting data you cannot give notice about is not a cost
+measure, it is a liability.
+
+Autoclass moves each object down — Standard, Nearline, Coldline, Archive — as it goes unread, and
+back to Standard the moment it is read. For a backup that is exactly right: written once, read
+only on a restore. A lapsed account's data descends to Archive on its own and costs roughly a
+twentieth of Standard; an active subscriber who restores pulls it back, and **pays no retrieval
+fee**, because Autoclass waives retrieval and early-deletion charges. Hand-tuned lifecycle
+tiering would save about as much and charge for every restore.
+
+It costs a management fee per object per month (about $0.0025 per 1,000). At the manifest's
+20,000-item ceiling that is about $0.05 a month, against several dollars saved.
+
+**THE TRAP, and the reason this is written down.** Autoclass and `SetStorageClass` lifecycle rules
+are mutually exclusive: enabling Autoclass disables `SetStorageClass`, and adding such a rule
+later is the thing that would silently undo this. `storage-lifecycle.json` must therefore stay
+**delete-only**. Its `messages/` delete rule is unaffected and keeps working — delete rules are
+the one kind Autoclass permits. If a future change wants age-based tiering, it has to choose:
+that, or Autoclass, never both.
+
+**Inspect before enabling.** Enabling is not free on existing objects: it can trigger one-time
+retrieval, early-deletion and Class A charges for what is already there. On a small bucket that is
+noise; look first rather than assume it still is.
+
+```
+gcloud storage buckets describe gs://silentsum-vault-eevee-mate \
+  --format="default(autoclass,lifecycle,storageClass)"
+gcloud storage du --summarize gs://silentsum-vault-eevee-mate/users/
+```
+
+Then, and note this touches only SilentSum's own bucket — never `eevee-mate.appspot.com`, which
+is EVPAL's:
+
+```
+gcloud storage buckets update gs://silentsum-vault-eevee-mate --enable-autoclass
+gcloud storage buckets describe gs://silentsum-vault-eevee-mate --format="default(autoclass)"
+```
+
+gcloud is not installed on the development machine, so this is also the console path:
+Cloud Storage → `silentsum-vault-eevee-mate` → Configuration → Autoclass → Enable.
+
+Afterwards the lifecycle rule set must still contain the `messages/` delete rule and nothing
+else; check with the `describe` above.
+
+    Enabled: (not yet -- awaiting a run on a machine with gcloud, or the console)
+
 ## Support relay (added 2026-09-26)
 
 `silentsumSupportRelay` is the app's customer-service form. It replaced a direct call to Resend that
