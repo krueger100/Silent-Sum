@@ -22,7 +22,14 @@ import { useEntitlements, useServices } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
 import type { BillingService } from '@/billing/billingService';
 import { cloudActive, deriveCloudState, type Entitlements } from '@/billing/entitlements';
-import { CLOUD_TERM_DAYS, PLANS_TITLE, PRODUCTS, type ProductId } from '@/billing/products';
+import {
+  CLOUD_TERM_DAYS,
+  PLANS_TITLE,
+  PRODUCTS,
+  pesoNote,
+  usdPrice,
+  type ProductId,
+} from '@/billing/products';
 import { describeBillingError, describeSyncOutcome } from '@/billing/screens/billingErrors';
 import { formatDay } from '@/billing/screens/formatDay';
 import { Button } from '@/components/Button';
@@ -370,7 +377,15 @@ function PlansBody({
       <SectionLabel>Plans</SectionLabel>
       <View style={styles.card} testID="plans_product_pro">
         <Text style={styles.productName}>{PRODUCTS.pro.name}</Text>
-        <Text style={styles.productPrice}>{PRODUCTS.pro.price}</Text>
+        {/* The dollar reads as the price and the peso sits under it. Both lines are on this
+            screen alone, where the two plans are compared; the inline mentions elsewhere keep
+            the peso only, since they are nudges mid-sentence rather than a price list. */}
+        <Text testID="plans_pro_price_usd" style={styles.productPrice}>
+          {usdPrice(PRODUCTS.pro)}
+        </Text>
+        <Text testID="plans_pro_price_php" style={styles.priceApprox}>
+          {pesoNote(PRODUCTS.pro)}
+        </Text>
         <Text style={styles.cardLine}>{PRODUCTS.pro.tagline}</Text>
         <Bullets
           styles={styles}
@@ -402,7 +417,12 @@ function PlansBody({
 
       <View style={styles.card} testID="plans_product_cloud">
         <Text style={styles.productName}>{PRODUCTS.cloud.name}</Text>
-        <Text style={styles.productPrice}>{PRODUCTS.cloud.price}</Text>
+        <Text testID="plans_cloud_price_usd" style={styles.productPrice}>
+          {usdPrice(PRODUCTS.cloud)}
+        </Text>
+        <Text testID="plans_cloud_price_php" style={styles.priceApprox}>
+          {pesoNote(PRODUCTS.cloud)}
+        </Text>
         <Text style={styles.cardLine}>{PRODUCTS.cloud.tagline}</Text>
         <Bullets
           styles={styles}
@@ -623,6 +643,8 @@ const makeStyles = (colors: Palette) =>
     bulletText: { ...typography.caption, color: colors.textMuted, lineHeight: 19, flex: 1 },
     productName: { ...typography.title, color: colors.text },
     productPrice: { ...typography.label, color: colors.accent, fontSize: 18 },
+    // Muted and small on purpose: an approximation must not read as the price.
+    priceApprox: { ...typography.caption, color: colors.textMuted, marginTop: -2 },
     owned: { ...typography.label, color: colors.success, fontSize: 16 },
     muted: { ...typography.caption, color: colors.textMuted, lineHeight: 17 },
     error: { ...typography.label, color: colors.danger },

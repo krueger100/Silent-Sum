@@ -9,7 +9,7 @@ import {
   parseEntitlements,
   vaultGate,
 } from '@/billing/entitlements';
-import { PRODUCTS } from '@/billing/products';
+import { PRODUCTS, pesoNote, usdPrice } from '@/billing/products';
 
 const NOW = Date.UTC(2026, 8, 21, 12, 0, 0);
 const DAY = 86_400_000;
@@ -30,6 +30,34 @@ describe('products', () => {
       priceCentavos: 9900,
       kind: 'monthly',
     });
+  });
+
+  /** The headline, with the term on it: "US$1.58" alone would read as a one-off. */
+  it('builds the dollar price line from the price actually charged', () => {
+    expect(usdPrice(PRODUCTS.pro)).toBe('US$4.76 one-time');
+    expect(usdPrice(PRODUCTS.cloud)).toBe('US$1.58/month');
+  });
+
+  it('names the peso in full underneath, because that is what leaves the card', () => {
+    expect(pesoNote(PRODUCTS.pro)).toBe('about PH ₱299');
+    expect(pesoNote(PRODUCTS.cloud)).toBe('about PH ₱99/month');
+  });
+
+  /**
+   * Both lines are computed from `priceCentavos`, so a price change moves them together. A
+   * dollar headline that had not heard about a price rise would be a discount nobody agreed to,
+   * and it is now the line a customer reads as the price.
+   */
+  it('moves both lines together when the charged price changes', () => {
+    const dearer = { ...PRODUCTS.cloud, priceCentavos: 19900 };
+    expect(usdPrice(dearer)).toBe('US$3.17/month');
+    expect(pesoNote(dearer)).toBe('about PH ₱199/month');
+  });
+
+  /** The peso must still be on screen somewhere in every inline mention. */
+  it('keeps the peso in the copy used mid-sentence elsewhere', () => {
+    expect(PRODUCTS.pro.price).toContain('₱');
+    expect(PRODUCTS.cloud.price).toContain('₱');
   });
 });
 

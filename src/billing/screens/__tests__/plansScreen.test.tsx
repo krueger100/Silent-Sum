@@ -72,7 +72,7 @@ describe('PlansScreen', () => {
 
     const pro = screen.getByTestId('plans_product_pro');
     expect(pro).toHaveTextContent('SilentSum Pro', { exact: false });
-    expect(pro).toHaveTextContent('₱299 one-time', { exact: false });
+    expect(pro).toHaveTextContent('₱299', { exact: false });
     expect(pro).toHaveTextContent(PRODUCTS.pro.tagline, { exact: false });
     expect(pro).toHaveTextContent('End-to-end encrypted messaging', { exact: false });
 
@@ -84,6 +84,15 @@ describe('PlansScreen', () => {
     expect(cloud).toHaveTextContent('Unlimited items in the vault', { exact: false });
     expect(pro).not.toHaveTextContent('Unlimited items in the vault', { exact: false });
     expect(cloud).not.toHaveTextContent('End-to-end encrypted messaging', { exact: false });
+
+    // The dollar reads as the price now, but the peso is what PayMongo is told and what
+    // `apply.ts` checks, so it must never leave the screen.
+    expect(pro).toHaveTextContent('US$4.76 one-time', { exact: false });
+    expect(pro).toHaveTextContent('about PH ₱299', { exact: false });
+    expect(cloud).toHaveTextContent('US$1.58/month', { exact: false });
+    expect(cloud).toHaveTextContent('about PH ₱99/month', { exact: false });
+    expect(screen.getByTestId('plans_pro_price_php')).toBeTruthy();
+    expect(screen.getByTestId('plans_cloud_price_php')).toBeTruthy();
     stop();
   });
 
