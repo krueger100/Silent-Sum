@@ -157,7 +157,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // whatever this says, so a versionCode edited in `build.gradle` silently returns to 1 and Play
     // refuses the upload as a duplicate. Bump it for every build that is uploaded, independently of
     // `version` above -- Play compares only this number.
-    versionCode: 9,
+    versionCode: 10,
     ...(firebaseAndroid ? { googleServicesFile: googleServicesJson } : {}),
     adaptiveIcon: {
       // `surfaceAlt` from DARK_PALETTE, matching `android-icon-background.png`. A launcher that
