@@ -1,7 +1,7 @@
 /**
  * The SilentSum billing functions (codebase `silentsum` in the root `firebase.json`).
  *
- * Ten functions, deployed to one region:
+ * Eleven functions, deployed to one region:
  *   silentsumCreateCheckout   callable  -> a hosted PayMongo checkout page for Pro or Cloud
  *   silentsumSyncCheckout     callable  -> reconcile one checkout with PayMongo ("I have paid")
  *   silentsumStartCloudSubscription
@@ -13,6 +13,8 @@
  *   silentsumSupportRelay     https     -> the app's support form -> one fixed inbox, rate limited
  *   silentsumFindUser         callable  -> one exact e-mail -> one account id (Pro, rate limited)
  *   silentsumPeerEmail        callable  -> one account id -> its e-mail, for a correspondent only
+ *   silentsumDeleteConversation
+ *                             callable  -> erase one conversation and its media, both sides
  *
  * The PayMongo secret key, the webhook secret and the Resend API key come from Firebase Secret
  * Manager (`firebase functions:secrets:set PAYMONGO_SECRET_KEY` / `PAYMONGO_WEBHOOK_SECRET` /
