@@ -185,12 +185,19 @@ Cloud Storage → `silentsum-vault-eevee-mate` → Configuration → Autoclass �
 Afterwards the lifecycle rule set must still contain the `messages/` delete rule and nothing
 else; check with the `describe` above.
 
-    Enabled: (not yet -- awaiting a run on a machine with gcloud, or the console)
+    Enabled: 2026-10-11, via the console (Configuration -> Default storage class -> Autoclass).
+    Included classes: Standard, Nearline, Coldline, Archive -- the full ladder, Archive terminal.
+    Lifecycle rules at the time: NONE, so nothing was deleted by the enablement.
 
-**Autoclass is now load-bearing, not an optimisation.** See the margin table in the next section:
-with it, all three price bands hold a 30–37% margin even when a vault is full to the top of its
-band. Without it, **all three lose money** at the top of their band. Selling the bands before
-this switch is on means selling below cost to anybody who actually uses what they paid for.
+Note for anyone reading the console later: Autoclass is not a row of its own. It is the pencil
+beside **Default storage class**, which afterwards reads "Managed with Autoclass" with an
+**Included classes** row underneath. The enable dialog's blurb says "Standard or Nearline",
+which describes the common case and not what this bucket got -- check Included classes, because
+a Nearline floor would throw away most of the saving.
+
+**Autoclass is load-bearing, not an optimisation.** Without it all three price bands lose money
+at the top of their band. With it they clear 22–30% once a vault has matured. The full table,
+against this bucket's real location, is in the next section.
 
 ## Cloud subscriptions (added 2026-10-11, NOT YET LIVE)
 
@@ -276,28 +283,68 @@ Nothing had to be switched off to ship this.
 
 Fees are from PayMongo's published pricing page, which states all rates are VAT-exclusive, so
 each is multiplied by 1.12: **Maya 1.79% → 2.005%, no fixed fee**; a domestic card would be
-3.125% + ₱13.39 → **3.50% + ₱15.00**. Plus ₱10 per payout. Storage figures are ESTIMATES, on the
-blended Autoclass rate explained above ($0.0132/GB-month) against Standard-only ($0.0277). Tax
-is the 8% flat rate on gross.
+3.125% + ₱13.39 → **3.50% + ₱15.00**. Plus ₱10 per payout. Tax is the 8% flat rate on gross.
 
-Worst case — a vault full to the top of its band:
+Storage rates are READ OFF Google's pricing page for this bucket's actual location — **`asia`
+multi-region** — not estimated, converted at Google's own 730 hours/month:
 
-| band | price | storage | Maya net | 8% tax | profit | margin |
-| --- | --- | --- | --- | --- | --- | --- |
-| 64 GB | ₱99 | $0.84 | $1.39 | $0.13 | **$0.42** | 30% |
-| 160 GB | ₱249 | $2.10 | $3.73 | $0.32 | **$1.30** | 35% |
-| 512 GB | ₱799 | $6.73 | $12.31 | $1.02 | **$4.56** | 37% |
+| | Standard | Nearline | Coldline | Archive |
+| --- | --- | --- | --- | --- |
+| asia multi-region, per GiB-month | $0.0260 | $0.0150 | $0.0087 | $0.0030 |
 
-Break-even is at 96 / 259 / 858 GB, i.e. **150–168% of each band's ceiling** — so every band
-stays profitable even when fully used.
+Autoclass blends those to **$0.0112** for a one-year-old vault and **$0.0071** for a two-year-old
+one, as objects descend the ladder.
 
-**Without Autoclass the same table is all losses:** −34% / −24% / −21%, with break-even at
-47 / 126 / 418 GB, or 73–82% of each ceiling. A subscriber who uses more than about three
-quarters of what they paid for costs more than they pay.
+**THE LINE THAT DOMINATES, and that an earlier version of this file missed entirely:
+inter-region replication.** It is billed per GiB on all data WRITTEN to a dual-region or
+multi-region bucket. For `asia` multi-region it is **$0.08/GiB — four times the US and EU rate
+of $0.02 — and a single-region bucket does not pay it at all.** It is one-time per upload, but
+it is enormous relative to the monthly price:
+
+| band | cost to fill it, once | = months of that band's entire net revenue |
+| --- | --- | --- |
+| 64 GB | $5.12 | 4.1 |
+| 160 GB | $12.80 | 3.8 |
+| 512 GB | $40.96 | 3.6 |
+
+Full to the top of the band, with replication amortised over an assumed 24-month subscriber:
+
+| band | price | storage | replication/mo | Maya net | 8% tax | profit | margin |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 GB | ₱99 | $0.74 | $0.21 | $1.39 | $0.13 | **$0.31** | 22% |
+| 160 GB | ₱249 | $1.85 | $0.53 | $3.73 | $0.32 | **$1.02** | 28% |
+| 512 GB | ₱799 | $5.92 | $1.71 | $12.31 | $1.02 | **$3.66** | 30% |
+
+Break-even is at 85 / 229 / 758 GB against ceilings of 64 / 160 / 512 — covered, but by 1.3–1.5×
+rather than the 1.5–1.7× an earlier estimate claimed.
+
+**Year one is much thinner: 3% / 10% / 13%**, because replication is being paid off against a
+vault that has not yet cooled. A subscriber who fills a band and leaves inside a year is close
+to break-even or behind.
+
+### The bucket's location costs about half the profit
+
+`asia` multi-region was chosen when the bucket was created (2026-09-16) and is the single
+largest lever left. A single Asian region pays **no replication at all** and cheaper storage:
+
+| band | profit now (asia multi-region) | profit if single-region |
+| --- | --- | --- |
+| 64 GB | $0.31 (22%) | **$0.73 (53%)** |
+| 160 GB | $1.02 (28%) | **$2.09 (56%)** |
+| 512 GB | $3.66 (30%) | **$7.08 (58%)** |
+
+Not acted on. Moving means relocating a bucket that holds real vaults, and the multi-region
+also buys availability a single region does not. Recorded here so the trade-off is a decision
+rather than an accident.
 
 Moving to Maya is itself worth +23% on the ₱99 band against a card, because a ₱15 fixed fee is
 15% of a ₱99 charge. That was not the reason for choosing it, but it is why the cheapest band
 works at all.
+
+Two smaller lines, both real and both small: **soft delete is on with a 7-day window and
+soft-deleted objects are billed** at their class rate (they are exempt from the Autoclass
+management fee); and the `messages/` lifecycle rule in `storage-lifecycle.json` **has never been
+applied** — the bucket's Lifecycle tab reads "None" — so chat media is not expiring.
 
 ## Support relay (added 2026-09-26)
 
