@@ -71,7 +71,12 @@ import { encodeUnderCap, fitPhotoForSending, THUMB_SEND_EDGES } from '@/messagin
 import type { FileSystem } from '@/storage/fileSystem';
 import type { SecureDelete } from '@/storage/secureDelete';
 import type { PlaybackScratch } from '@/vault/playbackScratch';
-import type { VaultRepository , ThumbnailGenerator, VideoThumbnailGenerator } from '@/vault/types';
+import {
+  storedBytesOf,
+  type VaultRepository,
+  type ThumbnailGenerator,
+  type VideoThumbnailGenerator,
+} from '@/vault/types';
 import { keyFingerprint, traceRecovery } from '@/messaging/recoveryTrace';
 import { base64Decode, base64Encode } from '@/utils/base64';
 import type { Clock } from '@/utils/clock';
@@ -1697,7 +1702,11 @@ export class MessagingService {
       // Throws `expired` when the object has been swept, which the screen must not confuse with
       // a vault refusal: one is permanent, the other is a limit with a way past it.
       const bytes = await this.fetchMediaBytes(conversationId, message);
-      const gate = this.deps.entitlements.gate(repository.photos.length, bytes.length);
+      const gate = this.deps.entitlements.gate(
+        repository.photos.length,
+        bytes.length,
+        storedBytesOf(repository.photos),
+      );
       if (!gate.allowed) throw new MessagingError('vault-refused', gate.reason);
       await repository.addPhoto({ bytes }, { source: 'import' });
       return;
@@ -1705,7 +1714,11 @@ export class MessagingService {
 
     const uri = await this.fetchMedia(conversationId, message);
     try {
-      const gate = this.deps.entitlements.gate(repository.photos.length, await media.fs.size(uri));
+      const gate = this.deps.entitlements.gate(
+        repository.photos.length,
+        await media.fs.size(uri),
+        storedBytesOf(repository.photos),
+      );
       if (!gate.allowed) throw new MessagingError('vault-refused', gate.reason);
       await repository.addVideo({ uri, durationMs: 0 }, { source: 'import' });
     } finally {

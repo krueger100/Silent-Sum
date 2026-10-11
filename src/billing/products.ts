@@ -17,6 +17,14 @@ export interface Product {
   readonly priceCentavos: number;
   readonly tagline: string;
   readonly kind: 'one-time' | 'monthly';
+  /**
+   * Whether `price` is the FIRST of several, rather than the only one.
+   *
+   * Cloud is charged by what the vault holds (`CLOUD_BANDS`), so its headline is the cheapest
+   * band and nothing else. Without this the screen shows one figure above a line listing three,
+   * and the figure reads as the price.
+   */
+  readonly banded: boolean;
 }
 
 export const PRODUCTS: Readonly<Record<ProductId, Product>> = {
@@ -27,14 +35,18 @@ export const PRODUCTS: Readonly<Record<ProductId, Product>> = {
     priceCentavos: 29900,
     tagline: 'Private messaging with other SilentSum users. Pay once, keep it forever.',
     kind: 'one-time',
+    banded: false,
   },
   cloud: {
     id: 'cloud',
     name: 'SilentSum Cloud',
     price: '₱99/month',
     priceCentavos: 9900,
-    tagline: 'An unlimited vault and encrypted cloud backup.',
+    // Not "unlimited". The price follows what is stored -- see `CLOUD_BANDS` -- and a tagline
+    // that promised otherwise is what the whole cost problem was made of.
+    tagline: 'A bigger vault and encrypted cloud backup. You pay for what you store.',
     kind: 'monthly',
+    banded: true,
   },
 };
 
@@ -67,7 +79,8 @@ export const USD_PER_PHP = 0.01592;
  */
 export function usdPrice(product: Product): string {
   const amount = ((product.priceCentavos / 100) * USD_PER_PHP).toFixed(2);
-  return product.kind === 'monthly' ? `US$${amount}/month` : `US$${amount} one-time`;
+  const core = product.kind === 'monthly' ? `US$${amount}/month` : `US$${amount} one-time`;
+  return product.banded ? `from ${core}` : core;
 }
 
 /**
@@ -83,7 +96,8 @@ export function usdPrice(product: Product): string {
  */
 export function pesoNote(product: Product): string {
   const amount = `₱${product.priceCentavos / 100}`;
-  return product.kind === 'monthly' ? `about PH ${amount}/month` : `about PH ${amount}`;
+  const core = product.kind === 'monthly' ? `about PH ${amount}/month` : `about PH ${amount}`;
+  return product.banded ? `${core} and up` : core;
 }
 
 export const PRODUCT_IDS: readonly ProductId[] = ['pro', 'cloud'];

@@ -3,6 +3,7 @@ import {
   readCheckoutSession,
   readInvoice,
   readPayment,
+  readPaymentIntent,
   readSubscription,
 } from '../paymongo/events';
 
@@ -158,6 +159,43 @@ describe('readSubscription', () => {
       status: 'active',
       customerId: 'cus_1',
       nextBillingMs: Date.UTC(2026, 9, 21),
+      planId: null,
+      latestInvoice: null,
+      defaultPaymentMethodId: null,
+      setupNextActionUrl: null,
+    });
+  });
+
+  it('reads the plan, the first invoice and its payment intent as the create answer carries them', () => {
+    // The shape is PayMongo's documented subscription resource: the plan is NESTED (there is no
+    // top-level `plan_id`), and the first invoice's payment intent is two levels down.
+    expect(
+      readSubscription({
+        id: 'sub_1',
+        type: 'subscription',
+        attributes: {
+          status: 'incomplete',
+          customer_id: 'cus_1',
+          default_customer_payment_method_id: 'pm_9',
+          plan: { id: 'plan_64', amount: 9900, interval: 'monthly' },
+          latest_invoice: {
+            id: 'in_1',
+            status: 'open',
+            payment_intent: { id: 'pi_1', status: 'awaiting_payment_method' },
+          },
+          setup_intent: { id: 'pi_2', status: 'awaiting_next_action', next_action_url: 'https://x.test/a' },
+        },
+      }),
+    ).toMatchObject({
+      planId: 'plan_64',
+      defaultPaymentMethodId: 'pm_9',
+      latestInvoice: {
+        id: 'in_1',
+        status: 'open',
+        paymentIntentId: 'pi_1',
+        paymentIntentStatus: 'awaiting_payment_method',
+      },
+      setupNextActionUrl: 'https://x.test/a',
     });
   });
 
@@ -198,5 +236,44 @@ describe('readInvoice', () => {
       subscriptionStatus: null,
       nextBillingMs: null,
     });
+  });
+});
+
+describe('readPaymentIntent', () => {
+  it('reads the status and the https redirect the customer must authorise on', () => {
+    expect(
+      readPaymentIntent({
+        id: 'pi_1',
+        type: 'payment_intent',
+        attributes: {
+          status: 'awaiting_next_action',
+          next_action: {
+            type: 'redirect',
+            redirect: { url: 'https://auth.paymongo.test/pi_1', return_url: 'https://x.test/r' },
+          },
+        },
+      }),
+    ).toEqual({
+      id: 'pi_1',
+      status: 'awaiting_next_action',
+      redirectUrl: 'https://auth.paymongo.test/pi_1',
+    });
+  });
+
+  it('refuses a redirect that is not https, rather than handing it to a browser', () => {
+    // Opening http here would send an authorisation flow over plaintext. A missing URL is a
+    // failure the caller already handles; a downgraded one must not be mistaken for a good one.
+    expect(
+      readPaymentIntent({
+        id: 'pi_1',
+        attributes: { next_action: { redirect: { url: 'http://auth.paymongo.test/pi_1' } } },
+      })?.redirectUrl,
+    ).toBeNull();
+    expect(readPaymentIntent({ id: 'pi_1', attributes: {} })?.redirectUrl).toBeNull();
+  });
+
+  it('is null for something that is not a resource', () => {
+    expect(readPaymentIntent(null)).toBeNull();
+    expect(readPaymentIntent({ attributes: {} })).toBeNull();
   });
 });

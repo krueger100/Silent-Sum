@@ -100,13 +100,20 @@ export class EntitlementsController {
     return deriveCloudState(this.current, this.deps.clock.now());
   }
 
-  /** Whether one more item of `bytes` may be added when the vault already holds `itemCount`. */
-  gate(itemCount: number, bytes: number): GateDecision {
+  /**
+   * Whether one more item of `bytes` may be added when the vault already holds `itemCount`
+   * items totalling `storedBytes`.
+   *
+   * `storedBytes` is required rather than optional on purpose: a caller that forgot it would
+   * silently skip the Cloud ceiling, which is the one check with a bill behind it.
+   */
+  gate(itemCount: number, bytes: number, storedBytes: number): GateDecision {
     return vaultGate({
       cloudActive: this.isCloudActive(),
       enforced: this.deps.enforced,
       itemCount,
       bytes,
+      storedBytes,
     });
   }
 

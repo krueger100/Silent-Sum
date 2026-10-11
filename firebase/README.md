@@ -187,6 +187,118 @@ else; check with the `describe` above.
 
     Enabled: (not yet -- awaiting a run on a machine with gcloud, or the console)
 
+**Autoclass is now load-bearing, not an optimisation.** See the margin table in the next section:
+with it, all three price bands hold a 30–37% margin even when a vault is full to the top of its
+band. Without it, **all three lose money** at the top of their band. Selling the bands before
+this switch is on means selling below cost to anybody who actually uses what they paid for.
+
+## Cloud subscriptions (added 2026-10-11, NOT YET LIVE)
+
+`silentsumStartCloudSubscription` creates a real monthly PayMongo subscription, so Cloud can
+renew on its own instead of being bought 30 days at a time. The code is written and tested; it
+cannot run yet, for reasons that are not code.
+
+### Two things PayMongo must enable, by e-mail
+
+Neither is self-service. Both are stated on PayMongo's own documentation pages:
+
+1. **Subscriptions.** The subscriptions guide says to "contact PayMongo support to enable
+   subscriptions on your account". Until then `POST /v1/subscriptions` is refused.
+2. **The payment method must be activated** on the account — the same guide says to "Ensure that
+   your PayMongo Account is activated for the supported payment method". For SilentSum that is
+   **Maya**.
+
+Mail support@paymongo.com for both. Card vaulting is a third thing PayMongo gates ("Card Vaulting
+is only available for select accounts") and SilentSum deliberately does **not** want it — see
+below.
+
+### Why Maya and not cards
+
+PayMongo supports cards and Maya for subscriptions. A card subscription requires the card to be
+vaulted, and vaulting is done by sending `card_number`, `exp_month`, `exp_year` and `cvc` to
+`POST /v1/payment_methods`. There is no hosted page for a subscription's first payment, so those
+fields would have to be collected in the app and passed through our own backend — which puts
+SilentSum's servers inside PCI DSS scope for the sake of one product.
+
+A Maya payment method needs nothing but `{"type": "paymaya"}`. `SubscriptionWallet` in
+`functions/src/paymongo/client.ts` is therefore a one-member union, and
+`clientSubscriptions.test.ts` asserts the request body has exactly one key. The cost is that
+card-only customers cannot subscribe; they can still buy a 30-day term, which takes every method.
+
+### The flow, as the API documents it
+
+| step | call |
+| --- | --- |
+| 1 | `POST /v1/subscriptions/plans` — one plan per band, cached in `silentsum_billing_plans` |
+| 2 | `POST /v1/customers` — `first_name`, `last_name`, `email`, `default_device: email` |
+| 3 | `POST /v1/subscriptions` — `customer_id` + `plan_id`; the first invoice appears at once |
+| 4 | `POST /v1/payment_methods` — `{"type": "paymaya"}` |
+| 5 | `POST /v1/payment_intents/{latest_invoice.payment_intent.id}/attach` — the app opens the `next_action.redirect.url` this answers with |
+
+The customer has **24 hours** to authorise, or PayMongo cancels the subscription and its status
+becomes `incomplete_cancelled`. After that PayMongo bills it: a `draft` invoice one day before
+the date, `open` twelve hours later, then payment. A failure retries once a day, three times,
+then the subscription goes `unpaid`.
+
+No `phone` is sent. PayMongo marks it optional, and a vault app has no business holding a mobile
+number. `first_name`/`last_name` are required by the API and SilentSum does not know them, so a
+fixed `SilentSum Subscriber` goes out instead.
+
+### Usage-based pricing, and its one-cycle lag
+
+One plan per band, and `PUT /v1/subscriptions/{id}/plan` to move between them. The band comes
+from `CloudStorageMeter`, which lists `users/{uid}/` in SilentSum's bucket and adds up the object
+sizes — the server's own figure, never the client's.
+
+Re-rating happens on `subscription.invoice.paid`, so **a vault that changes band is billed the
+old band once more and the new one after that.** PayMongo applies a plan change from the next
+cycle; there is no proration API. The worst case is a vault that fills from empty to the 512 GB
+ceiling inside one month, which costs about **$5.47, once**, and is bounded by the ceiling on
+additions.
+
+### Testing the monthly charge without waiting a month
+
+`POST /v1/subscriptions/{id}/test_cycle` forces the next cycle. It is **test keys only** —
+`PayMongoClient.triggerTestCycle` exists for exactly this. The full lifecycle is already covered
+offline against the documented shapes in `functions/src/__tests__/subscriptionLifecycle.test.ts`
+(first charge, two renewals, a band change, a failed charge, the retries running out,
+cancellation keeping the paid period). What that cannot prove is PayMongo's real response bodies,
+which is what the test key is for once Subscriptions are enabled.
+
+### What the app does meanwhile
+
+`PlansScreen` tries `startCloudSubscription` and falls back to a one-off term when the backend
+answers `unsupported` — which is what every deployment answers today. It says which happened in
+the status line, because the two charge differently and the user is agreeing to one of them.
+Nothing had to be switched off to ship this.
+
+### Do the band prices cover their costs?
+
+Fees are from PayMongo's published pricing page, which states all rates are VAT-exclusive, so
+each is multiplied by 1.12: **Maya 1.79% → 2.005%, no fixed fee**; a domestic card would be
+3.125% + ₱13.39 → **3.50% + ₱15.00**. Plus ₱10 per payout. Storage figures are ESTIMATES, on the
+blended Autoclass rate explained above ($0.0132/GB-month) against Standard-only ($0.0277). Tax
+is the 8% flat rate on gross.
+
+Worst case — a vault full to the top of its band:
+
+| band | price | storage | Maya net | 8% tax | profit | margin |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64 GB | ₱99 | $0.84 | $1.39 | $0.13 | **$0.42** | 30% |
+| 160 GB | ₱249 | $2.10 | $3.73 | $0.32 | **$1.30** | 35% |
+| 512 GB | ₱799 | $6.73 | $12.31 | $1.02 | **$4.56** | 37% |
+
+Break-even is at 96 / 259 / 858 GB, i.e. **150–168% of each band's ceiling** — so every band
+stays profitable even when fully used.
+
+**Without Autoclass the same table is all losses:** −34% / −24% / −21%, with break-even at
+47 / 126 / 418 GB, or 73–82% of each ceiling. A subscriber who uses more than about three
+quarters of what they paid for costs more than they pay.
+
+Moving to Maya is itself worth +23% on the ₱99 band against a card, because a ₱15 fixed fee is
+15% of a ₱99 charge. That was not the reason for choosing it, but it is why the cheapest band
+works at all.
+
 ## Support relay (added 2026-09-26)
 
 `silentsumSupportRelay` is the app's customer-service form. It replaced a direct call to Resend that

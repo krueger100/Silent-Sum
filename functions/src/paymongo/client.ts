@@ -1,10 +1,26 @@
 /**
- * The three PayMongo calls this backend makes, over plain `fetch`.
+ * The PayMongo calls this backend makes, over plain `fetch`.
  *
  * Authentication is HTTP Basic with the secret key as the user name and an empty password. The
  * key arrives through a Firebase secret and is never logged, never put in an error and never
  * sent anywhere but `api.paymongo.com`. Resource ids are interpolated into paths only after a
  * character check, so a value that came from a client can never rewrite the URL.
+ *
+ * Every path and body below was taken from PayMongo's own reference, not inferred:
+ *   POST  /checkout_sessions                      one-off hosted page
+ *   GET   /checkout_sessions/{id}
+ *   POST  /customers                              `first_name`, `last_name`, `email`,
+ *                                                 `default_device`; `phone` is OPTIONAL
+ *   POST  /subscriptions/plans                    one plan per price band
+ *   POST  /subscriptions                          `customer_id` + `plan_id`, nothing else
+ *   GET   /subscriptions/{id}
+ *   PUT   /subscriptions/{id}/plan                move between bands
+ *   PUT   /subscriptions/{id}/payment_method      replace the method future cycles charge
+ *   POST  /subscriptions/{id}/cancel              `cancellation_reason` from a fixed list
+ *   POST  /subscriptions/invoices/{id}/pay        retry one open invoice
+ *   POST  /subscriptions/{id}/test_cycle          TEST KEYS ONLY: force the next cycle
+ *   POST  /payment_methods                        wallets only here -- see `createWalletMethod`
+ *   POST  /payment_intents/{id}/attach            the first invoice's payment
  */
 export interface PayMongoHttpResponse {
   readonly ok: boolean;
@@ -14,7 +30,7 @@ export interface PayMongoHttpResponse {
 
 export type PayMongoFetch = (
   url: string,
-  init: { method: 'GET' | 'POST'; headers: Record<string, string>; body?: string },
+  init: { method: 'GET' | 'POST' | 'PUT'; headers: Record<string, string>; body?: string },
 ) => Promise<PayMongoHttpResponse>;
 
 export class PayMongoApiError extends Error {
@@ -50,6 +66,45 @@ export interface CreatedCheckoutSession {
   readonly checkoutUrl: string;
   readonly resource: Record<string, unknown>;
 }
+
+/** `POST /subscriptions/plans`. `plan_type` is left at PayMongo's default, `scheduled`. */
+export interface CreatePlanInput {
+  readonly name: string;
+  readonly description: string;
+  /** Centavos. PayMongo's minimum is 100. */
+  readonly amountCentavos: number;
+  readonly currency: string;
+  readonly interval: 'weekly' | 'monthly' | 'yearly';
+  /** 1 to 10. */
+  readonly intervalCount: number;
+  readonly metadata?: Record<string, string>;
+}
+
+/**
+ * `POST /customers`.
+ *
+ * `phone` is deliberately absent. PayMongo marks it optional, and SilentSum does not know it:
+ * the account is an e-mail and a password, and asking a vault app's user for a mobile number to
+ * buy storage would collect an identifier the product exists to avoid. `default_device` is
+ * therefore always `email`.
+ */
+export interface CreateCustomerInput {
+  readonly firstName: string;
+  readonly lastName: string;
+  readonly email: string;
+  readonly metadata?: Record<string, string>;
+}
+
+/**
+ * The payment methods a subscription may be charged on, as far as THIS backend is concerned.
+ *
+ * PayMongo supports cards and Maya for subscriptions. Cards are missing on purpose: creating a
+ * card payment method means `details.card_number`, `exp_month`, `exp_year` and `cvc` crossing
+ * this process, which would drag SilentSum's servers into PCI DSS scope for the sake of one
+ * product. Maya needs nothing but its `type`, so the wallet path carries no card data at all --
+ * and because the union has one member, there is no code path that could start.
+ */
+export type SubscriptionWallet = 'paymaya';
 
 export const PAYMONGO_BASE_URL = 'https://api.paymongo.com/v1';
 
@@ -144,6 +199,99 @@ export class PayMongoClient {
     return resource;
   }
 
+  /** The plan a band's subscriptions are created against. Returns its id. */
+  async createPlan(input: CreatePlanInput): Promise<string> {
+    const data = await this.request('POST', '/subscriptions/plans', {
+      data: {
+        attributes: {
+          plan_type: 'scheduled',
+          name: input.name,
+          description: input.description,
+          amount: input.amountCentavos,
+          currency: input.currency,
+          interval: input.interval,
+          interval_count: input.intervalCount,
+          ...(input.metadata === undefined ? {} : { metadata: { ...input.metadata } }),
+        },
+      },
+    });
+    return this.idOf(data, 'plan');
+  }
+
+  async createCustomer(input: CreateCustomerInput): Promise<string> {
+    const data = await this.request('POST', '/customers', {
+      data: {
+        attributes: {
+          first_name: input.firstName,
+          last_name: input.lastName,
+          email: input.email,
+          default_device: 'email',
+          ...(input.metadata === undefined ? {} : { metadata: { ...input.metadata } }),
+        },
+      },
+    });
+    return this.idOf(data, 'customer');
+  }
+
+  /**
+   * The subscription itself. The body really is only these two fields: the price comes from the
+   * plan and the schedule from PayMongo, which is the whole point of using it over a timer here.
+   *
+   * The bare resource comes back rather than a parsed view, because the first invoice and its
+   * payment intent are nested in it and `events.ts` is where this shape is read and tested.
+   */
+  async createSubscription(input: {
+    readonly customerId: string;
+    readonly planId: string;
+  }): Promise<Record<string, unknown>> {
+    this.assertId(input.customerId);
+    this.assertId(input.planId);
+    const resource = record(
+      await this.request('POST', '/subscriptions', {
+        data: { attributes: { customer_id: input.customerId, plan_id: input.planId } },
+      }),
+    );
+    if (resource === null) throw new PayMongoApiError(502, null, 'subscription answer was malformed');
+    return resource;
+  }
+
+  async retrieveSubscription(id: string): Promise<Record<string, unknown>> {
+    this.assertId(id);
+    const resource = record(await this.request('GET', `/subscriptions/${id}`));
+    if (resource === null) throw new PayMongoApiError(502, null, 'subscription answer was malformed');
+    return resource;
+  }
+
+  /** Move a live subscription to another band's plan. PayMongo applies it from the next cycle. */
+  async changeSubscriptionPlan(id: string, planId: string): Promise<void> {
+    this.assertId(id);
+    this.assertId(planId);
+    await this.request('PUT', `/subscriptions/${id}/plan`, {
+      data: { attributes: { plan_id: planId } },
+    });
+  }
+
+  /** Replace what future cycles are charged on. The answer carries the re-authentication step. */
+  async changeSubscriptionPaymentMethod(
+    id: string,
+    input: { readonly paymentMethodId: string; readonly redirectUrl: string },
+  ): Promise<Record<string, unknown>> {
+    this.assertId(id);
+    this.assertId(input.paymentMethodId);
+    const resource = record(
+      await this.request('PUT', `/subscriptions/${id}/payment_method`, {
+        data: {
+          attributes: {
+            payment_method_id: input.paymentMethodId,
+            redirect_url: input.redirectUrl,
+          },
+        },
+      }),
+    );
+    if (resource === null) throw new PayMongoApiError(502, null, 'subscription answer was malformed');
+    return resource;
+  }
+
   async cancelSubscription(id: string, reason: string): Promise<void> {
     this.assertId(id);
     await this.request('POST', `/subscriptions/${id}/cancel`, {
@@ -151,11 +299,76 @@ export class PayMongoClient {
     });
   }
 
+  /** Retry one open invoice. No body: PayMongo charges the subscription's own method. */
+  async payInvoice(invoiceId: string): Promise<void> {
+    this.assertId(invoiceId);
+    await this.request('POST', `/subscriptions/invoices/${invoiceId}/pay`);
+  }
+
+  /**
+   * Force the next billing cycle. TEST KEYS ONLY -- PayMongo's reference says so, and a live key
+   * is refused by the API, not by us. This is what makes "does a month actually renew" a thing
+   * that can be observed rather than waited for.
+   */
+  async triggerTestCycle(id: string): Promise<void> {
+    this.assertId(id);
+    await this.request('POST', `/subscriptions/${id}/test_cycle`);
+  }
+
+  /**
+   * A wallet payment method. `type` is the only field sent, which is the entire reason the
+   * subscription path is restricted to wallets: there is no `details` object here, so no card
+   * number can pass through this process even by mistake.
+   */
+  async createWalletMethod(type: SubscriptionWallet): Promise<string> {
+    const data = await this.request('POST', '/payment_methods', {
+      data: { attributes: { type } },
+    });
+    return this.idOf(data, 'payment method');
+  }
+
+  /**
+   * Attaching a method to the first invoice's payment intent: the "normal payment flow" the
+   * subscriptions guide points at. The redirect in the answer is where the customer authorises,
+   * and a successful authorisation is also what vaults the wallet for later cycles.
+   */
+  async attachPaymentIntent(input: {
+    readonly paymentIntentId: string;
+    readonly paymentMethodId: string;
+    readonly returnUrl: string;
+  }): Promise<Record<string, unknown>> {
+    this.assertId(input.paymentIntentId);
+    this.assertId(input.paymentMethodId);
+    const resource = record(
+      await this.request('POST', `/payment_intents/${input.paymentIntentId}/attach`, {
+        data: {
+          attributes: {
+            payment_method: input.paymentMethodId,
+            return_url: input.returnUrl,
+          },
+        },
+      }),
+    );
+    if (resource === null)
+      throw new PayMongoApiError(502, null, 'payment intent answer was malformed');
+    return resource;
+  }
+
+  private idOf(data: unknown, what: string): string {
+    const id = text(record(data)?.id);
+    if (id === null) throw new PayMongoApiError(502, null, `${what} answer carried no id`);
+    return id;
+  }
+
   private assertId(id: string): void {
     if (!ID_PATTERN.test(id)) throw new PayMongoApiError(400, null, 'not a PayMongo resource id');
   }
 
-  private async request(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async request(
+    method: 'GET' | 'POST' | 'PUT',
+    path: string,
+    body?: unknown,
+  ): Promise<unknown> {
     const headers: Record<string, string> = {
       Authorization: this.authorization,
       Accept: 'application/json',

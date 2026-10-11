@@ -32,12 +32,36 @@ export interface CheckoutSessionView {
   readonly payments: readonly PaymentView[];
 }
 
+/** The invoice nested inside a subscription: `latest_invoice`, which is not a full invoice. */
+export interface LatestInvoiceView {
+  readonly id: string | null;
+  readonly status: string | null;
+  readonly paymentIntentId: string | null;
+  readonly paymentIntentStatus: string | null;
+}
+
 export interface SubscriptionView {
   readonly id: string;
   readonly status: string | null;
   readonly customerId: string | null;
   /** `next_billing_schedule` (a `YYYY-MM-DD` date) as UTC midnight, epoch ms. */
   readonly nextBillingMs: number | null;
+  /**
+   * `plan.id`. The subscription resource has no top-level `plan_id`, only a nested `plan`
+   * object -- which is why the band a subscription is on is read from here.
+   */
+  readonly planId: string | null;
+  readonly latestInvoice: LatestInvoiceView | null;
+  readonly defaultPaymentMethodId: string | null;
+  /** `setup_intent.next_action_url`: where a NEW payment method is re-authenticated. */
+  readonly setupNextActionUrl: string | null;
+}
+
+export interface PaymentIntentView {
+  readonly id: string;
+  readonly status: string | null;
+  /** `next_action.redirect.url` -- present while the status is `awaiting_next_action`. */
+  readonly redirectUrl: string | null;
 }
 
 export interface InvoiceView {
@@ -149,11 +173,43 @@ export function readCheckoutSession(value: unknown): CheckoutSessionView | null 
 export function readSubscription(value: unknown): SubscriptionView | null {
   const r = resource(value);
   if (r === null) return null;
+  const invoice = record(r.attributes.latest_invoice);
+  const intent = invoice === null ? null : record(invoice.payment_intent);
+  const setup = record(r.attributes.setup_intent);
   return {
     id: r.id,
     status: text(r.attributes.status),
     customerId: text(r.attributes.customer_id),
     nextBillingMs: dateMs(r.attributes.next_billing_schedule),
+    planId: text(record(r.attributes.plan)?.id),
+    latestInvoice:
+      invoice === null
+        ? null
+        : {
+            id: text(invoice.id),
+            status: text(invoice.status),
+            paymentIntentId: text(intent?.id),
+            paymentIntentStatus: text(intent?.status),
+          },
+    defaultPaymentMethodId: text(r.attributes.default_customer_payment_method_id),
+    setupNextActionUrl: text(setup?.next_action_url),
+  };
+}
+
+/**
+ * A payment intent, for the one thing the subscription flow needs from it: where to send the
+ * customer. Only an https redirect is reported -- a plain-http or relative `next_action` would
+ * be PayMongo behaving unlike its documentation, and opening it would be worse than failing.
+ */
+export function readPaymentIntent(value: unknown): PaymentIntentView | null {
+  const r = resource(value);
+  if (r === null) return null;
+  const action = record(r.attributes.next_action);
+  const url = text(record(action?.redirect)?.url);
+  return {
+    id: r.id,
+    status: text(r.attributes.status),
+    redirectUrl: url !== null && /^https:\/\//i.test(url) ? url : null,
   };
 }
 

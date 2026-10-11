@@ -245,7 +245,7 @@ describe('EntitlementsController', () => {
   it('gates nothing when the build cannot sell anything', async () => {
     const { controller } = build({ enforced: false });
     await controller.load();
-    expect(controller.gate(999, MAX_ITEM_BYTES + 1)).toEqual({ allowed: true });
+    expect(controller.gate(999, MAX_ITEM_BYTES + 1, 0)).toEqual({ allowed: true });
   });
 
   it('allows video on a free account, and counts it as one item', async () => {
@@ -254,9 +254,9 @@ describe('EntitlementsController', () => {
     await controller.load();
     const stop = controller.start();
 
-    expect(controller.gate(0, 5_000_000)).toEqual({ allowed: true });
-    expect(controller.gate(49, 5_000_000)).toEqual({ allowed: true });
-    expect(controller.gate(50, 5_000_000)).toEqual({ allowed: false, reason: 'itemLimit' });
+    expect(controller.gate(0, 5_000_000, 0)).toEqual({ allowed: true });
+    expect(controller.gate(49, 5_000_000, 0)).toEqual({ allowed: true });
+    expect(controller.gate(50, 5_000_000, 0)).toEqual({ allowed: false, reason: 'itemLimit' });
     stop();
   });
 
@@ -265,13 +265,13 @@ describe('EntitlementsController', () => {
     await cloud.signUp(EMAIL, PASSWORD);
     await controller.load();
     const stop = controller.start();
-    expect(controller.gate(0, MAX_ITEM_BYTES + 1)).toEqual({ allowed: false, reason: 'fileSize' });
+    expect(controller.gate(0, MAX_ITEM_BYTES + 1, 0)).toEqual({ allowed: false, reason: 'fileSize' });
 
     billing.completePayment((await billing.createCheckout('cloud')).checkoutId);
     await controller.flush();
     expect(controller.isCloudActive()).toBe(true);
     // The cap is about the device, not the plan, so a Cloud term does not lift it.
-    expect(controller.gate(0, MAX_ITEM_BYTES + 1)).toEqual({ allowed: false, reason: 'fileSize' });
+    expect(controller.gate(0, MAX_ITEM_BYTES + 1, 0)).toEqual({ allowed: false, reason: 'fileSize' });
     stop();
   });
 
@@ -280,18 +280,18 @@ describe('EntitlementsController', () => {
     await cloud.signUp(EMAIL, PASSWORD);
     await controller.load();
     const stop = controller.start();
-    expect(controller.gate(50, 1)).toEqual({ allowed: false, reason: 'itemLimit' });
-    expect(controller.gate(49, 1)).toEqual({ allowed: true });
+    expect(controller.gate(50, 1, 0)).toEqual({ allowed: false, reason: 'itemLimit' });
+    expect(controller.gate(49, 1, 0)).toEqual({ allowed: true });
 
     // Pro is the messaging plan: buying it must NOT lift the vault gates.
     billing.completePayment((await billing.createCheckout('pro')).checkoutId);
     await controller.flush();
     expect(controller.isPro()).toBe(true);
-    expect(controller.gate(50, 1)).toEqual({ allowed: false, reason: 'itemLimit' });
+    expect(controller.gate(50, 1, 0)).toEqual({ allowed: false, reason: 'itemLimit' });
 
     billing.completePayment((await billing.createCheckout('cloud')).checkoutId);
     await controller.flush();
-    expect(controller.gate(999, 1)).toEqual({ allowed: true });
+    expect(controller.gate(999, 1, 0)).toEqual({ allowed: true });
     stop();
   });
 

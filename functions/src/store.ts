@@ -87,6 +87,25 @@ export interface BillingStore {
   beginEvent(event: Omit<EventRecord, 'outcome' | 'processedAt'>): Promise<'new' | 'duplicate'>;
   finishEvent(id: string, outcome: string, processedAt: number): Promise<void>;
   /**
+   * The PayMongo plan id for a band, remembered so a plan is created once and not once per
+   * subscriber. Keyed by band AND price AND mode, so changing a price makes a NEW plan rather
+   * than silently billing the old amount, and test plans are never handed to a live key.
+   *
+   * Null means "not created yet". A race creates two plans at the same price, one of which wins
+   * the cache; that is wasteful, not wrong, and nobody is charged twice for it.
+   */
+  getPlanId(key: string): Promise<string | null>;
+  putPlanId(key: string, planId: string, createdAt: number): Promise<void>;
+  /**
+   * The account's PayMongo customer id, the reverse of the `CustomerRef` above.
+   *
+   * Both directions are needed and neither can be derived from the other: a webhook arrives with
+   * a PayMongo id and needs the account, while subscribing starts from an account and must reuse
+   * the customer it already has rather than making a second one.
+   */
+  getCustomerId(uid: string): Promise<string | null>;
+  putCustomerId(uid: string, customerId: string, createdAt: number): Promise<void>;
+  /**
    * `mutate` receives the current entitlements (the free tier when none exist) and returns the
    * next ones, or null to leave them alone. It runs only for a payment not yet in the ledger.
    */
@@ -107,6 +126,8 @@ export class InMemoryBillingStore implements BillingStore {
   readonly refs = new Map<string, BillingRef>();
   readonly events = new Map<string, EventRecord>();
   readonly payments = new Map<string, PaymentRecord>();
+  readonly plans = new Map<string, string>();
+  readonly customers = new Map<string, string>();
 
   constructor(private readonly now: () => number = () => Date.now()) {}
 
@@ -143,6 +164,22 @@ export class InMemoryBillingStore implements BillingStore {
     const event = this.events.get(id);
     if (event === undefined) return;
     this.events.set(id, { ...event, outcome, processedAt });
+  }
+
+  async getPlanId(key: string): Promise<string | null> {
+    return this.plans.get(key) ?? null;
+  }
+
+  async putPlanId(key: string, planId: string, _createdAt: number): Promise<void> {
+    this.plans.set(key, planId);
+  }
+
+  async getCustomerId(uid: string): Promise<string | null> {
+    return this.customers.get(uid) ?? null;
+  }
+
+  async putCustomerId(uid: string, customerId: string, _createdAt: number): Promise<void> {
+    this.customers.set(uid, customerId);
   }
 
   async applyPayment(input: {

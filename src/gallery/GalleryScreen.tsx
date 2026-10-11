@@ -30,7 +30,7 @@ import { ImportService, type ImportReport } from '@/gallery/importService';
 import { PhotoTile } from '@/gallery/PhotoTile';
 import { openRepository } from '@/gallery/vaultAccess';
 import { CameraSheet } from '@/camera/CameraSheet';
-import type { PhotoEntry } from '@/vault/types';
+import { storedBytesOf, type PhotoEntry } from '@/vault/types';
 
 const GAP = 4;
 const EDGE = 4;
@@ -144,7 +144,11 @@ export function GalleryScreen({
     // a selection is never half-imported.
     // Zero bytes: nothing has been picked yet, so the size is unknown here. Each picked asset's
     // size is checked inside the import, from the picker's metadata, before it is read.
-    const gate = services.entitlements.gate(target.photos.length, 0);
+    const gate = services.entitlements.gate(
+      target.photos.length,
+      0,
+      storedBytesOf(target.photos),
+    );
     if (!gate.allowed) {
       setUpsell(gate.reason);
       return;

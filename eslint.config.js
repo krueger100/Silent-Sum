@@ -2,6 +2,7 @@
 const { defineConfig } = require('eslint/config');
 const expoConfig = require('eslint-config-expo/flat');
 const nodeGlobals = require('globals').node;
+const jestGlobals = require('globals').jest;
 
 module.exports = defineConfig([
   expoConfig,
@@ -33,5 +34,12 @@ module.exports = defineConfig([
     // which nothing noticed for a while, because `expo lint` does not reach scripts/ at all.
     files: ['scripts/**/*.js'],
     languageOptions: { globals: nodeGlobals },
+  },
+  {
+    // The plain-JS tests in test/ run under Node AND under Jest: `require` and `__dirname` as
+    // well as `describe`, `it` and `expect`. Without both sets every line of them is a
+    // `no-undef` error -- which `expo lint` never showed, because it does not reach test/ either.
+    files: ['test/**/*.js'],
+    languageOptions: { globals: { ...nodeGlobals, ...jestGlobals } },
   },
 ]);

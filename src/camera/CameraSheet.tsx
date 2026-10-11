@@ -72,6 +72,7 @@ import { ActivityIndicator, BackHandler, Pressable, StyleSheet, Text, View } fro
 import { useServices } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
 import { upsellMessage } from '@/billing/screens/VaultUpsellDialog';
+import { storedBytesOf } from '@/vault/types';
 import type { CaptureInspector, CaptureRejection } from '@/camera/captureInspector';
 import { Button } from '@/components/Button';
 import { Paragraph } from '@/components/Screen';
@@ -343,7 +344,8 @@ export function CameraSheet({
    */
   const vaultRefusal = useCallback((): string | null => {
     if (toChat) return null;
-    const gate = services.entitlements.gate(openRepository(services)?.photos.length ?? 0, 0);
+    const photos = openRepository(services)?.photos ?? [];
+    const gate = services.entitlements.gate(photos.length, 0, storedBytesOf(photos));
     return gate.allowed ? null : upsellMessage(gate.reason);
   }, [services, toChat]);
 
@@ -539,6 +541,7 @@ export function CameraSheet({
           const gate = services.entitlements.gate(
             repository.photos.length,
             await services.fs.size(video.uri),
+            storedBytesOf(repository.photos),
           );
           if (!gate.allowed) {
             if (mounted.current) setNotice(upsellMessage(gate.reason));

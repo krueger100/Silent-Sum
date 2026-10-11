@@ -20,8 +20,13 @@ import { ActivityIndicator, Linking, StyleSheet, Text, View } from 'react-native
 
 import { useEntitlements, useServices } from '@/app/ServicesProvider';
 import { radius, spacing, type Palette, typography, useStyles, useTheme } from '@/app/theme';
-import type { BillingService } from '@/billing/billingService';
-import { cloudActive, deriveCloudState, type Entitlements } from '@/billing/entitlements';
+import { BillingError, type BillingService } from '@/billing/billingService';
+import {
+  CLOUD_BANDS,
+  cloudActive,
+  deriveCloudState,
+  type Entitlements,
+} from '@/billing/entitlements';
 import {
   CLOUD_TERM_DAYS,
   PLANS_TITLE,
@@ -57,7 +62,15 @@ async function openInBrowser(url: string): Promise<boolean> {
 /** A checkout in progress: what was bought, where, and what the account had before it. */
 interface Waiting {
   readonly product: ProductId;
-  readonly checkoutId: string;
+  /**
+   * The PayMongo checkout session, for "I have paid".
+   *
+   * Null for a SUBSCRIPTION: there is no session to reconcile. A subscription's first charge is
+   * confirmed by PayMongo's `subscription.invoice.paid` webhook and reaches the app the only way
+   * it ever could -- the entitlement document changing -- so the fallback there is to look
+   * again, not to ask the backend about a session that does not exist.
+   */
+  readonly checkoutId: string | null;
   readonly url: string;
   /** Undefined until the browser has been asked; false when it could not open. */
   readonly opened: boolean | undefined;
@@ -244,24 +257,74 @@ function PlansBody({
     });
   };
 
+  /**
+   * One hosted checkout, started and opened. NOT wrapped in `run`.
+   *
+   * `run` refuses to start while another action is in flight, so an action that calls another
+   * action through it is silently dropped -- which is exactly what the subscription fallback
+   * does. Keeping the work here and the wrapping at the edges means either entry point can
+   * reach it, and neither can swallow the other.
+   */
+  const openCheckout = async (product: ProductId): Promise<void> => {
+    const start = await billing.createCheckout(product);
+    if (!mounted.current) return;
+    setWaiting({
+      product,
+      checkoutId: start.checkoutId,
+      url: start.checkoutUrl,
+      opened: undefined,
+      accessUntilBefore: entitlements.cloud.accessUntil,
+    });
+    const opened = await openUrl(start.checkoutUrl);
+    if (!mounted.current) return;
+    setWaiting((current) =>
+      current === null || current.checkoutId !== start.checkoutId ? current : { ...current, opened },
+    );
+  };
+
   const buy = (product: ProductId): void => {
     void run(async () => {
       setStatus(null);
-      const start = await billing.createCheckout(product);
+      await openCheckout(product);
+    });
+  };
+
+  /**
+   * One monthly Cloud subscription, with the one-off term as the fallback.
+   *
+   * The fallback is not a nicety. PayMongo enables Subscriptions per merchant account, so a
+   * build that only knew how to subscribe would make Cloud unbuyable the moment it met a backend
+   * where the feature is off -- which is every deployment today. Which path was taken is said
+   * out loud in the status line, because the two charge differently and the user is about to
+   * agree to one of them.
+   */
+  const subscribeCloud = (): void => {
+    void run(async () => {
+      setStatus(null);
+      let start;
+      try {
+        start = await billing.startCloudSubscription();
+      } catch (error) {
+        if (!(error instanceof BillingError) || error.code !== 'unsupported') throw error;
+        await openCheckout('cloud');
+        return;
+      }
       if (!mounted.current) return;
       setWaiting({
-        product,
-        checkoutId: start.checkoutId,
-        url: start.checkoutUrl,
+        product: 'cloud',
+        checkoutId: null,
+        url: start.authorizeUrl,
         opened: undefined,
         accessUntilBefore: entitlements.cloud.accessUntil,
       });
-      const opened = await openUrl(start.checkoutUrl);
+      setStatus(
+        `₱${String(Math.round(start.priceCentavos / 100))} a month for up to ${start.bandLabel}, ` +
+          'charged automatically until you cancel.',
+      );
+      const opened = await openUrl(start.authorizeUrl);
       if (!mounted.current) return;
       setWaiting((current) =>
-        current === null || current.checkoutId !== start.checkoutId
-          ? current
-          : { ...current, opened },
+        current === null || current.checkoutId !== null ? current : { ...current, opened },
       );
     });
   };
@@ -269,8 +332,16 @@ function PlansBody({
   const iHavePaid = (): void => {
     const pending = pendingCheckout;
     if (pending === null) return;
+    const checkoutId = pending.checkoutId;
+    if (checkoutId === null) {
+      // A subscription has no session to reconcile; the document is the only answer there is.
+      void run(async () => {
+        await services.entitlements.refresh();
+      });
+      return;
+    }
     void run(async () => {
-      const outcome = await billing.syncCheckout(pending.checkoutId);
+      const outcome = await billing.syncCheckout(checkoutId);
       if (!mounted.current) return;
       if (outcome === 'paid') {
         setStatus('PayMongo confirmed the payment. Your plan updates in a moment.');
@@ -300,6 +371,25 @@ function PlansBody({
   };
 
   const cloudState = deriveCloudState(entitlements, now);
+
+  /**
+   * Whether Renew is on screen at all, which is NOT the same question as whether it would work.
+   *
+   * Renew is the way back from cancelling, not an action on a healthy plan: while Cloud is on
+   * and staying on, the only thing a user can usefully do to it is stop it, so Cancel is the
+   * one button there. An inert "Renews automatically" button said the same thing but took up a
+   * primary action slot to say it, and the bullet above already says it in words.
+   *
+   * ONE EXCEPTION, and it is not an oversight. A plan that does NOT renew itself and is inside
+   * its last `CLOUD_RENEWAL_WINDOW_DAYS` keeps the button, because the status line says "renew
+   * soon" at exactly that point and a prompt with no way to act on it is a dead end -- the user
+   * would have to cancel in order to renew, or let Cloud lapse and lose access in between.
+   * Every SilentSum account today is a term, so this is the case that actually ships.
+   */
+  const renewable =
+    cloudState.kind === 'active' &&
+    (cloudState.cancelAtPeriodEnd || (!cloudState.autoRenews && cloudState.renewalDue));
+
   const signedIn = user !== null;
   const canAct = signedIn && pendingCheckout === null && !busy;
   const statusLine = landedLine ?? status;
@@ -359,7 +449,14 @@ function PlansBody({
               {`Your browser could not be opened. Visit this address to pay: ${pendingCheckout.url}`}
             </Text>
           ) : null}
-          <Button testID="plans_i_paid" label="I have paid" busy={busy} onPress={iHavePaid} />
+          {/* "I have paid" asks the backend about a session. A subscription has none, so the
+              same button says what it can actually do there: look at the document again. */}
+          <Button
+            testID="plans_i_paid"
+            label={pendingCheckout.checkoutId === null ? 'Check again' : 'I have paid'}
+            busy={busy}
+            onPress={iHavePaid}
+          />
           <Button
             testID="plans_stop_waiting"
             label="Cancel"
@@ -428,29 +525,41 @@ function PlansBody({
           styles={styles}
           testID="plans_cloud_features"
           items={[
-            'Unlimited items in the vault',
-            'Unlimited photos and videos — the 50-item limit is lifted',
+            `You pay for what you store: ${CLOUD_BANDS.map((b) => `₱${String(b.pricePhp)} up to ${b.label}`).join(', ')}`,
+            'The 50-item limit is lifted; photos and videos both count towards the space',
             'Encrypted cloud backup and restore, and support chat',
-            'A subscription: renewed monthly, for as long as you want it',
+            // NOT "a subscription", which this has never been. Nothing is charged automatically
+            // -- `CLOUD_TERM_DAYS` of access is bought one payment at a time -- and the muted
+            // line below said so while this bullet said the opposite, on the same screen.
+            cloudState.kind === 'active' && cloudState.autoRenews
+              ? `Renewed automatically every ${String(CLOUD_TERM_DAYS)} days until you cancel`
+              : `Paid ${String(CLOUD_TERM_DAYS)} days at a time, by hand: nothing renews on its own`,
           ]}
         />
+        {/* The two billing modes make opposite promises, and a screen that states the wrong one
+            is the bug this pair exists to prevent: it previously said "nothing is charged
+            automatically" directly under a bullet calling Cloud a subscription. */}
         <Text style={styles.muted}>
-          {`Each payment adds ${String(CLOUD_TERM_DAYS)} days. Nothing is charged automatically: ` +
-            'renew whenever you like, and let it lapse whenever you like. Everything already in ' +
-            'your vault stays, readable offline, and Pro is never affected.'}
+          {cloudState.kind === 'active' && cloudState.autoRenews
+            ? `Each renewal adds ${String(CLOUD_TERM_DAYS)} days and is charged automatically. ` +
+              'Cancel whenever you like and it runs to the end of the period already paid for. ' +
+              'Everything already in your vault stays, readable offline, and Pro is never affected.'
+            : `Each payment adds ${String(CLOUD_TERM_DAYS)} days. Nothing is charged automatically: ` +
+              'renew whenever you like, and let it lapse whenever you like. Everything already in ' +
+              'your vault stays, readable offline, and Pro is never affected.'}
         </Text>
         {!signedIn ? (
           <Text style={styles.muted}>Sign in below to subscribe.</Text>
         ) : pendingCheckout !== null ? null : cloudState.kind === 'active' ? (
           <>
-            <Button
-              testID="plans_renew_cloud"
-              label="Renew"
-              disabled={!canAct}
-              onPress={() => {
-                buy('cloud');
-              }}
-            />
+            {renewable ? (
+              <Button
+                testID="plans_renew_cloud"
+                label="Renew"
+                disabled={!canAct}
+                onPress={subscribeCloud}
+              />
+            ) : null}
             {cloudState.cancelAtPeriodEnd ? null : (
               <Button
                 testID="plans_cancel_cloud"
@@ -468,9 +577,7 @@ function PlansBody({
             testID="plans_subscribe_cloud"
             label="Subscribe"
             disabled={!canAct}
-            onPress={() => {
-              buy('cloud');
-            }}
+            onPress={subscribeCloud}
           />
         )}
       </View>

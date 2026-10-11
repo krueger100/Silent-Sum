@@ -186,6 +186,14 @@ export type CloudState =
       readonly renewalDue: boolean;
       readonly cancelAtPeriodEnd: boolean;
       readonly pastDue: boolean;
+      /**
+       * The provider will charge again on its own, so there is nothing for the user to renew.
+       *
+       * True only for a real PayMongo subscription that has not been cancelled. A `term` is
+       * bought one payment at a time and never renews itself, so it is false there -- which is
+       * what keeps "Renew" working for the billing SilentSum actually has today.
+       */
+      readonly autoRenews: boolean;
     }
   | { readonly kind: 'expired'; readonly on: number };
 
@@ -197,13 +205,17 @@ export function deriveCloudState(e: Entitlements, nowMs: number): CloudState {
   }
   if (cloud.accessUntil <= nowMs) return { kind: 'expired', on: cloud.accessUntil };
   const daysLeft = Math.ceil((cloud.accessUntil - nowMs) / DAY_MS);
+  const cancelAtPeriodEnd = cloud.cancelAtPeriodEnd || cloud.status === 'cancelled';
   return {
     kind: 'active',
     until: cloud.accessUntil,
     daysLeft,
     renewalDue: daysLeft <= CLOUD_RENEWAL_WINDOW_DAYS,
-    cancelAtPeriodEnd: cloud.cancelAtPeriodEnd || cloud.status === 'cancelled',
+    cancelAtPeriodEnd,
     pastDue: cloud.status === 'past_due',
+    // Both halves matter. A cancelled subscription still has access running to its end, and
+    // during that window it does NOT renew -- which is exactly when the user needs "Renew" back.
+    autoRenews: cloud.source === 'subscription' && !cancelAtPeriodEnd,
   };
 }
 
@@ -227,7 +239,79 @@ export const FREE_TIER = { maxItems: 50 } as const;
  */
 export const MAX_ITEM_BYTES = 100 * 1024 * 1024;
 
-export type GateReason = 'itemLimit' | 'fileSize';
+const GIB = 1024 * 1024 * 1024;
+
+/**
+ * What a Cloud term costs, by how much the vault actually holds.
+ *
+ * Cloud used to promise "unlimited", and the word was the whole liability: the product's own
+ * limits -- 20,000 manifest entries at `MAX_ITEM_BYTES` -- allowed 1,953 GB against one ₱99
+ * payment, which is roughly thirty times what it brings in. Bands replace that with a price
+ * that follows the cost, so the customer who costs more pays more and nobody is subsidising
+ * anybody.
+ *
+ * WHERE THE NUMBERS COME FROM. A stored GB costs about $0.0132 a month once Autoclass is on --
+ * a backup is written once and read only on a restore, so most of it cools to Coldline and only
+ * the last month sits in Standard. Add restore egress and the Autoclass management fee. A ₱99
+ * card payment nets $1.28 after PayMongo's 3.5% + ₱15, so ₱99 breaks even somewhere near 97 GB.
+ * Each band below is priced to keep roughly 35-65% of its net revenue at the TOP of the band,
+ * where a subscriber costs the most.
+ *
+ * THE PRICES ARE A PROPOSAL, not a decision: they are one table, and the margin maths above is
+ * what justifies them. For context they are two to four times Google One per GB (₱89/100 GB,
+ * ₱139/200 GB, ₱449/2 TB). SilentSum cannot win on storage price -- retail GCS plus Philippine
+ * card fees will not allow it -- so these are sized to be honest rather than competitive, and
+ * the thing being sold is the encryption, not the gigabytes.
+ *
+ * The top band is also the ceiling, because something has to be. It bounds ADDITIONS ONLY,
+ * exactly as `FREE_TIER` does: nothing stored is touched, nothing is deleted, and a vault over
+ * it stays readable and restorable -- it simply stops taking new items.
+ */
+export interface CloudBand {
+  /** Inclusive upper bound on stored plaintext bytes. */
+  readonly maxBytes: number;
+  readonly pricePhp: number;
+  readonly priceCentavos: number;
+  /** For copy: "64 GB". */
+  readonly label: string;
+}
+
+export const CLOUD_BANDS: readonly CloudBand[] = [
+  { maxBytes: 64 * GIB, pricePhp: 99, priceCentavos: 9900, label: '64 GB' },
+  { maxBytes: 160 * GIB, pricePhp: 249, priceCentavos: 24900, label: '160 GB' },
+  { maxBytes: 512 * GIB, pricePhp: 799, priceCentavos: 79900, label: '512 GB' },
+];
+
+/** The ceiling: the top band's bound. Past this the vault takes nothing new. */
+export const CLOUD_TIER = {
+  maxBytes: CLOUD_BANDS[CLOUD_BANDS.length - 1]?.maxBytes ?? 0,
+} as const;
+
+/**
+ * The band a vault of this size falls in, or null when it is past the top one.
+ *
+ * Null is not an error: it is a vault over the ceiling, which keeps everything it has and stops
+ * accepting more. Callers must not treat it as "free".
+ */
+export function bandFor(storedBytes: number): CloudBand | null {
+  return CLOUD_BANDS.find((band) => storedBytes <= band.maxBytes) ?? null;
+}
+
+/**
+ * What the next renewal will cost, in centavos, for a vault of this size.
+ *
+ * Billed on what is STORED at the moment of charging rather than on a plan chosen up front, so
+ * a vault that shrinks costs less next month without anybody having to ask. A vault over the
+ * ceiling is charged at the top band -- it cannot grow, and charging nothing for the largest
+ * vaults would be exactly backwards.
+ */
+export function cloudChargeCentavos(storedBytes: number): number {
+  const band = bandFor(storedBytes);
+  if (band !== null) return band.priceCentavos;
+  return CLOUD_BANDS[CLOUD_BANDS.length - 1]?.priceCentavos ?? 0;
+}
+
+export type GateReason = 'itemLimit' | 'fileSize' | 'cloudStorageLimit';
 
 export type GateDecision =
   { readonly allowed: true } | { readonly allowed: false; readonly reason: GateReason };
@@ -251,10 +335,18 @@ export function vaultGate(input: {
   readonly enforced: boolean;
   readonly itemCount: number;
   readonly bytes: number;
+  /** Everything the vault already holds, in plaintext bytes. See {@link CLOUD_TIER}. */
+  readonly storedBytes: number;
 }): GateDecision {
   if (!input.enforced) return { allowed: true };
   if (input.bytes > MAX_ITEM_BYTES) return { allowed: false, reason: 'fileSize' };
-  if (input.cloudActive) return { allowed: true };
+  if (input.cloudActive) {
+    // Measured against what this item WOULD make the total, not what it is now, so the cap is
+    // never crossed rather than noticed afterwards.
+    return input.storedBytes + input.bytes > CLOUD_TIER.maxBytes
+      ? { allowed: false, reason: 'cloudStorageLimit' }
+      : { allowed: true };
+  }
   if (input.itemCount >= FREE_TIER.maxItems) return { allowed: false, reason: 'itemLimit' };
   return { allowed: true };
 }

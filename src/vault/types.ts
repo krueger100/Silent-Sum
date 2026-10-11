@@ -117,6 +117,17 @@ export interface AddPhotoOptions {
   readonly mimeType?: string;
 }
 
+/**
+ * What the vault holds, in plaintext bytes.
+ *
+ * Summed from the index rather than tracked as a running total, because a running total drifts:
+ * one missed decrement and the vault believes it is fuller than it is, for ever, with nothing to
+ * reconcile against. The index is the record, and twenty thousand additions is nothing to add up.
+ */
+export function storedBytesOf(photos: readonly PhotoEntry[]): number {
+  return photos.reduce((total, photo) => total + photo.sizeBytes, 0);
+}
+
 export type PhotosListener = (photos: readonly PhotoEntry[]) => void;
 
 /**

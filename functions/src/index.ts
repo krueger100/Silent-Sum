@@ -1,9 +1,11 @@
 /**
  * The SilentSum billing functions (codebase `silentsum` in the root `firebase.json`).
  *
- * Nine functions, deployed to one region:
+ * Ten functions, deployed to one region:
  *   silentsumCreateCheckout   callable  -> a hosted PayMongo checkout page for Pro or Cloud
  *   silentsumSyncCheckout     callable  -> reconcile one checkout with PayMongo ("I have paid")
+ *   silentsumStartCloudSubscription
+ *                             callable  -> a monthly PayMongo subscription for Cloud
  *   silentsumCancelCloud      callable  -> stop Cloud from renewing
  *   silentsumPaymongoWebhook  https     -> PayMongo's signed events
  *   silentsumBillingReturn    https     -> the page the browser lands on after checkout
@@ -38,6 +40,8 @@ import {
 
 import { cancelCloud } from './cancel';
 import { createCheckout } from './checkout';
+import { rerateCloudSubscription, startCloudSubscription } from './subscription';
+import { CloudStorageMeter } from './storageMeter';
 import { deleteConversation } from './conversations';
 import { readConfig, type BillingConfig } from './config';
 import { findPeerEmail, findUserByEmail } from './directory';
@@ -90,6 +94,28 @@ function backend(secretKey: string) {
     paymongo: new PayMongoClient(secretKey),
     config,
     now: () => Date.now(),
+  };
+}
+
+/**
+ * The extra dependencies a SUBSCRIPTION needs over a one-off checkout: a storage meter, because
+ * the price follows what is stored, and the account's e-mail, because PayMongo requires one on
+ * a customer. The e-mail comes from Firebase Auth rather than from the request -- a caller must
+ * not be able to put somebody else's address on a customer record.
+ */
+function subscriptionBackend(secretKey: string) {
+  const deps = backend(secretKey);
+  return {
+    ...deps,
+    meter: new CloudStorageMeter(deps.config.storageBucket),
+    returnUrl: returnUrlFor(deps.config),
+    accountEmail: async (uid: string) => {
+      try {
+        return (await getAuth().getUser(uid)).email ?? null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 
@@ -171,6 +197,22 @@ export const silentsumSyncCheckout = onCall(callableOptions, async (request) => 
   }
 });
 
+/**
+ * Start a native PayMongo subscription for Cloud: the thing that makes "renews automatically"
+ * true. The answer carries a page to authorise on; nothing is charged until the customer does.
+ *
+ * The request body is ignored entirely. There is nothing for a caller to choose: the band comes
+ * from measured storage and the price from the band.
+ */
+export const silentsumStartCloudSubscription = onCall(callableOptions, async (request) => {
+  const uid = requireUid(request);
+  try {
+    return await startCloudSubscription(subscriptionBackend(PAYMONGO_SECRET_KEY.value()), { uid });
+  } catch (error) {
+    throw toHttpsError(error, 'startCloudSubscription');
+  }
+});
+
 export const silentsumCancelCloud = onCall(callableOptions, async (request) => {
   const uid = requireUid(request);
   const deps = backend(PAYMONGO_SECRET_KEY.value());
@@ -190,15 +232,17 @@ export const silentsumPaymongoWebhook = onRequest(
       return;
     }
     const secretKey = PAYMONGO_SECRET_KEY.value();
+    const subscriptions = subscriptionBackend(secretKey);
     const result = await handleWebhook(
       {
-        store: new FirestoreBillingStore(getFirestore()),
-        config: readConfig(process.env, secretKey),
+        store: subscriptions.store,
+        config: subscriptions.config,
         webhookSecret: PAYMONGO_WEBHOOK_SECRET.value(),
         now: () => Date.now(),
         log: (message, data) => {
           logger.info(message, data);
         },
+        rerate: (input) => rerateCloudSubscription(subscriptions, input),
       },
       {
         rawBody: request.rawBody ?? Buffer.from(''),

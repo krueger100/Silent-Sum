@@ -31,6 +31,20 @@ export function describeBillingError(error: unknown): string {
       );
     case 'already-owned':
       return 'You already own SilentSum Pro on this account. There is nothing more to buy.';
+    case 'already-subscribed':
+      return 'SilentSum Cloud already renews on this account. Cancel it first if you want to change it.';
+    case 'no-email':
+      return (
+        'The payment provider needs an e-mail address for the receipt and for failed charges, ' +
+        'and this account has none. Add one on the backup screen and try again.'
+      );
+    case 'unsupported':
+      // The screen falls back to a one-off term rather than showing this, so it is only reached
+      // when even that is unavailable. Said plainly: the vault is unaffected either way.
+      return (
+        'Monthly billing is not available on this account yet. Nothing was charged, and ' +
+        'everything already in your vault is unaffected.'
+      );
     case 'invalid-argument':
       return 'The server did not understand that request. Update the app and try again.';
     case 'permission-denied':

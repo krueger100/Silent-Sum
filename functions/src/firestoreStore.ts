@@ -6,6 +6,8 @@
  *   silentsum_billing_refs/{paymongoId}    server-only: which account a PayMongo id belongs to
  *   silentsum_billing_events/{eventId}     server-only: every webhook delivery, once
  *   silentsum_billing_payments/{paymentId} server-only: every payment applied, once
+ *   silentsum_billing_plans/{bandKey}      server-only: the PayMongo plan for one price band
+ *   silentsum_billing_customers/{uid}      server-only: the account's PayMongo customer id
  *
  * Dates are stored as Firestore `Timestamp`s, because the security rules compare
  * `cloud.accessUntil` with `request.time`; the domain works in epoch milliseconds, and the
@@ -26,6 +28,8 @@ export const COLLECTIONS = {
   refs: 'silentsum_billing_refs',
   events: 'silentsum_billing_events',
   payments: 'silentsum_billing_payments',
+  plans: 'silentsum_billing_plans',
+  customers: 'silentsum_billing_customers',
 } as const;
 
 export function entitlementsPath(uid: string): string {
@@ -187,6 +191,32 @@ export class FirestoreBillingStore implements BillingStore {
       data[key] = key === 'paidAt' || key === 'createdAt' ? stamp(value as number | null) : value;
     }
     await this.db.collection(COLLECTIONS.refs).doc(id).set(data, { merge: true });
+  }
+
+  async getPlanId(key: string): Promise<string | null> {
+    const snapshot = await this.db.collection(COLLECTIONS.plans).doc(key).get();
+    const planId = snapshot.data()?.planId;
+    return typeof planId === 'string' && planId !== '' ? planId : null;
+  }
+
+  async putPlanId(key: string, planId: string, createdAt: number): Promise<void> {
+    await this.db
+      .collection(COLLECTIONS.plans)
+      .doc(key)
+      .set({ planId, createdAt: stamp(createdAt) });
+  }
+
+  async getCustomerId(uid: string): Promise<string | null> {
+    const snapshot = await this.db.collection(COLLECTIONS.customers).doc(uid).get();
+    const customerId = snapshot.data()?.customerId;
+    return typeof customerId === 'string' && customerId !== '' ? customerId : null;
+  }
+
+  async putCustomerId(uid: string, customerId: string, createdAt: number): Promise<void> {
+    await this.db
+      .collection(COLLECTIONS.customers)
+      .doc(uid)
+      .set({ customerId, createdAt: stamp(createdAt) });
   }
 
   /** New, unless this delivery was already recorded -- and not left in `error` by a failed try. */

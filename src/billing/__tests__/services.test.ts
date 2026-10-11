@@ -49,7 +49,7 @@ describe('createServices billing wiring', () => {
     const services = createServices({ ...base(), firebase: FIREBASE_UNAVAILABLE });
     expect(services.billing).toBeNull();
     expect(services.entitlements.enforced).toBe(false);
-    expect(services.entitlements.gate(1000, MAX_ITEM_BYTES + 1)).toEqual({ allowed: true });
+    expect(services.entitlements.gate(1000, MAX_ITEM_BYTES + 1, 0)).toEqual({ allowed: true });
   });
 
   it('takes the billing service Firebase offers and enforces the free tier', () => {
@@ -61,8 +61,8 @@ describe('createServices billing wiring', () => {
     expect(services.entitlements.enforced).toBe(true);
     // Video is free now, so a fresh vault takes one; what the enforced build still gates is the
     // 51st item and an oversized one.
-    expect(services.entitlements.gate(0, 5_000_000)).toEqual({ allowed: true });
-    expect(services.entitlements.gate(FREE_TIER.maxItems, 1)).toEqual({
+    expect(services.entitlements.gate(0, 5_000_000, 0)).toEqual({ allowed: true });
+    expect(services.entitlements.gate(FREE_TIER.maxItems, 1, 0)).toEqual({
       allowed: false,
       reason: 'itemLimit',
     });
