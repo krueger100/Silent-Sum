@@ -113,10 +113,19 @@ checked and when, not that it was once believed to be fine.
     Checked: 2026-10-11, in the Cloud console (gcloud is still not installed here).
       Bucket silentsum-vault-eevee-mate exists and matches firebase.json.
       Top level holds exactly two prefixes: messages/ and users/. Nothing foreign.
-      Lifecycle rules: NONE -- so the rule below has never been applied, and chat media
-      has never expired. This is outcome one, "apply the rule", plus the fact that
-      messages/ already has content accumulating against no expiry at all.
+      Lifecycle rules: NONE -- so the rule had never been applied, and chat media
+      had never expired. This was outcome one, "apply the rule", plus the fact that
+      messages/ already had content accumulating against no expiry at all.
       Location: asia MULTI-REGION. Soft delete: 7 days. Autoclass: enabled the same day.
+
+    APPLIED: 2026-10-11, via the console, with Autoclass already on. The Lifecycle tab
+      now reads exactly one rule and nothing else:
+        Delete object | 30+ days since object was created, Name matches prefix 'messages/'
+      Verified against the form's DOM before saving, not from a screenshot: action
+      "Delete object", exactly two conditions ticked, age 30, prefix "messages/" as a
+      single exact entry with no suffix condition. This matches storage-lifecycle.json
+      field for field, so the file and the bucket finally agree.
+      Google's console warns a new rule can take up to 24 hours to first evaluate.
 
 **Applying it with Autoclass on.** Safe, and the reason is in the Autoclass section below: the
 restriction is on `SetStorageClass` actions and `matchesStorageClass` conditions, and this rule
@@ -372,10 +381,12 @@ Moving to Maya is itself worth +23% on the ₱99 band against a card, because a 
 15% of a ₱99 charge. That was not the reason for choosing it, but it is why the cheapest band
 works at all.
 
-Two smaller lines, both real and both small: **soft delete is on with a 7-day window and
-soft-deleted objects are billed** at their class rate (they are exempt from the Autoclass
-management fee); and the `messages/` lifecycle rule in `storage-lifecycle.json` **has never been
-applied** — the bucket's Lifecycle tab reads "None" — so chat media is not expiring.
+One smaller line, real and small: **soft delete is on with a 7-day window and soft-deleted
+objects are billed** at their class rate, though they are exempt from the Autoclass management
+fee. It is why chat media stops costing anything on day 37 rather than day 30.
+
+(The other line here used to say the `messages/` lifecycle rule had never been applied. It was
+applied on 2026-10-11 — see the chat media expiry section above.)
 
 ## Support relay (added 2026-09-26)
 
