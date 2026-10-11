@@ -110,7 +110,30 @@ Four outcomes:
 Record what was observed, with the date, below. A future maintainer needs to know this was
 checked and when, not that it was once believed to be fine.
 
-    Checked: (not yet -- gcloud is not installed on the development machine as of 2026-09-25)
+    Checked: 2026-10-11, in the Cloud console (gcloud is still not installed here).
+      Bucket silentsum-vault-eevee-mate exists and matches firebase.json.
+      Top level holds exactly two prefixes: messages/ and users/. Nothing foreign.
+      Lifecycle rules: NONE -- so the rule below has never been applied, and chat media
+      has never expired. This is outcome one, "apply the rule", plus the fact that
+      messages/ already has content accumulating against no expiry at all.
+      Location: asia MULTI-REGION. Soft delete: 7 days. Autoclass: enabled the same day.
+
+**Applying it with Autoclass on.** Safe, and the reason is in the Autoclass section below: the
+restriction is on `SetStorageClass` actions and `matchesStorageClass` conditions, and this rule
+uses a `Delete` action with an `age` and a `matchesPrefix`. It touches none of them.
+
+**Soft delete interacts with this.** The bucket keeps deleted objects for 7 days and bills for
+them at their storage class, so chat media actually stops costing anything at day 37, not day
+30. That is a reason to apply the rule sooner rather than a reason to change it.
+
+**The app is already ready for objects to vanish.** `fetchThumb` distinguishes an expired object
+(`object-not-found`) from a sealed one and from a retryable failure, so an expired chat
+thumbnail says so instead of offering a retry that cannot work.
+
+Without gcloud, the console path is: bucket → **Lifecycle** tab → **Add a rule** →
+action **Delete object** → conditions **Age = 30 days** AND **Object name matches prefix =
+`messages/`**. Both conditions, on one rule. Age alone would reach `users/` and delete people's
+vault backups.
 
 Then:
 
@@ -154,12 +177,20 @@ tiering would save about as much and charge for every restore.
 It costs a management fee per object per month (about $0.0025 per 1,000). At the manifest's
 20,000-item ceiling that is about $0.05 a month, against several dollars saved.
 
-**THE TRAP, and the reason this is written down.** Autoclass and `SetStorageClass` lifecycle rules
-are mutually exclusive: enabling Autoclass disables `SetStorageClass`, and adding such a rule
-later is the thing that would silently undo this. `storage-lifecycle.json` must therefore stay
-**delete-only**. Its `messages/` delete rule is unaffected and keeps working — delete rules are
-the one kind Autoclass permits. If a future change wants age-based tiering, it has to choose:
-that, or Autoclass, never both.
+**THE TRAP, stated precisely.** Google's Autoclass page says a bucket cannot have Autoclass
+enabled *and* a lifecycle rule using the `SetStorageClass` action or the `matchesStorageClass`
+condition, and that **requests which would cause both fail**. So the two directions differ:
+
+- *Enabling Autoclass* deletes any existing storage-class rules. The console says so in the
+  enable dialog.
+- *Adding* such a rule afterwards is **refused outright** — it does not silently switch
+  Autoclass off, which an earlier version of this note claimed.
+
+`storage-lifecycle.json` must still stay **delete-only**, and `test/storageLifecycle.test.js`
+still earns its place: it catches the mistake at commit time instead of at apply time, when the
+failure would be a confusing API error against live infrastructure. Delete rules are unaffected
+and are the kind Autoclass permits. If a future change wants age-based tiering, it has to
+choose: that, or Autoclass, never both.
 
 **Inspect before enabling.** Enabling is not free on existing objects: it can trigger one-time
 retrieval, early-deletion and Class A charges for what is already there. On a small bucket that is
