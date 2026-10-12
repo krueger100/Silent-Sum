@@ -19,7 +19,11 @@ function toAdminError(error: unknown, signedIn: boolean): ConversationAdminError
     case 'unauthenticated':
       // Signed in already? Then the server saw no App Check token, not an absent user. Telling a
       // signed-in person to sign in is the one answer that is certainly wrong.
-      return new ConversationAdminError(signedIn ? 'unavailable' : 'unauthenticated');
+      //
+      // `unavailable` was the second-wrong answer, and the one this used to give: its copy says
+      // to try again shortly, and an unattested build is refused identically every time. Say
+      // attestation, which names the one thing that does fix it -- installing from the store.
+      return new ConversationAdminError(signedIn ? 'attestation' : 'unauthenticated');
     case 'permission-denied':
       return new ConversationAdminError('not-a-member');
     case 'invalid-argument':

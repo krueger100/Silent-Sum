@@ -10,8 +10,15 @@
  * across and reports what the server said.
  */
 export type ConversationAdminErrorCode =
-  /** Nobody is signed in, or App Check declined to vouch for this build. */
+  /** Nobody is signed in. */
   | 'unauthenticated'
+  /**
+   * Signed in, but App Check would not vouch for this build, so the server refused. Distinct from
+   * `unauthenticated` because the remedy differs and the user is already past sign-in, and from
+   * `unavailable` because no amount of trying again shortly will change it -- which is what this
+   * used to be reported as. Mirrors `DirectoryErrorCode`.
+   */
+  | 'attestation'
   /** The caller is not in that conversation. The server decides this, never the client. */
   | 'not-a-member'
   | 'invalid'

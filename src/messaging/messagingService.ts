@@ -1913,9 +1913,12 @@ export class MessagingService {
       await admin.deleteForBoth(conversationId);
     } catch (error) {
       if (error instanceof ConversationAdminError) {
-        throw new MessagingError(
-          error.code === 'unauthenticated' ? 'unauthenticated' : 'unavailable',
-        );
+        // Carry the two the screens have distinct copy for. Collapsing `attestation` into
+        // `unavailable` here is what told a signed-in user on an unattested build to try again
+        // shortly, forever. `startConversation` above already keeps them apart.
+        if (error.code === 'unauthenticated') throw new MessagingError('unauthenticated');
+        if (error.code === 'attestation') throw new MessagingError('attestation');
+        throw new MessagingError('unavailable');
       }
       throw new MessagingError('unavailable');
     }
