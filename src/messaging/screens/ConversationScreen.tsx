@@ -388,10 +388,20 @@ export function ConversationScreen({
   const title = state?.label ?? 'Conversation';
   const now = services.clock.now();
   const trimmed = draft.trim();
-  // A second send while an attachment is uploading is refused rather than queued: two items
-  // racing to one conversation would arrive in whatever order the network settled on.
-  const busy = sending || outgoing.busy;
-  const canSubmit = !busy && trimmed !== '';
+  // Two guards, deliberately not one flag.
+  //
+  // A text send already in flight is a genuine double-submit risk, so the composer waits for it.
+  // An attachment uploading is not: a text message is its own document under its own random id,
+  // so it cannot collide with an upload or be reordered by one. Folding both into a single `busy`
+  // held the keyboard shut for as long as a video took to go out -- a minute of an app that looks
+  // broken, and the complaint this answers.
+  //
+  // The ordering rule the single flag was protecting is narrower than where it was applied.
+  // `useOutgoingMedia` states it as two ATTACHMENTS racing: "two photos racing to the same
+  // conversation would arrive in whichever order the network settled on". That is still enforced,
+  // by the attach button below, which stays shut while an upload is in flight.
+  const uploading = outgoing.busy;
+  const canSubmit = !sending && trimmed !== '';
 
   return (
     <Screen
@@ -527,15 +537,15 @@ export function ConversationScreen({
                 testID="conversation_attach"
                 accessibilityRole="button"
                 accessibilityLabel="Attach"
-                disabled={busy}
-                accessibilityState={{ disabled: busy, busy: outgoing.busy }}
+                disabled={uploading}
+                accessibilityState={{ disabled: uploading, busy: uploading }}
                 onPress={() => {
                   setAttaching(true);
                 }}
                 style={({ pressed }) => [
                   styles.attach,
-                  busy ? styles.attachDisabled : null,
-                  pressed && !busy ? styles.pressed : null,
+                  uploading ? styles.attachDisabled : null,
+                  pressed && !uploading ? styles.pressed : null,
                 ]}
               >
                 <Text style={styles.attachGlyph}>+</Text>
@@ -547,7 +557,7 @@ export function ConversationScreen({
                 onChangeText={setDraft}
                 multiline
                 maxLength={MAX_MESSAGE_LENGTH}
-                editable={!busy}
+                editable={!sending}
                 placeholder="Message"
                 placeholderTextColor={theme.textMuted}
               />
@@ -555,7 +565,7 @@ export function ConversationScreen({
                 testID="conversation_send"
                 accessibilityRole="button"
                 accessibilityLabel="Send"
-                accessibilityState={{ disabled: !canSubmit, busy }}
+                accessibilityState={{ disabled: !canSubmit, busy: sending }}
                 disabled={!canSubmit}
                 onPress={() => {
                   void send();
